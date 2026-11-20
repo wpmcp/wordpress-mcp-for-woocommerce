@@ -1,6 +1,6 @@
-# WordPress MCP for WooCommerce
+# WooCommerce MCP Server (Safe MCP for WooCommerce)
 
-Let Claude, ChatGPT or Cursor run your WooCommerce store over MCP, with a snapshot before every write and one-click rollback.
+A free WooCommerce MCP plugin that lets Claude, ChatGPT and Cursor manage products, orders and coupons on your store, with a snapshot before every write and one-click undo.
 
 **[Download the plugin (safe-mcp-for-woocommerce.zip)](https://github.com/wpmcp/wordpress-mcp-for-woocommerce/releases/latest/download/safe-mcp-for-woocommerce.zip)**
 
