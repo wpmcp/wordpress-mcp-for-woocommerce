@@ -1,0 +1,1017 @@
+<?php
+
+namespace WPMCP\MCP;
+
+use WPMCP\Memory\Memory_Store;
+use WPMCP\Plugin;
+use WPMCP\Safety\Operation_Context;
+
+if (! defined('ABSPATH')) {
+    exit;
+}
+
+/**
+ * WP-CLI-invoked stdio MCP transport (issue #77).
+ *
+ * Several MCP clients only speak stdio, and local development wants a server
+ * without any HTTP setup. This class serves the same tool surface as the
+ * HTTP transport (WPMCP\MCP\Server) over newline-delimited JSON-RPC on
+ * stdin/stdout, started with `wp mcp-stdio serve --user=<login|id>`.
+ *
+ * Design mirrors the rest of the plugin: the transport is a thin loop, and
+ * every protocol decision lives in a pure, independently testable method
+ * (handle_request), so tests exercise the handshake, tools/list and the
+ * tools/call round-trip without spawning a process.
+ *
+ * Three things this transport must get right, because none of them are free:
+ *
+ *  1. USER CONTEXT. WP-CLI runs as user 0 unless the global --user flag is
+ *     given, and every wpmcp ability's permission_callback
+ *     (Registrar::is_permitted) starts with current_user_can(). Without a
+ *     user, every tools/call would be denied, so serve() refuses to start
+ *     rather than serving a surface where nothing works. (This is the
+ *     opposite direction of travel from issue #44, which is MCP -> wp-cli
+ *     and default-OFF; here wp-cli is the client, so the operator's own
+ *     --user choice is the whole trust decision.)
+ *  2. EXPOSURE PARITY. Compact mode (issue #79) is applied by
+ *     Tool_Exposure on the adapter's mcp_adapter_tools_list filter, which
+ *     the adapter's HTTP pipeline fires and this transport does not. The
+ *     tool list is therefore run through Tool_Exposure directly, and the
+ *     handshake reuses Handshake_Instructions, so both transports advertise
+ *     the same surface and the same guidance. Tool results go through
+ *     Structured_Result::normalize() for the same reason.
+ *  3. FRAMING. Newline-delimited JSON-RPC is destroyed by a single PHP
+ *     notice on stdout, which is exactly failure mode 2 in Transport_Guard
+ *     (issue #133), so the display channel is suppressed before the first
+ *     read and protocol output is written with fwrite() rather than echo.
+ *
+ * The loop is long-lived, which per-request state does not expect, so
+ * Operation_Context and the memoized reads behind the permission chain are
+ * reset between messages (see reset_per_message_state). What that does and
+ * does not buy is worth stating precisely, because the obvious claim is
+ * wrong: abilities are registered once, at process start, and
+ * Registrar::register() skips governance-disabled ones at registration
+ * time, so the ADVERTISED tool list is fixed for the life of the process.
+ * What can change is what a fresh session would see (a plugin activated in
+ * wp-admin, a license added, a governance or exposure toggle), and a
+ * session started by serve() watches for that (Tool_List_Watch, issue #632):
+ * it advertises tools.listChanged:true and sends one
+ * notifications/tools/list_changed per change, so a client that honours it
+ * re-lists, and the refusal for a held tool says to reconnect for the rest.
+ * HTTP is stateless and keeps listChanged:false. What is
+ * re-evaluated per message is everything inside the call path: compact-mode
+ * exposure, the Governance and project-memory gates, capability checks and
+ * the rate-limit budget. A mid-process revocation therefore still denies at
+ * execute, which is the half that matters for safety.
+ */
+class Stdio_Transport
+{
+    private const JSONRPC = '2.0';
+
+    /**
+     * Protocol version used when the MCP Adapter (which owns negotiation)
+     * is not loaded. Kept equal to the newest version the adapter's
+     * McpVersionNegotiator supports so both transports agree.
+     */
+    public const FALLBACK_PROTOCOL_VERSION = Protocol_Revision::LEGACY;
+
+    /** Id prefix of requests this server sends to the client (issue #387). */
+    private const SERVER_REQUEST_PREFIX = 'wpmcp-s2c-';
+
+    /**
+     * The client capabilities of the 2026-07-28 request being handled, or
+     * null while handling a 2025-11-25 one. 2026 carries them per request.
+     *
+     * @var array<string,mixed>|null
+     */
+    private ?array $request_capabilities = null;
+
+    /**
+     * The client capabilities a 2025-11-25 session declared at initialize.
+     *
+     * @var array<string,mixed>
+     */
+    private array $session_capabilities = [];
+
+    /**
+     * Sends a request to the client and returns its result, or null for
+     * no answer (issue #387). Only the serve() loop can do this, so it is
+     * unset when the transport answers HTTP or is driven by tests.
+     *
+     * @var callable(string, array<string,mixed>): (array<string,mixed>|null)|null
+     */
+    private $client_requester = null;
+
+    /**
+     * Watches tool availability for the serve() session (issue #632).
+     * Null when the transport answers HTTP or is driven unwatched.
+     */
+    private ?Tool_List_Watch $list_watch = null;
+
+    /**
+     * Makes this a long-lived session that advertises tools.listChanged and
+     * reports availability changes through tool_list_notification(). Only
+     * serve() calls it: the HTTP 2026 bridge is stateless.
+     */
+    public function watch_tool_list(): void
+    {
+        $this->list_watch = new Tool_List_Watch();
+    }
+
+    /**
+     * The notifications/tools/list_changed message to send, once per change
+     * of the available tool set since the session's initialize, or null.
+     *
+     * @return array<string,string>|null
+     */
+    public function tool_list_notification(): ?array
+    {
+        if (null === $this->list_watch || ! $this->list_watch->changed()) {
+            return null;
+        }
+
+        return [ 'jsonrpc' => self::JSONRPC, 'method' => 'notifications/tools/list_changed' ];
+    }
+
+    /**
+     * Wires the channel for server-to-client requests (2025-11-25
+     * elicitation). Null removes it.
+     *
+     * @param callable(string, array<string,mixed>): (array<string,mixed>|null)|null $requester
+     */
+    public function set_client_requester(?callable $requester): void
+    {
+        $this->client_requester = $requester;
+    }
+
+    /** Registers the WP-CLI command. No-op outside WP-CLI. */
+    public static function register(): void
+    {
+        if (! defined('WP_CLI') || ! WP_CLI || ! class_exists('WP_CLI')) {
+            return;
+        }
+
+        \WP_CLI::add_command('mcp-stdio serve', [self::class, 'serve'], [
+            'shortdesc' => 'Serves MCP over stdio. Requires the global --user flag, e.g. '
+                . 'wp mcp-stdio serve --user=admin',
+        ]);
+    }
+
+    /**
+     * Blocking read loop: one JSON-RPC message per line on stdin, one
+     * response per line on stdout. Notifications produce no output.
+     */
+    public static function serve(): void
+    {
+        Transport_Guard::suppress_error_display();
+
+        $context_error = self::user_context_error();
+        if (null !== $context_error) {
+            // register() only ever wires this as a WP-CLI callback, and
+            // WP_CLI::error() halts, so there is no second exit path to
+            // write here.
+            \WP_CLI::error($context_error);
+        }
+
+        // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen -- stdio transport: the protocol stream IS php://stdin. WP_Filesystem has no equivalent and would not be a filesystem operation here.
+        $stdin = fopen('php://stdin', 'r');
+        if (false === $stdin) {
+            return;
+        }
+
+        $transport = new self();
+        $transport->watch_tool_list();
+
+        // Availability can change in another process while this one waits
+        // on stdin, or through a tool call this one ran: checked before and
+        // after each message, on fresh option reads.
+        $notify = static function () use ($transport): void {
+            self::reset_per_message_state();
+            $notification = $transport->tool_list_notification();
+            if (null !== $notification) {
+                self::emit($notification);
+            }
+        };
+
+        // Messages the client sent while the server was waiting on its own
+        // request (elicitation, issue #387) wait here for the main loop.
+        $pending  = new \SplQueue();
+        $sequence = 0;
+        $read     = static fn() => fgets($stdin);
+        $transport->set_client_requester(static function (string $method, array $params) use ($read, $pending, &$sequence): ?array {
+            $request_id = self::SERVER_REQUEST_PREFIX . (++$sequence);
+            self::emit([ 'jsonrpc' => self::JSONRPC, 'id' => $request_id, 'method' => $method, 'params' => $params ]);
+
+            return self::await_response($read, $request_id, $pending);
+        });
+
+        while (true) {
+            $line = $pending->isEmpty() ? fgets($stdin) : $pending->dequeue();
+            if (false === $line) {
+                break;
+            }
+            $line = trim($line);
+            if ('' === $line) {
+                continue;
+            }
+
+            $request = json_decode($line, true);
+            if (! is_array($request)) {
+                self::emit(self::error_response(null, -32700, 'Parse error'));
+                continue;
+            }
+
+            $notify();
+
+            // A throwing tool costs one HTTP request on the other
+            // transport; here it would cost the whole session, and the
+            // client would block forever on a request id that never gets
+            // an answer. Registrar::throttled() turns a tool's exception
+            // into a WP_Error (issue #612), but the transport itself and a
+            // foreign ability can still throw, so the loop owns the last
+            // line of defence.
+            try {
+                $response = $transport->handle_request($request);
+            } catch (\Throwable $e) {
+                $response = self::error_response(
+                    $request['id'] ?? null,
+                    -32603,
+                    'Internal error: ' . $e->getMessage()
+                );
+            }
+
+            if (null !== $response) {
+                self::emit($response);
+            }
+
+            $notify();
+        }
+        // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- pairs with the fopen above; closing php://stdin is not a filesystem operation.
+        fclose($stdin);
+    }
+
+    /**
+     * Why the process must not start, or null when the context is usable.
+     *
+     * Separated from serve() so the requirement is testable without a
+     * process: WP-CLI is user 0 unless --user is given, and user 0 fails
+     * every ability's capability check.
+     */
+    public static function user_context_error(): ?string
+    {
+        if (get_current_user_id() > 0) {
+            return null;
+        }
+
+        return 'wp mcp-stdio serve needs a user context: WP-CLI runs as no user by default, so every '
+            . 'tool call would be denied by its capability check. Re-run with the global --user flag, '
+            . 'e.g. wp mcp-stdio serve --user=admin';
+    }
+
+    /**
+     * Reads client lines until the response to the server's own request
+     * arrives, and returns its result: null on end of input or an error
+     * response. Every other message read meanwhile is queued, untouched,
+     * for the main loop; a response to some other id is dropped, since this
+     * server has at most one request of its own outstanding.
+     *
+     * @param callable(): (string|false) $read_line Next raw line, false at EOF.
+     * @return array<string,mixed>|null
+     */
+    public static function await_response(callable $read_line, string $request_id, \SplQueue $pending): ?array
+    {
+        while (false !== ($line = $read_line())) {
+            $message = json_decode(trim((string) $line), true);
+
+            $is_response = is_array($message)
+                && ! isset($message['method'])
+                && array_key_exists('id', $message)
+                && (array_key_exists('result', $message) || array_key_exists('error', $message));
+
+            if (! $is_response) {
+                $pending->enqueue($line);
+                continue;
+            }
+            if ($request_id !== $message['id']) {
+                continue;
+            }
+
+            return isset($message['result']) && is_array($message['result']) ? $message['result'] : null;
+        }
+
+        return null;
+    }
+
+    /**
+     * Dispatches one JSON-RPC request. Returns the response array, or null
+     * for notifications (no id). Pure with respect to I/O: the serve() loop
+     * owns stdin/stdout so tests can call this directly.
+     *
+     * @param array<string,mixed> $request Decoded JSON-RPC request.
+     * @return array<string,mixed>|null
+     */
+    public function handle_request(array $request): ?array
+    {
+        // Everything this transport runs is a call through the wpmcp
+        // endpoint, audited as such (issue #412).
+        \WPMCP\Governance\Call_Source::enter(\WPMCP\Governance\Call_Source::MCP);
+        try {
+            return $this->route_request($request);
+        } finally {
+            \WPMCP\Governance\Call_Source::leave();
+        }
+    }
+
+    /**
+     * @param array<string,mixed> $request Decoded JSON-RPC request.
+     * @return array<string,mixed>|null
+     */
+    private function route_request(array $request): ?array
+    {
+        $method = isset($request['method']) ? (string) $request['method'] : '';
+
+        // JSON-RPC 2.0 defines a notification as a request with no id at
+        // all, and that is the whole rule. Adding "or the method starts
+        // with notifications/" would silently drop an id-bearing request of
+        // such a method, leaving a synchronous client blocked forever on a
+        // response that is never written.
+        if (! array_key_exists('id', $request)) {
+            return null;
+        }
+
+        $id     = $request['id'];
+        $params = is_array($request['params'] ?? null) ? $request['params'] : [];
+
+        // Either revision, per line (issue #386). A request naming
+        // 2026-07-28 in its _meta, and server/discover (the call a client
+        // makes before it knows any revision), take the 2026 path;
+        // everything else is the 2025 session lifecycle, unchanged.
+        $requested = Protocol_Revision::requested($params);
+        if ('server/discover' === $method || Protocol_Revision::MODERN === $requested) {
+            return $this->handle_modern($id, $method, $params, $requested);
+        }
+        if (null !== $requested && ! Protocol_Revision::is_servable($requested)) {
+            return Protocol_Revision::unsupported_version_error($id, $requested);
+        }
+
+        return $this->dispatch($id, $method, $params);
+    }
+
+    /**
+     * One 2026-07-28 request: the revision's own method set, its required
+     * client capabilities, and its result fields, around the same handlers
+     * the 2025 path uses.
+     *
+     * @param mixed               $id        Request id.
+     * @param array<string,mixed> $params    Request params.
+     * @param string|null         $requested The revision named in _meta.
+     * @return array<string,mixed>
+     */
+    private function handle_modern($id, string $method, array $params, ?string $requested): array
+    {
+        // A bare server/discover probe names no revision; anything that
+        // does name one must name one this server serves.
+        if (null !== $requested && Protocol_Revision::MODERN !== $requested) {
+            if (! Protocol_Revision::is_servable($requested)) {
+                return Protocol_Revision::unsupported_version_error($id, $requested);
+            }
+        } elseif (null !== $requested && ! Protocol_Revision::has_client_capabilities($params)) {
+            return self::error_response($id, Protocol_Revision::INVALID_PARAMS, '2026-07-28 requests require clientCapabilities in _meta.');
+        }
+
+        if (! in_array($method, Protocol_Revision::MODERN_METHODS, true)) {
+            return self::error_response($id, Protocol_Revision::METHOD_NOT_FOUND, sprintf('Method not found: %s', $method));
+        }
+
+        $meta         = isset($params['_meta']) ? (array) $params['_meta'] : [];
+        $capabilities = json_decode((string) wp_json_encode($meta[ Protocol_Revision::META_CLIENT_CAPABILITIES ] ?? []), true);
+
+        $this->request_capabilities = is_array($capabilities) ? $capabilities : [];
+        try {
+            if ('server/discover' === $method) {
+                $server = self::capabilities();
+                // The Tasks extension (issue #387): backups and CLI jobs.
+                $server['extensions'] = [ Tasks::EXTENSION => new \stdClass() ];
+                $response = self::result_response($id, Protocol_Revision::discover_result($server));
+            } elseif (str_starts_with($method, 'tasks/')) {
+                $answer   = Tasks::handle($method, $params);
+                $response = isset($answer['error'])
+                    ? self::error_response($id, $answer['error']['code'], $answer['error']['message'])
+                    : self::result_response($id, $answer['result'] ?? []);
+            } else {
+                $response = $this->dispatch($id, $method, $params);
+            }
+        } finally {
+            $this->request_capabilities = null;
+        }
+
+        if (isset($response['error'])) {
+            // 2026-07-28 reports a missing resource as invalid params.
+            if (Protocol_Revision::RESOURCE_NOT_FOUND === ($response['error']['code'] ?? null)) {
+                $response['error']['code'] = Protocol_Revision::INVALID_PARAMS;
+            }
+            return $response;
+        }
+
+        $result = $response['result'] ?? [];
+        $response['result'] = Protocol_Revision::complete($method, is_array($result) ? $result : (array) $result);
+
+        return $response;
+    }
+
+    /**
+     * The revision-neutral method table both paths share.
+     *
+     * @param mixed               $id     Request id.
+     * @param array<string,mixed> $params Request params.
+     * @return array<string,mixed>
+     */
+    private function dispatch($id, string $method, array $params): array
+    {
+        switch ($method) {
+            case 'initialize':
+                return self::result_response($id, $this->initialize_result($params));
+            case 'ping':
+                // stdClass, not []: an empty PHP array serializes as a JSON
+                // array and the MCP spec requires an object here. Same trap
+                // Structured_Result exists to prevent three lines below.
+                return self::result_response($id, new \stdClass());
+            case 'tools/list':
+                return self::result_response($id, [ 'tools' => $this->list_tools() ]);
+            case 'tools/call':
+                return $this->call_tool($id, $params);
+            case 'prompts/list':
+                return self::result_response($id, [ 'prompts' => Context_Primitives::prompts() ]);
+            case 'prompts/get':
+                return $this->get_prompt($id, $params);
+            case 'resources/list':
+                return self::result_response($id, [ 'resources' => Context_Primitives::resources() ]);
+            case 'resources/templates/list':
+                return self::result_response($id, [ 'resourceTemplates' => [] ]);
+            case 'resources/read':
+                return $this->read_resource($id, $params);
+            default:
+                return self::error_response($id, -32601, sprintf('Method not found: %s', $method));
+        }
+    }
+
+    /**
+     * @param array<string,mixed> $params initialize params.
+     * @return array<string,mixed>
+     */
+    private function initialize_result(array $params): array
+    {
+        // Remembered for the session: 2025-11-25 declares them once.
+        $capabilities               = json_decode((string) wp_json_encode($params['capabilities'] ?? []), true);
+        $this->session_capabilities = is_array($capabilities) ? $capabilities : [];
+
+        $server_capabilities = self::capabilities();
+        if (null !== $this->list_watch) {
+            $server_capabilities['tools']['listChanged'] = true;
+            $this->list_watch->start();
+        }
+
+        $result = [
+            'protocolVersion' => self::negotiate_protocol_version($params),
+            'capabilities'    => $server_capabilities,
+            'serverInfo'      => [
+                // The name the adapter is handed in Server::create_server(),
+                // not the server id: clients key config and display off
+                // serverInfo.name, so the two transports must not disagree.
+                'name'    => Server::SERVER_NAME,
+                'version' => defined('WPMCP_VERSION') ? WPMCP_VERSION : '0.0.0',
+            ],
+        ];
+
+        // Same guidance the HTTP handshake serves, built directly rather
+        // than through mcp_adapter_initialize_response: that filter passes
+        // the adapter's InitializeResult DTO, and handing foreign callbacks
+        // a plain array instead would be a contract break.
+        $instructions = (new Handshake_Instructions())->build();
+        if ('' !== $instructions) {
+            $result['instructions'] = $instructions;
+        }
+
+        return $result;
+    }
+
+    /**
+     * Same capability set the adapter advertises on the HTTP route, shared
+     * by the 2025 initialize result and the 2026 server/discover result.
+     *
+     * @return array<string,mixed>
+     */
+    public static function capabilities(): array
+    {
+        return [
+            'prompts'   => [ 'listChanged' => false ],
+            'resources' => [ 'subscribe' => false, 'listChanged' => false ],
+            'tools'     => [ 'listChanged' => false ],
+        ];
+    }
+
+    /**
+     * Echoes the client's protocol version when the adapter supports it,
+     * otherwise the newest supported version. No hardcoded version: the
+     * adapter validates the MCP-Protocol-Version header against this exact
+     * list on the HTTP route, so the two transports must not drift.
+     *
+     * @param array<string,mixed> $params initialize params.
+     */
+    private static function negotiate_protocol_version(array $params): string
+    {
+        $requested = isset($params['protocolVersion']) ? (string) $params['protocolVersion'] : '';
+
+        return Protocol_Revision::negotiate_initialize($requested);
+    }
+
+    /**
+     * Tool descriptors for every wpmcp/ ability visible in the live
+     * registry, same filtering rule as Server::tool_names(), then the same
+     * exposure trim compact mode applies on the HTTP route.
+     *
+     * @return array<int,array<string,mixed>>
+     */
+    private function list_tools(): array
+    {
+        if (! function_exists('wp_get_abilities')) {
+            return [];
+        }
+
+        $tools = [];
+        foreach (wp_get_abilities() as $key => $ability) {
+            $name = is_object($ability) && method_exists($ability, 'get_name')
+                ? $ability->get_name()
+                : (string) $key;
+
+            if (! str_starts_with($name, 'wpmcp/')) {
+                continue;
+            }
+
+            $tool = [
+                'name'        => self::tool_name($name),
+                'description' => is_object($ability) && method_exists($ability, 'get_description')
+                    ? (string) $ability->get_description()
+                    : '',
+                // Wire_Schema turns the empty PHP arrays a schema is written
+                // with into the JSON objects JSON Schema requires, at any
+                // depth (issues #586, #591): this list serves stdio and the
+                // HTTP 2026-07-28 path, which the adapter's own DTOs never see.
+                'inputSchema' => Wire_Schema::input(
+                    is_object($ability) && method_exists($ability, 'get_input_schema')
+                        ? $ability->get_input_schema()
+                        : []
+                ),
+                // Issue #387; see Output_Schemas for why these live at the wire.
+                'outputSchema' => Wire_Schema::schema(Output_Schemas::for_ability($name)),
+            ];
+            // Annotations and the requirement note (issue #630), as on HTTP.
+            $registered = Plugin::instance()->registrar()->get($name);
+            $tools[]    = null !== $registered ? Tool_Annotations::apply($tool, $registered) : $tool;
+        }
+
+        $trimmed = (new Tool_Exposure())->filter_tools_list($tools);
+
+        return is_array($trimmed) ? array_values($trimmed) : $tools;
+    }
+
+    /**
+     * Executes one tool via the Abilities API. Ability-level failures come
+     * back as MCP tool errors (isError content), not JSON-RPC faults,
+     * matching the HTTP transport's behavior.
+     *
+     * @param mixed               $id     Request id.
+     * @param array<string,mixed> $params tools/call params.
+     * @return array<string,mixed>
+     */
+    private function call_tool($id, array $params): array
+    {
+        $tool_name    = isset($params['name']) ? (string) $params['name'] : '';
+        $ability_name = self::ability_for_tool($tool_name);
+        $not_in_build = Not_In_Build::refusal($tool_name, is_array($params['arguments'] ?? null) ? $params['arguments'] : []);
+        if (null !== $not_in_build) {
+            return self::result_response($id, Hidden_Tool_Refusal::result($not_in_build));
+        }
+
+        if (null === $ability_name) {
+            // A dispatcher pair held back because no plugin it covers is
+            // active (issue #876): a direct call is told which to activate.
+            if (class_exists('\\WPMCP\\Plugin')) {
+                $arguments = is_array($params['arguments'] ?? null) ? $params['arguments'] : [];
+                $inactive  = \WPMCP\Plugin::instance()->registrar()->plugin_inactive_for_tool($tool_name, $arguments);
+                if (null !== $inactive) {
+                    return self::result_response($id, Hidden_Tool_Refusal::result($inactive));
+                }
+            }
+
+            return self::error_response($id, -32602, sprintf('Unknown tool: %s', $tool_name));
+        }
+
+        // wp_has_ability() first: wp_get_ability() on an unknown name raises
+        // _doing_it_wrong(), which prints HTML onto the protocol stream.
+        $ability = wp_has_ability($ability_name) ? wp_get_ability($ability_name) : null;
+        if (! is_object($ability) || ! method_exists($ability, 'execute')) {
+            return self::error_response($id, -32602, sprintf('Unknown tool: %s', $tool_name));
+        }
+
+        $input = is_array($params['arguments'] ?? null) ? $params['arguments'] : [];
+
+        // The permission check first, as the HTTP adapter does: a refusal that
+        // names what is missing (issue #875) is shown, where execute() would
+        // hand back core's generic "does not have necessary permission".
+        if (method_exists($ability, 'check_permissions')) {
+            $permission = $ability->check_permissions($input);
+            if (is_wp_error($permission)) {
+                return self::result_response($id, self::tool_result($permission));
+            }
+        }
+
+        // Confirm gates as elicitation (issue #387): 'answer' is a 2026
+        // retry carrying the question's answer, 'ask' the channel to ask on.
+        $ask       = $this->elicitation_channel();
+        $confirmed = false;
+        if ('input_required' === $ask) {
+            $answer = Elicitation::answer($params, $tool_name, $input);
+            if ('decline' === $answer) {
+                return self::result_response($id, Elicitation::declined_result($tool_name));
+            }
+            if ('accept' === $answer) {
+                $input     = Elicitation::with_confirm($tool_name, $input, true);
+                $confirmed = true;
+            }
+        }
+
+        $probe = null === $ask || $confirmed
+            ? $input
+            : Elicitation::probe_input($tool_name, $input, method_exists($ability, 'get_input_schema') ? (array) $ability->get_input_schema() : []);
+
+        $outcome = self::execute($ability, $probe);
+
+        if (null !== $ask && ! $confirmed && Elicitation::is_confirmation_refusal($outcome)) {
+            $reason = Elicitation::refusal_message($outcome);
+
+            if ('input_required' === $ask) {
+                return self::result_response($id, Elicitation::input_required($tool_name, $input, $reason));
+            }
+
+            $reply = ($this->client_requester)('elicitation/create', Elicitation::request_params($tool_name, $input, $reason));
+            if (null !== $reply) {
+                if (! Elicitation::accepted($reply)) {
+                    return self::result_response($id, Elicitation::declined_result($tool_name));
+                }
+                $outcome = self::execute($ability, Elicitation::with_confirm($tool_name, $input, true));
+            }
+        }
+
+        // Backups and CLI jobs as Tasks (issue #387) for a client that
+        // declared the extension: the job just queued, as a task handle.
+        $kind = Tasks::kind_for($ability_name);
+        if (
+            null !== $kind
+            && null !== $this->request_capabilities
+            && Tasks::supported($this->request_capabilities)
+            && is_array($outcome)
+            && isset($outcome['job_id'])
+            && is_int($outcome['job_id'])
+        ) {
+            $task = Tasks::create_result($kind, $outcome['job_id']);
+            if (null !== $task) {
+                return self::result_response($id, $task);
+            }
+        }
+
+        return self::result_response($id, self::tool_result($outcome));
+    }
+
+    /**
+     * How a confirm gate can ask the person on this request: by an
+     * input_required result (2026-07-28), by elicitation/create on the
+     * live session (2025-11-25 over stdio), or not at all (null), in which
+     * case the confirm argument is the whole contract.
+     */
+    private function elicitation_channel(): ?string
+    {
+        if (null !== $this->request_capabilities) {
+            return Elicitation::supports_form($this->request_capabilities) ? 'input_required' : null;
+        }
+
+        return null !== $this->client_requester && Elicitation::supports_form($this->session_capabilities)
+            ? 'session'
+            : null;
+    }
+
+    /**
+     * Runs one ability and returns what it produced: its result, the
+     * WP_Error it returned, or the Throwable it threw.
+     *
+     * The adapter's ToolsHandler::call_tool() catches Throwable and
+     * returns an isError CallToolResult, so the HTTP route survives a
+     * throwing tool. Registrar::throttled() returns a wpmcp tool's
+     * exception as a WP_Error on every WordPress (issue #612), but an
+     * ability registered by another plugin can still throw on 6.9, so
+     * parity here has to be written rather than assumed.
+     *
+     * @param object              $ability The WP_Ability.
+     * @param array<string,mixed> $input
+     * @return mixed
+     */
+    private static function execute($ability, array $input)
+    {
+        Confirmation_Required::take();
+        try {
+            $outcome = $ability->execute($input);
+        } catch (\Throwable $e) {
+            $outcome = $e;
+        }
+
+        // Core 7.1 hands a thrown refusal back as a generic WP_Error; the
+        // Registrar saw it typed on the way out (Confirmation_Required).
+        $refusal = Confirmation_Required::take();
+        if (null !== $refusal && is_wp_error($outcome)) {
+            return $refusal;
+        }
+
+        return $outcome;
+    }
+
+    /**
+     * An ability outcome as a CallToolResult. Ability-level failures come
+     * back as MCP tool errors (isError content), not JSON-RPC faults,
+     * matching the HTTP transport's behavior.
+     *
+     * @param mixed $outcome
+     * @return array<string,mixed>
+     */
+    private static function tool_result($outcome): array
+    {
+        if ($outcome instanceof \Throwable) {
+            return [
+                'isError' => true,
+                'content' => [ [ 'type' => 'text', 'text' => Registrar::plain_text($outcome->getMessage()) ] ],
+            ];
+        }
+
+        if (is_wp_error($outcome)) {
+            return [
+                'isError' => true,
+                'content' => [ [ 'type' => 'text', 'text' => $outcome->get_error_message() ] ],
+            ];
+        }
+
+        // Same wire normalization the HTTP route gets from Structured_Result
+        // on mcp_adapter_tool_call_result: structuredContent must be a JSON
+        // object, never a top-level list or scalar.
+        $normalized = Structured_Result::normalize($outcome);
+
+        // Unchecked, a false from wp_json_encode (invalid UTF-8 in a tool
+        // result, depth overflow) casts to '' and the text block silently
+        // becomes empty while structuredContent still claims a payload.
+        $text = wp_json_encode($normalized);
+        if (false === $text) {
+            return [
+                'isError' => true,
+                'content' => [ [ 'type' => 'text', 'text' => 'Tool result could not be serialized as JSON.' ] ],
+            ];
+        }
+
+        return [
+            'isError'           => false,
+            'content'           => [ [ 'type' => 'text', 'text' => $text ] ],
+            'structuredContent' => $normalized,
+        ];
+    }
+
+    /**
+     * prompts/get (issue #301). An unknown name is invalid params per the
+     * MCP prompts spec; a denial by the backing ability is the same
+     * permission-denied code the adapter returns on the HTTP route.
+     *
+     * @param mixed               $id     Request id.
+     * @param array<string,mixed> $params prompts/get params.
+     * @return array<string,mixed>
+     */
+    private function get_prompt($id, array $params): array
+    {
+        $name = isset($params['name']) && is_string($params['name']) ? trim($params['name']) : '';
+        if (! Context_Primitives::has_prompt($name)) {
+            return self::error_response($id, -32602, sprintf('Unknown prompt: %s', $name));
+        }
+
+        $allowed = Context_Primitives::prompt_permission($name);
+        if (true !== $allowed) {
+            return self::primitive_error($id, $allowed, -32602);
+        }
+
+        $result = Context_Primitives::render_prompt($name);
+        if (is_wp_error($result)) {
+            return self::primitive_error($id, $result, -32602);
+        }
+
+        return self::result_response($id, $result);
+    }
+
+    /**
+     * resources/read (issue #301). An unknown URI is -32002, the resource
+     * not found code from the MCP resources spec.
+     *
+     * @param mixed               $id     Request id.
+     * @param array<string,mixed> $params resources/read params.
+     * @return array<string,mixed>
+     */
+    private function read_resource($id, array $params): array
+    {
+        if (! isset($params['uri']) || ! is_string($params['uri'])) {
+            return self::error_response($id, -32602, 'Missing required parameter: uri');
+        }
+
+        $uri = trim($params['uri']);
+        if (! Context_Primitives::has_resource($uri)) {
+            return self::error_response($id, -32002, sprintf('Resource not found: %s', $uri));
+        }
+
+        $allowed = Context_Primitives::resource_permission($uri);
+        if (true !== $allowed) {
+            return self::primitive_error($id, $allowed, -32002);
+        }
+
+        $contents = Context_Primitives::read_resource($uri);
+        if (is_wp_error($contents)) {
+            return self::primitive_error($id, $contents, -32002);
+        }
+
+        return self::result_response($id, [ 'contents' => $contents ]);
+    }
+
+    /**
+     * Map a Context_Primitives failure onto a JSON-RPC error.
+     *
+     * @param mixed     $id             Request id.
+     * @param mixed     $error          WP_Error (or a non-true permission result).
+     * @param int       $not_found_code Code for a missing primitive on this method.
+     * @return array<string,mixed>
+     */
+    private static function primitive_error($id, $error, int $not_found_code): array
+    {
+        if (! is_wp_error($error)) {
+            return self::error_response($id, -32008, 'Permission denied');
+        }
+
+        switch ($error->get_error_code()) {
+            case Context_Primitives::ERROR_NOT_FOUND:
+                return self::error_response($id, $not_found_code, $error->get_error_message());
+            case Context_Primitives::ERROR_DENIED:
+                return self::error_response($id, -32008, 'Permission denied: ' . $error->get_error_message());
+            default:
+                return self::error_response($id, -32603, $error->get_error_message());
+        }
+    }
+
+    /**
+     * The ability name behind an advertised MCP tool name, or null when no
+     * registered wpmcp ability maps to it.
+     *
+     * Resolved by inverting the registry through the same mapping used to
+     * advertise the tool rather than by reversing the string: the adapter's
+     * sanitizer is not a reversible transform (it truncates long names and
+     * rewrites out-of-charset ones), so guessing where the '/' was is wrong
+     * for exactly the names that are hardest to debug.
+     */
+    private static function ability_for_tool(string $tool_name): ?string
+    {
+        if (
+            '' === $tool_name
+            || ! function_exists('wp_get_abilities')
+            || ! function_exists('wp_get_ability')
+            || ! function_exists('wp_has_ability')
+        ) {
+            return null;
+        }
+
+        foreach (wp_get_abilities() as $key => $ability) {
+            $name = is_object($ability) && method_exists($ability, 'get_name')
+                ? $ability->get_name()
+                : (string) $key;
+
+            if (! str_starts_with($name, 'wpmcp/')) {
+                continue;
+            }
+
+            if (self::tool_name($name) === $tool_name) {
+                return $name;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Ability name to MCP tool name, using the adapter's sanitizer when it
+     * is loaded so stdio and HTTP advertise byte-identical names.
+     */
+    public static function tool_name(string $ability_name): string
+    {
+        $sanitizer = '\\WP\\MCP\\Domain\\Utils\\McpNameSanitizer';
+        if (class_exists($sanitizer)) {
+            $sanitized = $sanitizer::sanitize_name($ability_name);
+            if (is_string($sanitized)) {
+                return $sanitized;
+            }
+        }
+
+        return Tool_Exposure::tool_name($ability_name);
+    }
+
+    /**
+     * Drops the memoized reads a long-lived loop would otherwise freeze, so
+     * an option written by another process (a revoked ability, a flipped
+     * exposure mode, a newly published guardrail) is observed on the next
+     * message rather than at the next restart.
+     *
+     * Deliberately NOT wp_cache_flush(). On a site running a persistent
+     * object-cache drop-in that wipes the whole shared cache, once per
+     * JSON-RPC message, for every other process on the site; it would also
+     * delete the transient-backed rate-limit counter (Rate_Limiter::PREFIX
+     * transients live in the object cache when one is present), which is
+     * the one piece of per-client state the loop most needs to keep. The
+     * plugin treats wp_cache_flush() as an explicit, operator-invoked
+     * destructive action (Tools\Cache\Clear_Cache); doing it implicitly is
+     * not this transport's call to make.
+     *
+     * So: flush the process-local cache only when it IS process-local, and
+     * otherwise delete the narrow option keys the gates read through (the
+     * same targeted pattern as Auth\Code_Store). Statics that no cache
+     * layer can reach are reset by hand; Memory_Store::$rules_cache is one,
+     * and it backs a severity=block guardrail.
+     */
+    private static function reset_per_message_state(): void
+    {
+        Operation_Context::reset();
+
+        Memory_Store::flush_rules_cache();
+
+        $persistent = function_exists('wp_using_ext_object_cache') && wp_using_ext_object_cache();
+
+        if (! $persistent) {
+            if (function_exists('wp_cache_flush')) {
+                wp_cache_flush();
+            }
+            return;
+        }
+
+        if (function_exists('wp_cache_delete')) {
+            wp_cache_delete('alloptions', 'options');
+            wp_cache_delete('notoptions', 'options');
+        }
+    }
+
+    /**
+     * @param mixed $id     Request id.
+     * @param mixed $result Result payload (an array, or stdClass where the
+     *                      spec requires an empty JSON object).
+     * @return array<string,mixed>
+     */
+    private static function result_response($id, $result): array
+    {
+        return [ 'jsonrpc' => self::JSONRPC, 'id' => $id, 'result' => $result ];
+    }
+
+    /**
+     * @param mixed  $id      Request id.
+     * @param int    $code    JSON-RPC error code.
+     * @param string $message Error message.
+     * @return array<string,mixed>
+     */
+    private static function error_response($id, int $code, string $message): array
+    {
+        return [
+            'jsonrpc' => self::JSONRPC,
+            'id'      => $id,
+            'error'   => [ 'code' => $code, 'message' => $message ],
+        ];
+    }
+
+    /** @param array<string,mixed> $response Message to write to stdout. */
+    private static function emit(array $response): void
+    {
+        $json = wp_json_encode($response);
+
+        // Unchecked, a false here writes a bare newline and the client
+        // waits forever on a request id that will never be answered. Core
+        // handles the analogous case on the HTTP route by turning the
+        // encode failure into a 500 rest_encode_error; the stdio equivalent
+        // is an internal-error envelope carrying the same id.
+        if (false === $json) {
+            $json = wp_json_encode(
+                self::error_response($response['id'] ?? null, -32603, 'Response could not be serialized as JSON.')
+            );
+        }
+        if (false === $json) {
+            return;
+        }
+
+        // fwrite, not echo: WP-CLI's output layer can buffer and interleave,
+        // and one interleaved byte desynchronizes the framing.
+        // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fwrite -- stdio transport: STDOUT is the protocol stream, not a file. WP_Filesystem has no equivalent.
+        fwrite(STDOUT, $json . "\n");
+    }
+}

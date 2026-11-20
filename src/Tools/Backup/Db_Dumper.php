@@ -1,0 +1,461 @@
+<?php
+
+namespace WPMCP\Tools\Backup;
+
+if (! defined('ABSPATH')) {
+    exit;
+}
+
+/**
+ * Produces a portable SQL dump of this site's tables, written incrementally
+ * through a caller-supplied writer callable rather than returned as a string.
+ *
+ * Streaming is the whole point: a modest site's wp_options and wp_postmeta
+ * dump to tens of megabytes, and buffering that into one PHP string is what
+ * turns "backup" into "fatal, memory exhausted" on the shared hosting this
+ * plugin has to run on. Rows are read in bounded batches and handed to the
+ * writer as soon as each statement is built, so peak memory tracks the batch
+ * size, not the database size.
+ *
+ * No shell-out. mysqldump is absent or disabled on most managed WordPress
+ * hosts, and wp.org forbids shipping code that shells out to it, so the dump
+ * is generated entirely through $wpdb.
+ *
+ * KNOWN LIMIT, still open: tables are read one after another outside any
+ * enclosing transaction, so the archive is not a point-in-time snapshot of
+ * the whole database. A post written midway through a dump can land in
+ * wp_posts with its wp_postmeta already read, so the restore sees the post
+ * without its meta. Per-table reads are now stable under concurrent writes
+ * (see dump_table()'s keyset pagination), which is the larger half of the
+ * problem; closing the rest needs START TRANSACTION WITH CONSISTENT SNAPSHOT
+ * around the whole dump, which is InnoDB-specific and commits any
+ * transaction already open on the connection - so it needs its own change
+ * with its own tests rather than being smuggled in here.
+ *
+ * KNOWN LIMIT, deliberately not papered over: values are emitted as escaped
+ * string literals via $wpdb::prepare(). That round-trips every column type
+ * WordPress core and the plugin ecosystem actually use (MySQL coerces the
+ * literal back to the column type on import), but a true binary BLOB
+ * containing invalid UTF-8 can be mangled. This engine reports which tables
+ * held BLOB columns in the manifest (see blob_tables()) so a restore can warn
+ * rather than silently produce a corrupt row.
+ */
+class Db_Dumper
+{
+    /** Rows read per SELECT. Bounds peak memory during the dump. */
+    public const BATCH = 500;
+
+    /** Soft cap on a single generated INSERT statement, in bytes. */
+    public const MAX_STATEMENT_BYTES = 512000;
+
+    /**
+     * Every table belonging to this install, in a stable (sorted) order.
+     *
+     * Scoped by table prefix so a shared database hosting several WordPress
+     * installs only dumps this one. On multisite the BASE prefix is used, so
+     * a network backup captures the global tables plus every sub-site's
+     * tables (wp_2_posts and friends) instead of only the current site's.
+     *
+     * @return string[]
+     */
+    public function tables(): array
+    {
+        global $wpdb;
+
+        $prefix = is_multisite() ? $wpdb->base_prefix : $wpdb->prefix;
+
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Enumerating tables to dump; there is no core API for this and caching a backup's table list would be wrong.
+        $tables = $wpdb->get_col(
+            $wpdb->prepare('SHOW TABLES LIKE %s', $wpdb->esc_like($prefix) . '%')
+        );
+
+        $tables = is_array($tables) ? $tables : [];
+        sort($tables);
+
+        return $tables;
+    }
+
+    /**
+     * Dump $tables (defaulting to every table on this install) as SQL,
+     * handing each chunk to $write as it is produced.
+     *
+     * Returns per-table row counts plus the tables that carry BLOB columns,
+     * which the archive manifest records for restore-time warnings.
+     *
+     * @param callable(string):void $write
+     * @param string[]|null         $tables
+     * @return array{tables: array<string,int>, blob_tables: string[], bytes: int}
+     */
+    public function dump(callable $write, ?array $tables = null): array
+    {
+        $state = $this->begin($tables);
+        $state = $this->step($state, $write, static fn(): bool => false);
+
+        return self::result($state);
+    }
+
+    /**
+     * Start a dump that can be continued in later requests (issue #783):
+     * the returned state is plain data, saved on the backup job between
+     * steps, and step() carries it forward. dump() is begin() plus one
+     * step() that never yields, so both write the same SQL.
+     *
+     * @param string[]|null $tables
+     * @return array<string,mixed>
+     */
+    public function begin(?array $tables = null): array
+    {
+        // Before the header is written: a refused dump emits nothing.
+        Network_Scope::assert_caller('A database dump');
+
+        $all = $this->tables();
+        // Never dump a table that is not ours: $tables is caller-supplied, so
+        // the intersection against the enumerated list is what keeps every
+        // query below on our own prefix (the names are then bound with %i).
+        $targets = null === $tables ? $all : array_values(array_intersect($tables, $all));
+
+        return [
+            'tables'      => $targets,
+            'index'       => 0,
+            'started'     => false,
+            'header'      => false,
+            'cursor'      => null,
+            'offset'      => 0,
+            'counts'      => [],
+            'blob_tables' => [],
+            'bytes'       => 0,
+            'done'        => false,
+        ];
+    }
+
+    /**
+     * Continue a dump from $state, writing through $write, until it is done
+     * or $yield returns true. $yield is asked after every batch of rows, so
+     * one call always makes progress. A yield ends the open INSERT at a row
+     * boundary, which keeps every statement in the file whole wherever the
+     * request that wrote it stopped.
+     *
+     * @param callable(string):void $write
+     * @param callable():bool       $yield
+     * @return array<string,mixed> the state to pass to the next call
+     */
+    public function step(array $state, callable $write, callable $yield, int $batch = self::BATCH): array
+    {
+        Network_Scope::assert_caller('A database dump');
+
+        $batch = max(1, $batch);
+        $emit  = static function (string $sql) use ($write, &$state): void {
+            $state['bytes'] += strlen($sql);
+            $write($sql);
+        };
+
+        if (empty($state['header'])) {
+            $emit($this->header());
+            $state['header'] = true;
+        }
+
+        $tables = array_values((array) $state['tables']);
+        while ((int) $state['index'] < count($tables)) {
+            $table = (string) $tables[ (int) $state['index'] ];
+
+            if (empty($state['started'])) {
+                $state['started']          = true;
+                $state['cursor']           = null;
+                $state['offset']           = 0;
+                $state['counts'][ $table ] = 0;
+                if (! $this->start_table($table, $emit)) {
+                    // A table that vanished between enumeration and dump (a
+                    // plugin uninstall mid-backup) is skipped rather than
+                    // aborting the whole archive: a backup missing one
+                    // dropped table beats no backup.
+                    $state['index']++;
+                    $state['started'] = false;
+                    continue;
+                }
+                if ($this->has_blob_column($table)) {
+                    $state['blob_tables'][] = $table;
+                }
+            }
+
+            $finished = $this->dump_rows($table, $state, $emit, $yield, $batch);
+            if ($finished) {
+                if ((int) $state['counts'][ $table ] > 0) {
+                    $emit("\n");
+                }
+                $state['index']++;
+                $state['started'] = false;
+            }
+            if ($yield()) {
+                break;
+            }
+        }
+
+        if ((int) $state['index'] >= count($tables)) {
+            $emit($this->footer());
+            $state['done'] = true;
+        }
+
+        return $state;
+    }
+
+    /**
+     * What dump() returns, from a finished state.
+     *
+     * @return array{tables: array<string,int>, blob_tables: string[], bytes: int}
+     */
+    public static function result(array $state): array
+    {
+        return [
+            'tables'      => array_map('intval', (array) ($state['counts'] ?? [])),
+            'blob_tables' => array_values((array) ($state['blob_tables'] ?? [])),
+            'bytes'       => (int) ($state['bytes'] ?? 0),
+        ];
+    }
+
+    /**
+     * A table's structure. False when the table is gone.
+     *
+     * @param callable(string):void $emit
+     */
+    private function start_table(string $table, callable $emit): bool
+    {
+        global $wpdb;
+
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.DirectDatabaseQuery.SchemaChange -- $table came from tables() above (SHOW TABLES on our own prefix) and is bound with %i. SHOW CREATE TABLE reads the schema, it does not change it. Not cached: a backup must capture the live schema.
+        $create = $wpdb->get_row($wpdb->prepare('SHOW CREATE TABLE %i', $table), ARRAY_N);
+
+        if (! is_array($create) || ! isset($create[1])) {
+            return false;
+        }
+
+        $quoted = '`' . str_replace('`', '``', $table) . '`';
+
+        $emit("\n--\n-- Table structure for {$table}\n--\n\n");
+        $emit("DROP TABLE IF EXISTS {$quoted};\n");
+        $emit($create[1] . ";\n\n");
+
+        return true;
+    }
+
+    /**
+     * A table's rows, in batches, from the cursor in $state. Returns true
+     * when the table is done, false when $yield stopped it part-way (the
+     * cursor and offset in $state then say where to go on from).
+     *
+     * @param callable(string):void $emit
+     * @param callable():bool       $yield
+     */
+    private function dump_rows(string $table, array &$state, callable $emit, callable $yield, int $batch): bool
+    {
+        global $wpdb;
+
+        $quoted = '`' . str_replace('`', '``', $table) . '`';
+        $key    = $this->primary_key($table);
+        $order  = null !== $key ? '`' . str_replace('`', '``', $key) . '`' : $this->column_order($table);
+        $buffer = '';
+        $done   = false;
+
+        while (true) {
+            $cursor = $state['cursor'];
+            $offset = (int) $state['offset'];
+            if (null !== $key) {
+                // Keyset pagination. LIMIT/OFFSET reads a shifting window:
+                // an INSERT or DELETE by ordinary site traffic while the dump
+                // is running moves every later row across the boundary, which
+                // duplicates or skips rows in a file nothing will validate
+                // until someone tries to restore it. Seeking past the last
+                // key read is stable under concurrent writes, and it also
+                // avoids the O(n^2) scan OFFSET costs on a large postmeta.
+                $sql = null === $cursor
+                    ? $wpdb->prepare('SELECT * FROM %i ORDER BY %i ASC LIMIT %d', $table, $key, $batch)
+                    : $wpdb->prepare('SELECT * FROM %i WHERE %i > %s ORDER BY %i ASC LIMIT %d', $table, $key, (string) $cursor, $key, $batch);
+            } else {
+                // No single-column primary key to seek on, so OFFSET is the
+                // only option, but ordered, so at least the sequence is
+                // deterministic rather than whatever the optimiser returns.
+                // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $order is a backtick-quoted column list built by Db_Dumper::column_order() (src/Tools/Backup/Db_Dumper.php) from SHOW COLUMNS %i on this validated table; %i binds one identifier, and an ORDER BY over every column is a list of them.
+                $sql = $wpdb->prepare("SELECT * FROM %i ORDER BY {$order} LIMIT %d OFFSET %d", $table, $batch, $offset);
+            }
+
+            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Identifiers come from the validated table list and from SHOW KEYS/SHOW COLUMNS on that table; every value is bound. Not cached: a backup must capture the live rows, each read once.
+            $rows = $wpdb->get_results($sql, ARRAY_A);
+
+            if (! is_array($rows) || [] === $rows) {
+                $done = true;
+                break;
+            }
+
+            if (null !== $key) {
+                $last            = $rows[ count($rows) - 1 ];
+                $state['cursor'] = (string) ($last[ $key ] ?? '');
+            }
+
+            foreach ($rows as $row) {
+                $values = $this->value_list($row);
+
+                if ('' === $buffer) {
+                    $buffer = "INSERT INTO {$quoted} ({$this->column_list($row)}) VALUES\n{$values}";
+                } else {
+                    $buffer .= ",\n{$values}";
+                }
+
+                if (strlen($buffer) >= self::MAX_STATEMENT_BYTES) {
+                    $emit($buffer . ";\n");
+                    $buffer = '';
+                }
+            }
+
+            $state['counts'][ $table ] = (int) ($state['counts'][ $table ] ?? 0) + count($rows);
+            $state['offset']           = $offset + count($rows);
+
+            if (count($rows) < $batch) {
+                $done = true;
+                break;
+            }
+
+            if ($yield()) {
+                break;
+            }
+        }
+
+        if ('' !== $buffer) {
+            $emit($buffer . ";\n");
+        }
+
+        return $done;
+    }
+
+    /**
+     * The table's primary key, when it is a single column.
+     *
+     * A composite key is deliberately not stitched into a keyset seek: the
+     * multi-column comparison is easy to get subtly wrong, and the ordered
+     * OFFSET fallback is already correct for the rare WordPress table that
+     * has one (term_relationships being the notable case).
+     */
+    private function primary_key(string $table): ?string
+    {
+        global $wpdb;
+
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- schema introspection of a table from the validated list, bound with %i; the key must reflect the live table.
+        $keys = $wpdb->get_results($wpdb->prepare("SHOW KEYS FROM %i WHERE Key_name = 'PRIMARY'", $table), ARRAY_A);
+
+        if (! is_array($keys) || 1 !== count($keys)) {
+            return null;
+        }
+
+        $column = (string) ($keys[0]['Column_name'] ?? '');
+
+        return '' === $column ? null : $column;
+    }
+
+    /** Every column, backtick-quoted, as a deterministic ORDER BY clause. */
+    private function column_order(string $table): string
+    {
+        global $wpdb;
+
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- schema introspection of a table from the validated list, bound with %i; the column set must reflect the live table.
+        $columns = $wpdb->get_results($wpdb->prepare('SHOW COLUMNS FROM %i', $table), ARRAY_A);
+
+        if (! is_array($columns) || [] === $columns) {
+            return '1';
+        }
+
+        $names = array_map(
+            static fn(array $c): string => '`' . str_replace('`', '``', (string) $c['Field']) . '`',
+            $columns
+        );
+
+        return implode(', ', $names);
+    }
+
+    /** Backtick-quoted column list for an INSERT, derived from the row keys. */
+    private function column_list(array $row): string
+    {
+        $columns = array_map(
+            static fn(string $name): string => '`' . str_replace('`', '``', $name) . '`',
+            array_keys($row)
+        );
+
+        return implode(', ', $columns);
+    }
+
+    /**
+     * One row rendered as a VALUES tuple. NULL stays a real SQL NULL (not the
+     * string "NULL", which would silently turn every nullable column into
+     * text on restore); everything else is escaped through $wpdb::prepare(),
+     * the same escaping path every write in this plugin already trusts.
+     */
+    private function value_list(array $row): string
+    {
+        global $wpdb;
+
+        $values = [];
+        foreach ($row as $value) {
+            if (null === $value) {
+                $values[] = 'NULL';
+                continue;
+            }
+            // prepare() swaps every "%" for a random per-request token and
+            // only turns it back when the string passes through
+            // $wpdb->query() in the SAME request. The dump is replayed in a
+            // different request, so the token must come out here, or every
+            // "%" in the data (permalink_structure's /%postname%/ among
+            // them) is restored as 66 characters of noise.
+            $values[] = $wpdb->remove_placeholder_escape($wpdb->prepare('%s', (string) $value));
+        }
+
+        return '(' . implode(', ', $values) . ')';
+    }
+
+    /**
+     * Whether a table has any BLOB/BINARY column, recorded in the manifest so
+     * a restore can warn about the string-literal round-trip limit above.
+     */
+    private function has_blob_column(string $table): bool
+    {
+        global $wpdb;
+
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- schema introspection of a table from the validated list, bound with %i; the column set must reflect the live table.
+        $columns = $wpdb->get_results($wpdb->prepare('SHOW COLUMNS FROM %i', $table), ARRAY_A);
+
+        if (! is_array($columns)) {
+            return false;
+        }
+
+        foreach ($columns as $column) {
+            $type = strtolower((string) ($column['Type'] ?? ''));
+            if (str_contains($type, 'blob') || str_contains($type, 'binary')) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Dump preamble. Foreign key and uniqueness checks are suspended for the
+     * duration of an import because tables arrive in alphabetical order, not
+     * dependency order, and the session sql_mode is pinned so a dump taken on
+     * a permissive server does not fail row-by-row on a strict one.
+     */
+    private function header(): string
+    {
+        global $wpdb;
+
+        $charset = $wpdb->charset ?: 'utf8mb4';
+
+        return "-- WP MCP site backup\n"
+            . '-- Generated: ' . gmdate('c') . "\n"
+            . '-- Plugin version: ' . (defined('WPMCP_VERSION') ? WPMCP_VERSION : '0.0.0') . "\n\n"
+            . "SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO';\n"
+            . "SET FOREIGN_KEY_CHECKS = 0;\n"
+            . "SET UNIQUE_CHECKS = 0;\n"
+            . "SET NAMES {$charset};\n\n";
+    }
+
+    private function footer(): string
+    {
+        return "\nSET FOREIGN_KEY_CHECKS = 1;\nSET UNIQUE_CHECKS = 1;\n";
+    }
+}

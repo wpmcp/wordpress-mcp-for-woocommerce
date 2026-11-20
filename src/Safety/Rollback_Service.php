@@ -1,0 +1,3985 @@
+<?php
+
+// phpcs:disable PSR1.Files.SideEffects.FoundWithSymbols -- ABSPATH guard is an intentional side effect.
+// phpcs:disable Squiz.Classes.ValidClassName.NotCamelCaps -- WP-style snake_case class name is intentional (matches brief's public interface).
+// phpcs:disable PSR1.Methods.CamelCapsMethodName.NotCamelCaps -- WP-style snake_case method names are intentional (matches brief's public interface).
+
+namespace WPMCP\Safety;
+
+use WPMCP\Privacy\Snapshot_Redactor;
+use WPMCP\Tools\Content\Content_Guard;
+use WPMCP\Tools\Database\Database_Guard;
+use WPMCP\Tools\Builders\Avada_Cache;
+use WPMCP\Tools\Builders\Beaver_Builder_Cache;
+use WPMCP\Tools\Builders\BeTheme_Cache;
+use WPMCP\Tools\Builders\Breakdance_Cache;
+use WPMCP\Tools\Builders\Bricks_Cache;
+use WPMCP\Tools\Builders\Builder_Design_Refresh;
+use WPMCP\Tools\Builders\Oxygen_Classic_Cache;
+use WPMCP\Tools\Builders\Elementor_Cache;
+
+if (! defined('ABSPATH')) {
+    exit;
+}
+
+class Rollback_Service
+{
+    /**
+     * Non-fatal findings from the most recent restore, currently only ever
+     * produced by the db_rows path's conflict detection (rows that changed,
+     * vanished, or were reclaimed since the operation being undone). A
+     * conflict is deliberately a WARNING, not a failure: rollback still
+     * restores the captured before-image (that is the promise), but the
+     * caller is told the ground shifted underneath it. Collected statically
+     * because apply_snapshot() is a void pipeline shared by callers that
+     * cannot thread a return value through (Safe_Mutation::restore).
+     */
+    private static array $warnings = [];
+
+    /**
+     * Set while an agent-facing rollback runs for a caller without
+     * moderate_comments: the comments a post snapshot resurrects then come
+     * back with the commenter's email, IP and user agent blank (issue #362).
+     * Static for the same reason as $warnings: apply_snapshot() is a void
+     * pipeline, and Safe_Mutation's own unwind must stay exact.
+     */
+    private static bool $blank_commenter_data = false;
+
+    /**
+     * Whether the most recent creation undo left a post it covers untouched
+     * (issue #756), so the undo point was not applied and stays live.
+     */
+    private static bool $post_create_untouched = false;
+
+    /**
+     * The posts the most recent restore moved to the trash because it undid
+     * their creation (issue #822): id, post_type and title of each, so the
+     * rollback tools can say where a created item went.
+     *
+     * @var array<int, array{id: int, post_type: string, title: string}>
+     */
+    private static array $trashed = [];
+
+    /** Return and clear the posts the most recent restore moved to the trash. */
+    public static function take_trashed(): array
+    {
+        $trashed       = self::$trashed;
+        self::$trashed = [];
+        return $trashed;
+    }
+
+    /** Return and clear the warnings accumulated by the most recent restore. */
+    public static function take_warnings(): array
+    {
+        $warnings       = self::$warnings;
+        self::$warnings = [];
+        return $warnings;
+    }
+
+    private static function warn(string $message): void
+    {
+        self::$warnings[] = $message;
+    }
+
+    private static function warn_if(?string $message): void
+    {
+        if (null !== $message) {
+            self::warn($message);
+        }
+    }
+
+    public static function restore_operation(string $operation_id): bool
+    {
+        self::$warnings = [];
+        self::$trashed  = [];
+        self::ensure_ledger_schema();
+        $row = Snapshot_Store::get_by_operation($operation_id);
+        if (! $row) {
+            return false;
+        }
+        // An undone operation is never applied again (issue #593): its
+        // before-image predates every write made since, so a second undo
+        // would wipe newer work, and a delete's undo would insert one more
+        // copy of what it deleted.
+        $undone = Snapshot_Store::rolled_back_at($row);
+        if (null !== $undone) {
+            self::warn(self::already_undone($operation_id, $undone));
+            return false;
+        }
+        // A personal data erasure redacted this snapshot (issue #478).
+        if (Snapshot_Redactor::is_erased($row['snapshot'])) {
+            self::warn(sprintf('operation %s refused: %s', $operation_id, Snapshot_Redactor::refusal($row['snapshot'])));
+            return false;
+        }
+        if (! self::may_restore($row['snapshot'])) {
+            self::warn(sprintf(
+                'operation %s refused: %s restoring it requires %s.',
+                $operation_id,
+                self::refusal_subject($row['snapshot'], 'its snapshot'),
+                self::restore_capability($row['snapshot'])
+            ));
+            return false;
+        }
+        $refused = self::refused_post($row['snapshot']);
+        if (null !== $refused) {
+            self::warn(sprintf('operation %s refused: %s', $operation_id, $refused));
+            return false;
+        }
+        // Undoing a BuddyPress group create would delete rows it did not
+        // make (issue #489).
+        $refused = BuddyPress_Rows_Snapshot::refusal((array) $row['snapshot']);
+        if (null !== $refused) {
+            self::warn(sprintf('operation %s refused: %s', $operation_id, $refused));
+            return false;
+        }
+        // Undoing a bbPress create that later posts were made under would
+        // delete them with it.
+        $refused = BbPress_Posts_Snapshot::refusal((array) $row['snapshot']);
+        if (null !== $refused) {
+            self::warn(sprintf('operation %s refused: %s', $operation_id, $refused));
+            return false;
+        }
+        // Mail a CRM write sent cannot be unsent, and a campaign sent since
+        // its draft was edited is not edited back (issue #477).
+        $refused = Crm_Rows_Snapshot::refusal((array) $row['snapshot']);
+        if (null !== $refused) {
+            self::warn(sprintf('operation %s refused: %s', $operation_id, $refused));
+            return false;
+        }
+        // Undoing an Amelia write that later bookings depend on (issue #499).
+        $refused = Amelia_Rows_Snapshot::refusal((array) $row['snapshot']);
+        if (null !== $refused) {
+            self::warn(sprintf('operation %s refused: %s', $operation_id, $refused));
+            return false;
+        }
+        // Undoing a create-menu or create-user that something has since
+        // built on (issue #598): refused before the claim, so it stays
+        // retryable once the menu or user is back as the call left it.
+        $refused = self::creation_refusal((array) $row['snapshot']);
+        if (null !== $refused) {
+            self::warn(sprintf('operation %s refused: %s', $operation_id, $refused));
+            return false;
+        }
+        // Another user is editing the post this would restore (issue #452).
+        $locked = Edit_Lock::restore_refusal([$row]);
+        if (null !== $locked) {
+            self::warn(sprintf('operation %s refused: %s', $operation_id, $locked->get_error_message()));
+            return false;
+        }
+        // One theme switch is one undo (issue #869): either half puts both
+        // the template and the stylesheet back, and no undo may leave them
+        // as a broken pair.
+        $partner = null;
+        if (Theme_Switch_Snapshot::is_theme_option((array) $row['snapshot'])) {
+            $partner_id  = Theme_Switch_Snapshot::partner_id((array) $row['snapshot']);
+            $partner_row = '' === $partner_id ? null : Snapshot_Store::get_by_operation($partner_id);
+            if ($partner_row && null === Snapshot_Store::rolled_back_at($partner_row)) {
+                $partner = $partner_row;
+            }
+            $refused = Theme_Switch_Snapshot::refusal(array_filter([ $row['snapshot'], $partner ? $partner['snapshot'] : null ]));
+            if (null !== $refused) {
+                self::warn(sprintf('operation %s refused: %s Nothing was changed.', $operation_id, $refused));
+                return false;
+            }
+        }
+        // Claimed before it is applied, atomically, so two undos racing for
+        // the same operation cannot both apply it. Released again when the
+        // restore throws, or when a file restore is refused by its own site
+        // check (issue #602), so a failed undo stays retryable. A theme
+        // switch claims BOTH halves in one write: if either is taken, nothing
+        // is written, so the pair is never half applied (issue #869).
+        if ($partner) {
+            if (! Snapshot_Store::claim_rows([ (int) $row['id'], (int) $partner['id'] ])) {
+                self::warn(sprintf(
+                    'operation %s refused: it or its paired theme switch operation %s was undone by another request while this undo ran. Nothing was changed.',
+                    $operation_id,
+                    $partner['operation_id']
+                ));
+                return false;
+            }
+            $before = [
+                'template'   => get_option('template'),
+                'stylesheet' => get_option('stylesheet'),
+            ];
+            try {
+                self::apply_for_caller($row['snapshot']);
+                self::apply_for_caller($partner['snapshot']);
+            } catch (\Throwable $e) {
+                // Put the pair back as it was, so it is never left mixed.
+                foreach ($before as $name => $value) {
+                    update_option($name, $value);
+                }
+                Snapshot_Store::release_rollback('', [ (int) $row['id'], (int) $partner['id'] ]);
+                throw $e;
+            }
+            self::warn(sprintf(
+                'operation %s was one half of a theme switch: its paired operation %s was undone with it, so the template and stylesheet are back together.',
+                $operation_id,
+                $partner['operation_id']
+            ));
+            return true;
+        }
+        if (! Snapshot_Store::claim_rollback($operation_id)) {
+            $row = Snapshot_Store::get_by_operation($operation_id);
+            self::warn(self::already_undone($operation_id, $row ? (string) Snapshot_Store::rolled_back_at($row) : ''));
+            return false;
+        }
+        try {
+            self::apply_for_caller($row['snapshot']);
+        } catch (\Throwable $e) {
+            Snapshot_Store::release_rollback($operation_id);
+            throw $e;
+        }
+        if (self::restore_failed($row['snapshot'])) {
+            Snapshot_Store::release_rollback($operation_id);
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Whether the restore of $snapshot just now left its object as it was:
+     * a file write whose file its own site check kept (issue #602), or a
+     * creation whose post was left untouched (issue #756). Such an undo
+     * point was not applied, so it is not recorded as undone.
+     */
+    private static function restore_failed(array $snapshot): bool
+    {
+        $type = $snapshot['object_type'] ?? '';
+        if (File_Write_Snapshot::TYPE === $type) {
+            return ! File_Write_Snapshot::last_restored();
+        }
+        return Post_Creation_Snapshot::OBJECT_TYPE === $type && self::$post_create_untouched;
+    }
+
+    /** The refusal for an operation that was already undone (issue #593). */
+    private static function already_undone(string $operation_id, string $at): string
+    {
+        return sprintf(
+            'operation %s refused: it was already undone%s (by rollback-operation, rollback-session or the Restore button), so nothing was changed. Undoing it again would overwrite every change made since.',
+            $operation_id,
+            '' === $at ? '' : ' at ' . $at . ' UTC'
+        );
+    }
+
+    /**
+     * Why undoing this creation row would delete more than the operation
+     * made (issue #598), or null. Only create-menu, create-user and
+     * create-tax-rate (issue #761) rows can be refused this way; every other
+     * type returns null.
+     */
+    private static function creation_refusal(array $snapshot): ?string
+    {
+        return Menu_Creation_Snapshot::refusal($snapshot)
+            ?? User_Creation_Snapshot::refusal($snapshot)
+            ?? Wc_Tax_Rate_Creation_Snapshot::refusal($snapshot);
+    }
+
+    /**
+     * Bring the ledger up to the current schema before an undo reads or
+     * claims rolled_back_at, for a site that upgraded without an admin or
+     * REST request since (WP-CLI, cron). One autoloaded option read when it
+     * is current.
+     */
+    private static function ensure_ledger_schema(): void
+    {
+        if (class_exists('\\WPMCP\\Site_Tables')) {
+            \WPMCP\Site_Tables::maybe_install();
+        }
+    }
+
+    /**
+     * Why the current user may not undo this snapshot's change to a post,
+     * or null when they may (issue #448). Undoing an edit writes the post
+     * back, so it takes core's edit_post for it, the same capability the
+     * edit itself took; undoing a creation trashes or deletes what was
+     * created, so it takes delete_post for each. A post that is gone (a
+     * force delete) has no meta capability to ask, so the type's own
+     * edit_posts is asked for the caller's own post and edit_others_posts
+     * for anyone else's. A row of a type that is no longer registered has
+     * no capabilities at all and takes manage_options.
+     *
+     * Only the agent-facing entry points ask, like may_restore(): the unwind
+     * of a mutation that threw is internal and never refused. With no
+     * current user the restore is not being made on anyone's behalf (code
+     * running outside any caller: cron, WP-CLI without --user, a tool's own
+     * compensation), and every agent-facing path into a restore requires a
+     * logged-in user holding edit_posts first, so there is no one to check.
+     */
+    private static function refused_post(array $snapshot): ?string
+    {
+        if (0 === get_current_user_id()) {
+            return null;
+        }
+        $type = (string) ($snapshot['object_type'] ?? '');
+        if ('post' === $type) {
+            $post_id = (int) ($snapshot['object_id'] ?? 0);
+            $post    = $post_id > 0 ? get_post($post_id) : null;
+            $store   = self::refused_store($post instanceof \WP_Post ? (string) $post->post_type : (string) ($snapshot['data']['post']['post_type'] ?? ''), $post_id);
+            if (null !== $store) {
+                return $store;
+            }
+            if ($post instanceof \WP_Post) {
+                return self::refused_post_capability('edit_post', $post) ?? self::refused_by_integration($post);
+            }
+            $row    = (array) ($snapshot['data']['post'] ?? []);
+            $object = get_post_type_object((string) ($row['post_type'] ?? ''));
+            if (! $object instanceof \WP_Post_Type) {
+                return current_user_can('manage_options') ? null : sprintf('post %d is of a type that is no longer registered.', $post_id);
+            }
+            $mine       = get_current_user_id() > 0 && (int) ($row['post_author'] ?? 0) === get_current_user_id();
+            $capability = (string) ($mine ? $object->cap->edit_posts : $object->cap->edit_others_posts);
+            return current_user_can($capability) ? null : sprintf('you cannot edit post %d.', $post_id);
+        }
+
+        if (in_array($type, [ 'page_build', 'media_import', Post_Creation_Snapshot::OBJECT_TYPE ], true)) {
+            $ids = Post_Creation_Snapshot::OBJECT_TYPE === $type
+                ? Post_Creation_Snapshot::post_ids($snapshot)
+                : [ (int) ($snapshot['object_id'] ?? 0) ];
+            foreach ($ids as $post_id) {
+                $post = $post_id > 0 ? get_post($post_id) : null;
+                if ($post instanceof \WP_Post) {
+                    $refused = self::refused_store((string) $post->post_type, $post_id)
+                        ?? self::refused_post_capability('delete_post', $post)
+                        ?? self::refused_by_integration($post);
+                    if (null !== $refused) {
+                        return $refused;
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Lets an integration refuse a restore that would write a post it guards
+     * (wpmcp_rollback_post_refusal): the filter gets null and the post, and
+     * returns a reason string to refuse. A synced pattern other people's
+     * posts place is guarded this way.
+     */
+    private static function refused_by_integration(\WP_Post $post): ?string
+    {
+        $why = apply_filters('wpmcp_rollback_post_refusal', null, $post);
+        return is_string($why) && '' !== $why ? $why : null;
+    }
+
+    /**
+     * Why a restore may not write a post of one of WP MCP's private stores
+     * (issue #517): agent memory entries and chat conversations are never
+     * written by the generic tools, so a snapshot of one, taken before that
+     * rule existed, must not put an entry back either. Restoring an agent
+     * memory entry would otherwise re-publish it without the administrator's
+     * approval.
+     */
+    private static function refused_store(string $post_type, int $post_id): ?string
+    {
+        if ('' === $post_type || Content_Guard::is_agent_readable_post_type($post_type)) {
+            return null;
+        }
+        $why = Content_Guard::store_refusal($post_type);
+        return sprintf('post %d belongs to a WP MCP internal store.', $post_id) . (null === $why ? '' : ' ' . $why);
+    }
+
+    /** Core meta capabilities that need an object ID, so are not re-mapped without one. */
+    private const OBJECT_META_CAPS = [
+        'edit_post', 'delete_post', 'read_post', 'publish_post', 'edit_page', 'delete_page', 'read_page',
+        'edit_user', 'delete_user', 'remove_user', 'promote_user', 'edit_comment', 'edit_term', 'delete_term',
+        'assign_term', 'add_post_meta', 'edit_post_meta', 'delete_post_meta', 'edit_block_binding',
+    ];
+
+    /**
+     * Whether the current user holds $capability (edit_post or delete_post)
+     * for a post. A post type registered without map_meta_cap can name a
+     * meta capability as its edit_post: core's custom_css type maps
+     * edit_post to edit_css, which map_meta_cap() returns as is and
+     * current_user_can() then checks as a primitive no role holds, so
+     * nobody could undo an add-custom-css write (issue #726). Only when the
+     * mapping lands on such a meta capability is each mapped capability
+     * asked again, through current_user_can(), so it resolves the way the
+     * write itself was checked (edit_css onto unfiltered_html, or
+     * do_not_allow). A mapping onto primitives was already answered by the
+     * first check and is never asked twice. A meta capability that needs an
+     * object ID is never asked again without one.
+     */
+    private static function user_can_post(string $capability, int $post_id): bool
+    {
+        if (current_user_can($capability, $post_id)) {
+            return true;
+        }
+        $user_id = get_current_user_id();
+        $caps    = map_meta_cap($capability, $user_id, $post_id);
+        $nested  = false;
+        foreach ($caps as $cap) {
+            if (! in_array($cap, self::OBJECT_META_CAPS, true) && [ $cap ] !== map_meta_cap($cap, $user_id)) {
+                $nested = true;
+                break;
+            }
+        }
+        if (! $nested) {
+            return false;
+        }
+        foreach ($caps as $cap) {
+            if (! current_user_can($cap)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static function refused_post_capability(string $capability, \WP_Post $post): ?string
+    {
+        if (! post_type_exists((string) $post->post_type)) {
+            return current_user_can('manage_options') ? null : sprintf('post %d is of a type that is no longer registered.', (int) $post->ID);
+        }
+        if (self::user_can_post($capability, (int) $post->ID)) {
+            return null;
+        }
+        return sprintf('you cannot %s post %d.', 'delete_post' === $capability ? 'delete' : 'edit', (int) $post->ID);
+    }
+
+    /**
+     * Apply a snapshot on behalf of the current user. A post snapshot keeps
+     * the post's comments for a force-delete undo, and those rows hold each
+     * commenter's email, IP and user agent. Refusing the restore would take
+     * away an author's undo of their own post, so a caller without
+     * moderate_comments gets the post and its comments with those fields
+     * blank instead (issue #362); a moderator gets the exact rows.
+     */
+    private static function apply_for_caller(array $snapshot): void
+    {
+        self::$blank_commenter_data = ! current_user_can('moderate_comments');
+        try {
+            self::apply_snapshot($snapshot);
+        } finally {
+            self::$blank_commenter_data = false;
+        }
+    }
+
+    /**
+     * Post types whose snapshots hold personal data, mapped to the capability
+     * a caller must hold to restore one.
+     *
+     * Deleting a form submission is snapshotted so it can be undone, which
+     * means a verbatim plaintext copy of the submission (name, email, remote
+     * IP, message body) sits in wpmcp_snapshots until it is pruned. The forms
+     * adapters gate reading and deleting a submission behind an
+     * administrator-only capability, but wpmcp/rollback-operation and
+     * wpmcp/rollback-session are registered at edit_posts, so without this the
+     * gate is one-way: anyone who can edit posts could resurrect a submission
+     * they are not allowed to read. Keyed on the snapshotted post type rather
+     * than on the adapter, because the snapshot outlives the adapter call and
+     * every entry-bearing adapter needs the same protection.
+     *
+     * @return array<string, string> post type => required capability
+     */
+    private static function pii_snapshot_capabilities(): array
+    {
+        return (array) apply_filters('wpmcp_pii_snapshot_capabilities', [
+            // Contact Form 7 via Flamingo; edit_users is the cap Flamingo maps
+            // every inbound-message capability to.
+            'flamingo_inbound' => 'edit_users',
+            'metform-entry'    => 'manage_options',
+            // Ninja Forms submissions (issue #66): the adapter's status change
+            // snapshots the whole nf_sub post, submitted values included.
+            'nf_sub'           => 'manage_options',
+        ]);
+    }
+
+    /**
+     * The opening of a capability refusal: an option snapshot is a site
+     * setting, everything else the list guards holds personal data.
+     */
+    private static function refusal_subject(array $snapshot, string $subject): string
+    {
+        return in_array($snapshot['object_type'] ?? '', [ 'option', 'option_set' ], true)
+            ? sprintf('%s is a site setting, and', $subject)
+            : sprintf('%s holds personal data and', $subject);
+    }
+
+    /**
+     * What restoring this snapshot demands, worded for a refusal: the
+     * capabilities, plus FunnelKit's own funnel access for a funnel.
+     */
+    private static function restore_capability(array $snapshot): string
+    {
+        $names  = array_map(static fn (array $cap): string => $cap[0], self::restore_capabilities($snapshot));
+        $phrase = [] === $names ? '' : sprintf('the "%s" capability', implode('" and "', $names));
+        if (self::is_funnelkit($snapshot)) {
+            $phrase .= ('' === $phrase ? '' : ' and ') . 'FunnelKit\'s own permission to edit funnels';
+        }
+        return $phrase;
+    }
+
+    private static function is_funnelkit(array $snapshot): bool
+    {
+        return in_array($snapshot['object_type'] ?? '', [ FunnelKit_Funnel_Snapshot::TYPE, FunnelKit_Funnel_Snapshot::CREATE_TYPE ], true);
+    }
+
+    /**
+     * Every capability this snapshot demands, each as [capability, ...args]
+     * for current_user_can(). Empty when the snapshot holds no PII.
+     *
+     * @return array<int, array<int, mixed>>
+     */
+    private static function restore_capabilities(array $snapshot): array
+    {
+        $type = $snapshot['object_type'] ?? '';
+        // Order snapshots hold the customer's addresses and put a whole
+        // order back (or trash one), so restoring one takes the capability
+        // the order writes themselves require (issue #292). A subscription
+        // snapshot is a whole order too (issue #658). A booking snapshot
+        // holds a customer's booking and its order's status, and a booking
+        // rules snapshot is store configuration (issue #659). A user
+        // membership snapshot holds a customer's plan access (PR #573).
+        if (in_array($type, [ Wc_Order_Snapshot::TYPE, Wc_Order_Snapshot::CREATE_TYPE, Wc_Subscription_Snapshot::TYPE, Wc_Booking_Snapshot::TYPE, Wc_Booking_Snapshot::CREATE_TYPE, Wc_Booking_Snapshot::RULES_TYPE, Wc_User_Membership_Snapshot::TYPE, Wc_User_Membership_Snapshot::CREATE_TYPE ], true)) {
+            return [ [ 'manage_woocommerce' ] ];
+        }
+        // Shipping zone and webhook snapshots are store configuration, and a
+        // webhook snapshot holds its signing secret, so restoring either takes
+        // the capability their writes require (issue #292).
+        if (in_array($type, [ Wc_Shipping_Zone_Snapshot::TYPE, Wc_Shipping_Zone_Snapshot::CREATE_TYPE, Wc_Webhook_Snapshot::TYPE, Wc_Webhook_Snapshot::CREATE_TYPE ], true)) {
+            return [ [ 'manage_woocommerce' ] ];
+        }
+        // A FunnelKit funnel's snapshot puts back its row, its meta and its
+        // step posts (checkout products and prices included), and every
+        // funnel write takes manage_woocommerce, so restoring one takes it
+        // too (issue #500), and FunnelKit's own access check as well, which
+        // may_restore() asks (issue #551).
+        if (in_array($type, [ FunnelKit_Funnel_Snapshot::TYPE, FunnelKit_Funnel_Snapshot::CREATE_TYPE ], true)) {
+            return [ [ 'manage_woocommerce' ] ];
+        }
+        // BuddyPress rows hold group memberships, activity content and
+        // profile field definitions, and every BuddyPress write takes
+        // manage_options, so restoring one takes it too (issue #354).
+        if ('buddypress_rows' === $type) {
+            return [ [ 'manage_options' ] ];
+        }
+        // A Code Snippets row is PHP source, and every Code Snippets write
+        // takes manage_options, so restoring one takes it too.
+        if (Code_Snippet_Snapshot::TYPE === $type) {
+            return [ [ 'manage_options' ] ];
+        }
+
+        // A bbPress image puts back forum, topic and reply rows, their meta
+        // and their authors' counts; restoring one takes the capability the
+        // write took (bbPress's moderate, publish_topics or publish_replies),
+        // recorded with it.
+        if (BbPress_Posts_Snapshot::TYPE === $type) {
+            $declared = $snapshot['data']['restore_capability'] ?? null;
+            return [ [ is_string($declared) && '' !== $declared ? $declared : 'manage_options' ] ];
+        }
+        // FluentCRM and MailPoet rows are contacts' personal data and their
+        // subscription consent (issue #477); restoring one takes the
+        // plugin's own permission, which Crm_Rows_Snapshot::restore()
+        // checks. MailPoet's are WordPress capabilities, named here too.
+        // A help desk ticket image holds the customer's messages (issue
+        // #708); restoring one takes the plugin's own ticket permission,
+        // which Helpdesk_Ticket_Snapshot::restore() checks, on top of this.
+        if (Helpdesk_Ticket_Snapshot::TYPE === $type) {
+            return [ [ Helpdesk_Ticket_Snapshot::capability((string) ($snapshot['data']['kind'] ?? '')) ] ];
+        }
+        // A queued action's args can hold personal data (issue #702); the
+        // cancel took manage_options, so its undo does.
+        if (Action_Scheduler_Snapshot::TYPE === $type) {
+            return [ [ 'manage_options' ] ];
+        }
+        // A SureCart product or coupon is store data in SureCart's cloud
+        // (issue #665); every SureCart write takes manage_options, so its
+        // undo does too.
+        if (SureCart_Snapshot::TYPE === $type) {
+            return [ [ 'manage_options' ] ];
+        }
+        if ('crm_rows' === $type) {
+            $kind = (string) ($snapshot['data']['kind'] ?? '');
+            if ('mailpoet' === Crm_Rows_Snapshot::plugin($kind)) {
+                return [ [ Crm_Rows_Snapshot::mailpoet_capability($kind) ] ];
+            }
+            return [ [ 'edit_posts' ] ];
+        }
+        // Amelia rows are customers' personal data and bookings (issue
+        // #499); restoring one takes Amelia's own write capability for what
+        // it covers, the one the write itself took.
+        if ('amelia_rows' === $type) {
+            $capability = Amelia_Rows_Snapshot::capability((string) ($snapshot['data']['kind'] ?? ''));
+            return [ [ '' !== $capability ? $capability : 'manage_options' ] ];
+        }
+        // A database cleanup's rows are raw core table rows (comments with
+        // their authors' emails and IPs, user meta), and the cleanup takes
+        // manage_options, so restoring one takes it too (issue #414).
+        if ('db_cleanup' === $type) {
+            return [ [ 'manage_options' ] ];
+        }
+        // An option snapshot names the capability its restore needs, the one
+        // its write took: a payment gateway's settings option holds the
+        // gateway's credentials (issue #292), and a store setting takes
+        // manage_woocommerce (issue #502). Restoring an option rewrites a
+        // site-wide setting while the rollback tools sit at edit_posts, so a
+        // snapshot that declares nothing takes manage_options: a writer
+        // that forgets to declare fails closed, never open. As in
+        // refused_post(), a restore with no current user is made on no
+        // one's behalf (cron, a tool's own compensation) and is not asked.
+        if (in_array($type, [ 'option', 'option_set' ], true)) {
+            if (0 === get_current_user_id()) {
+                return [];
+            }
+            $declared = $snapshot['data']['restore_capability'] ?? null;
+            $caps     = [ [ is_string($declared) && '' !== $declared ? $declared : 'manage_options' ] ];
+            // A network plugin write also put back active_sitewide_plugins
+            // (issue #557), which only a network admin may change.
+            if (is_array($snapshot['data']['network_plugins'] ?? null)) {
+                $caps[] = [ 'manage_network_plugins' ];
+            }
+            return $caps;
+        }
+        // A comment snapshot holds the whole comment row, author email and
+        // IP included, so restoring one takes moderate_comments, the
+        // capability that reading those fields takes (issue #348). A product
+        // review also takes what the review ops take: edit_product for the
+        // review's product.
+        if ('comment' === $type) {
+            $caps    = [ [ 'moderate_comments' ] ];
+            $product = self::review_product($snapshot);
+            if (null !== $product) {
+                $caps[] = $product > 0 ? [ 'edit_product', $product ] : [ 'edit_products' ];
+            }
+            return $caps;
+        }
+        // A block theme template, template part or navigation menu renders
+        // on every page, and core gates editing them at edit_theme_options,
+        // so restoring one takes it too (issue #378), whatever capability the
+        // rollback tool itself is registered at.
+        if (Site_Template_Snapshot::TYPE === $type) {
+            return [ [ 'edit_theme_options' ] ];
+        }
+        // Undoing a core file reinstall rewrites WordPress core, which core
+        // itself gates at update_core, so restoring one takes it too (#382).
+        if (Core_Files_Snapshot::TYPE === $type) {
+            return [ [ 'update_core' ] ];
+        }
+        // Undoing write-file, edit-file or delete-file rewrites a file in the
+        // install, so it takes what those tools take: manage_options and
+        // edit_files (which DISALLOW_FILE_EDIT denies to everyone), not the
+        // rollback tools' edit_posts (issue #602).
+        if (File_Write_Snapshot::TYPE === $type) {
+            return [ [ 'manage_options' ], [ 'edit_files' ] ];
+        }
+        // Undoing create-menu deletes a menu, which core gates at
+        // edit_theme_options like create-menu itself (issue #598).
+        if (Menu_Creation_Snapshot::OBJECT_TYPE === $type) {
+            return [ [ 'edit_theme_options' ] ];
+        }
+        // Undoing create-user deletes a user, which wp-admin gates at
+        // delete_users, not create-user's create_users (issue #598).
+        if (User_Creation_Snapshot::OBJECT_TYPE === $type) {
+            return [ [ 'delete_users' ] ];
+        }
+        if ('post' !== $type) {
+            return [];
+        }
+        $post_type = (string) ($snapshot['data']['post']['post_type'] ?? '');
+        if (in_array($post_type, [ 'wp_template', 'wp_template_part', 'wp_navigation' ], true)) {
+            return [ [ 'edit_theme_options' ] ];
+        }
+        $capability = self::pii_snapshot_capabilities()[ $post_type ] ?? null;
+        return null === $capability ? [] : [ [ $capability ] ];
+    }
+
+    /**
+     * The product a comment snapshot's review belongs to: its id, 0 when the
+     * row is a review whose product is gone, or null when it is no review.
+     */
+    private static function review_product(array $snapshot): ?int
+    {
+        $row = $snapshot['data']['comment'] ?? null;
+        if (! is_array($row)) {
+            return null;
+        }
+        $post_id = (int) ($row['comment_post_ID'] ?? 0);
+        if ($post_id > 0 && 'product' === get_post_type($post_id)) {
+            return $post_id;
+        }
+        return 'review' === ($row['comment_type'] ?? '') ? 0 : null;
+    }
+
+    /**
+     * Whether the CURRENT user may restore this snapshot. Only the two
+     * agent-facing entry points below consult it: Safe_Mutation's own unwind
+     * of a mutation that threw is an internal integrity operation, already
+     * behind the op's capability, and must never be blocked half way through.
+     */
+    private static function may_restore(array $snapshot): bool
+    {
+        foreach (self::restore_capabilities($snapshot) as $capability) {
+            if (! current_user_can(...$capability)) {
+                return false;
+            }
+        }
+        // Every FunnelKit write also passes FunnelKit's own funnel access
+        // check (manage_options by default), so a store manager FunnelKit
+        // refuses cannot delete or revert a funnel by undoing someone
+        // else's write either (issue #551).
+        if (self::is_funnelkit($snapshot) && ! FunnelKit_Funnel_Snapshot::current_user_may_edit_funnels()) {
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Undo every operation of one session.
+     *
+     * A named session is one run, and snapshot pruning keeps or drops it
+     * whole (issue #439). Once any of its undo points has been pruned, what
+     * is left would undo only part of the run, so the rollback is refused
+     * with the reason instead, however long ago it was pruned (issue #442).
+     * A named session with no undo points that was never pruned is reported
+     * as unknown in a warning rather than as an empty success. The
+     * catch-all 'default' session is a stream of unrelated single writes
+     * pruned row by row, so it is never refused.
+     *
+     * A named session belongs to the user who started it (issue #450).
+     * Below manage_options a caller may roll back only their own sessions:
+     * another user's, or one started with no user and so owned by no one,
+     * is refused with the reason before anything is restored. The shared
+     * 'default' session is everyone's stream of single writes, so it is not
+     * refused as a whole; each of its rows goes through the per-post checks
+     * below, as every row does.
+     *
+     * @throws Mutation_Failed When a named session's undo points were pruned,
+     *                         or it belongs to another user.
+     * @throws Post_Locked     When another user is editing a post it changed.
+     */
+    public static function restore_session(string $session_id): int
+    {
+        self::$warnings = [];
+        self::$trashed  = [];
+        self::ensure_ledger_schema();
+        self::assert_session_owner($session_id);
+        $pruned = Snapshot_Store::is_loose_session($session_id) ? 0 : Snapshot_Store::pruned_rows_for_session($session_id);
+        if ($pruned > 0) {
+            throw new Mutation_Failed(sprintf(
+                'Session "%s" can no longer be rolled back: %d of its undo points were pruned from snapshot history (a newer run replaced it, or it fell outside the history the site keeps). Restoring the rest would undo only part of it, so nothing was restored.',
+                esc_html($session_id),
+                absint($pruned)
+            ));
+        }
+        $rows  = Snapshot_Store::list_by_session($session_id); // newest first
+        $count = 0;
+
+        // Undo points already undone, by rollback-operation, the Restore
+        // button or an earlier rollback-session, are never applied again
+        // (issue #593). Only the rest are checked and undone below; the
+        // undone ones still take part in the whole-object grouping of pass
+        // 2, so the session still lands on its pre-session state.
+        $live         = array_values(array_filter($rows, static fn(array $r): bool => null === Snapshot_Store::rolled_back_at($r)));
+        $undone_count = count($rows) - count($live);
+
+        // All or nothing, like a pruned run: a session whose undo points
+        // include one a personal data erasure redacted (issue #478) cannot
+        // be put back whole, so none of it is.
+        $erased = self::erased_rows($live);
+        if ($erased > 0) {
+            throw new Mutation_Failed(sprintf(
+                'Session "%s" can no longer be rolled back: %d of its undo points had personal data removed by a personal data erasure request, so restoring them would write placeholders back over real data. Nothing was restored.',
+                esc_html($session_id),
+                absint($erased)
+            ));
+        }
+
+        // All or nothing: while another user is editing a post the session
+        // changed, nothing is restored (issue #452).
+        Edit_Lock::assert_restorable($live);
+
+        // The theme options a session puts back must leave a sound template
+        // and stylesheet pair, or nothing is restored (issue #869).
+        $theme_refusal = Theme_Switch_Snapshot::session_refusal($live);
+        if (null !== $theme_refusal) {
+            throw new Mutation_Failed(sprintf(
+                'Session "%s" cannot be rolled back: %s Nothing was restored.',
+                esc_html($session_id),
+                esc_html($theme_refusal)
+            ));
+        }
+
+        // No rows left: either the run was pruned long enough ago to have
+        // left the exact per-session counts (issue #442), or nothing was ever
+        // recorded under this id. The two must not both read as "0 restored".
+        if ([] === $rows && ! Snapshot_Store::is_loose_session($session_id)) {
+            if (Snapshot_Store::was_session_pruned($session_id)) {
+                throw new Mutation_Failed(sprintf(
+                    'Session "%s" can no longer be rolled back: its undo points were pruned from snapshot history (a newer run replaced it, or it fell outside the history the site keeps). Nothing was restored.',
+                    esc_html($session_id)
+                ));
+            }
+            self::warn(sprintf(
+                'No undo points exist for session "%s", and none were ever pruned: no change was recorded under that id, so there is nothing to undo. Check the session_id.',
+                $session_id
+            ));
+            return 0;
+        }
+
+        // Every undo point left was already undone: say so rather than
+        // return a bare 0 (issue #593).
+        if ([] !== $rows && [] === $live) {
+            self::warn(sprintf(
+                'Session "%s" was already undone: all %d of its undo points were rolled back before, so nothing was changed. Undoing them again would overwrite every change made since.',
+                $session_id,
+                count($rows)
+            ));
+            return 0;
+        }
+        if ($undone_count > 0) {
+            self::warn(sprintf(
+                'Session "%s": %d of its undo points were already undone and were skipped; only the other %d were rolled back.',
+                $session_id,
+                $undone_count,
+                count($live)
+            ));
+        }
+
+        // Pass 1: db_rows snapshots, applied NEWEST-first, every one of them.
+        // Unlike the whole-object snapshots below, a db_rows snapshot covers
+        // only the rows its WHERE matched, so two operations in one session
+        // can capture PARTIALLY overlapping row sets. "Oldest snapshot per
+        // object" dedup is only correct when each snapshot captures the whole
+        // object; for partial captures the only correct unwind is to undo
+        // each operation in reverse chronological order, letting older
+        // before-images overwrite newer ones where they overlap.
+        $legacy        = [];
+        $created_terms = [];
+        foreach ($rows as $r) {
+            $row_id  = (int) $r['id'];
+            $is_live = null === Snapshot_Store::rolled_back_at($r);
+            try {
+                $snapshot = Snapshot::unserialize($r['before_blob']);
+            } catch (\RuntimeException $e) {
+                // One corrupt row must not abort the unwind of every other
+                // operation in the session - but it must be visible: the row
+                // is reported, skipped, and NOT counted as restored.
+                if ($is_live) {
+                    self::warn(sprintf('operation %s skipped: %s', $r['operation_id'], $e->getMessage()));
+                }
+                continue;
+            }
+            // An already undone row is never applied in this pass. A whole
+            // object one still goes on to pass 2, only to hold its place as
+            // the object's oldest state there (issue #593).
+            if (! $is_live) {
+                if (! self::is_session_reverse_snapshot($snapshot)) {
+                    unset($snapshot['data']['compiled_widget_entry']);
+                    $legacy[] = [ 'snapshot' => $snapshot, 'id' => $row_id, 'live' => false ];
+                }
+                continue;
+            }
+            // Terms any write of the session created are removed after the
+            // whole unwind, from every row, the deduplicated ones included
+            // (issue #588).
+            $created_terms = array_merge($created_terms, Term_Restore::take_created($snapshot));
+            // An acf_options snapshot is partial in the same way: it covers
+            // the rows under the field names ONE write named, and two writes
+            // to one options page can name overlapping sets.
+            // And so is an option_set snapshot (classic widget writes): each
+            // covers sidebars_widgets plus ONE widget type's option, so two
+            // writes share sidebars_widgets but not the rest.
+            // A Redirection redirect is unwound the same way: undoing its
+            // create removes the row only while it still matches what the
+            // create wrote (issue #334), so the session's later edits of that
+            // row must be put back first, newest first, every one of them.
+            // Shipping zones likewise (issue #338): undoing a zone create
+            // deletes the zone only while its creation marker is intact, and
+            // a later delete-zone in the session removed that marker, so the
+            // session's whole-zone snapshots are put back first, newest first.
+            // BuddyPress rows (issue #354) too: a create's undo removes the
+            // group only while it still has the slug the create wrote.
+            // CRM rows (issue #477) too: a contact's undo checks the status
+            // the person left it in, so later edits go back first.
+            // Every snapshot this pass applies goes through the capability
+            // check first: option_set rows (classic widgets, issue #502) as
+            // much as shipping zones, BuddyPress, CRM, Amelia and cleanup rows.
+            if (! self::may_restore($snapshot)) {
+                self::warn(sprintf(
+                    'snapshot %s skipped: restoring it requires %s.',
+                    self::object_identity($snapshot),
+                    self::restore_capability($snapshot)
+                ));
+                continue;
+            }
+            // A BuddyPress group create is skipped, not counted, while the
+            // group holds rows the create did not make (issue #489).
+            if ('buddypress_rows' === $snapshot['object_type']) {
+                $refused = BuddyPress_Rows_Snapshot::refusal($snapshot);
+                if (null !== $refused) {
+                    self::warn(sprintf('snapshot %s skipped: %s', self::object_identity($snapshot), $refused));
+                    continue;
+                }
+            }
+            // So is a bbPress create that later posts depend on.
+            if (BbPress_Posts_Snapshot::TYPE === $snapshot['object_type']) {
+                $refused = BbPress_Posts_Snapshot::refusal($snapshot);
+                if (null !== $refused) {
+                    self::warn(sprintf('snapshot %s skipped: %s', self::object_identity($snapshot), $refused));
+                    continue;
+                }
+            }
+            // A CRM send is skipped, not counted: mail cannot be unsent.
+            if ('crm_rows' === $snapshot['object_type']) {
+                $refused = Crm_Rows_Snapshot::refusal($snapshot);
+                if (null !== $refused) {
+                    self::warn(sprintf('snapshot %s skipped: %s', self::object_identity($snapshot), $refused));
+                    continue;
+                }
+            }
+            // So is an Amelia write that later bookings depend on (issue #499).
+            if ('amelia_rows' === $snapshot['object_type']) {
+                $refused = Amelia_Rows_Snapshot::refusal($snapshot);
+                if (null !== $refused) {
+                    self::warn(sprintf('snapshot %s skipped: %s', self::object_identity($snapshot), $refused));
+                    continue;
+                }
+            }
+            // Plugin table rows (Pods table storage, TranslatePress
+            // dictionary rows, issue #299) too: each covers only the ids ONE
+            // write named, and two writes can name overlapping sets.
+            // A database cleanup (issue #414) too: each call's snapshot holds
+            // only the rows that call deleted, one bounded batch of many.
+            // Compiled-widget manifest changes (issue #72) are unwound the
+            // same way, newest first, every one of them. A compile snapshot
+            // holds ONE widget's entry and bytes, and a status or spec update
+            // holds one widget's enabled flag, so several of them touch the
+            // same widget in different ways; only a reverse-chronological
+            // unwind lands on the pre-session manifest.
+            if (self::is_session_reverse_snapshot($snapshot)) {
+                if (self::claim_and_apply($snapshot, [ $row_id ], false, 'operation ' . $r['operation_id'])) {
+                    $count++;
+                }
+                continue;
+            }
+            if (is_array($snapshot['data']['compiled_widget_entry'] ?? null)) {
+                self::restore_compiled_widget_entry($snapshot['data']['compiled_widget_entry']);
+                // The post half still goes through the oldest-first pass.
+                unset($snapshot['data']['compiled_widget_entry']);
+            }
+            // A network plugin write's active_sitewide_plugins (issue #557)
+            // likewise: unwound newest first, every one, so the network list
+            // lands on its pre-session value even when the session's oldest
+            // active_plugins snapshot was a site-only write that holds none.
+            if (is_array($snapshot['data']['network_plugins'] ?? null)) {
+                self::restore_network_plugins($snapshot['data']['network_plugins']);
+                unset($snapshot['data']['network_plugins']);
+            }
+            $legacy[] = [ 'snapshot' => $snapshot, 'id' => $row_id, 'live' => true ];
+        }
+
+        // Pass 2: whole-object snapshots, oldest first, restoring the OLDEST
+        // snapshot per object (its pre-session state). Runs after the
+        // db_rows pass so that when both kinds touched the same underlying
+        // rows, the exact whole-object restore wins.
+        //
+        // The rows are grouped per object first. A group whose rows were
+        // all undone already is left alone (issue #593). Otherwise the
+        // group's oldest snapshot is restored, even when that oldest row was
+        // undone on its own: it is still the pre-session state, and
+        // restoring a later row's before-image instead would bring back the
+        // very change that was undone. Every live row of the group is then
+        // recorded as undone.
+        $legacy = array_reverse($legacy); // oldest first, so we can unwind to the earliest
+        $groups = [];
+        $owner  = [];
+        foreach ($legacy as $entry) {
+            $key   = self::object_identity($entry['snapshot']);
+            $group = $owner[ $key ] ?? $key;
+            $known = isset($groups[ $group ]);
+            if (! $known) {
+                $groups[ $group ] = [ 'snapshot' => $entry['snapshot'], 'rep_live' => $entry['live'], 'live' => [], 'first' => [] ];
+                $owner[ $key ]    = $group;
+                // A creation row that covers several posts (duplicate-post
+                // with include_children) claims every one of them, so a later
+                // edit of a created child cannot bring it back out of the trash.
+                if (Post_Creation_Snapshot::OBJECT_TYPE === $entry['snapshot']['object_type']) {
+                    foreach (Post_Creation_Snapshot::post_ids($entry['snapshot']) as $created_id) {
+                        $owner[ 'post:' . $created_id ] = $owner[ 'post:' . $created_id ] ?? $group;
+                    }
+                }
+            }
+            // A FunnelKit funnel's oldest snapshot is restored for the whole
+            // session, so it takes on what every later write of the session
+            // did to the funnel: the steps they added are removed too, and
+            // the steps they removed come back (issue #554).
+            if ($known && FunnelKit_Funnel_Snapshot::TYPE === $entry['snapshot']['object_type']) {
+                $groups[ $group ]['snapshot'] = FunnelKit_Funnel_Snapshot::merge_effects($groups[ $group ]['snapshot'], $entry['snapshot']);
+            }
+            // A post the session created and then edited (issue #756): the
+            // oldest later snapshot of each created post holds it as the
+            // create left it, so it is put back first. Otherwise the create's
+            // undo meets the edited post, and a published draft (its
+            // post_date_gmt set) fails the identity check and stays live.
+            if (
+                $known
+                && Post_Creation_Snapshot::OBJECT_TYPE === $groups[ $group ]['snapshot']['object_type']
+                && Post_Creation_Snapshot::OBJECT_TYPE !== $entry['snapshot']['object_type']
+                && ! isset($groups[ $group ]['first'][ $key ])
+            ) {
+                $groups[ $group ]['first'][ $key ] = $entry['snapshot'];
+            }
+            if ($entry['live']) {
+                $groups[ $group ]['live'][] = $entry['id'];
+            }
+        }
+
+        $deferred = [];
+        foreach ($groups as $key => $group) {
+            if ([] === $group['live']) {
+                continue;
+            }
+            $snapshot = $group['snapshot'];
+            // As before #593, the later rows of a refused group still count
+            // (they are deduped onto it) and only the refused row does not.
+            // None of them is recorded as undone.
+            $counted_if_refused = count($group['live']) - ($group['rep_live'] ? 1 : 0);
+            // The snapshots put back before a creation's undo (issue #756)
+            // pass the same checks as the creation row itself.
+            foreach (array_merge([ $snapshot ], array_values($group['first'])) as $checked) {
+                if (! self::may_restore($checked)) {
+                    // One refused snapshot must not abort the rest of the unwind,
+                    // but it must be visible and must NOT be counted as restored.
+                    self::warn(sprintf(
+                        'snapshot %s skipped: %s restoring it requires %s.',
+                        $key,
+                        self::refusal_subject($checked, 'it'),
+                        self::restore_capability($checked)
+                    ));
+                    $count += $counted_if_refused;
+                    continue 2;
+                }
+                $refused = self::refused_post($checked);
+                if (null !== $refused) {
+                    self::warn(sprintf('snapshot %s skipped: %s', $key, $refused));
+                    $count += $counted_if_refused;
+                    continue 2;
+                }
+            }
+            // A created menu is undone after everything else, so the items
+            // the session added to it are removed first (issue #598); its
+            // refusal is asked then, once they are gone. A created tax rate
+            // likewise, so the session's own edits of it are put back first
+            // (issue #761).
+            if (in_array($snapshot['object_type'], [ Menu_Creation_Snapshot::OBJECT_TYPE, Wc_Tax_Rate_Creation_Snapshot::OBJECT_TYPE ], true)) {
+                $deferred[ $key ] = $group;
+                continue;
+            }
+            $refused = self::creation_refusal($snapshot);
+            if (null !== $refused) {
+                self::warn(sprintf('snapshot %s skipped: %s', $key, $refused));
+                $count += $counted_if_refused;
+                continue;
+            }
+            // A child-theme scaffold is undone LAST: its restore refuses to
+            // delete the active theme, so the stylesheet/template options a
+            // later switch-theme in the same session changed must be put back
+            // first, or the session rollback would leave the scaffold behind.
+            if ('theme_scaffold' === $snapshot['object_type']) {
+                $deferred[ $key ] = $group;
+                continue;
+            }
+            if (self::claim_and_apply($snapshot, $group['live'], true, 'snapshot ' . $key, array_reverse(array_values($group['first'])))) {
+                $count += count($group['live']);
+            }
+        }
+        foreach ($deferred as $key => $group) {
+            $refused = self::creation_refusal($group['snapshot']);
+            if (null !== $refused) {
+                self::warn(sprintf('snapshot %s skipped: %s', $key, $refused));
+                $count += count($group['live']) - ($group['rep_live'] ? 1 : 0);
+                continue;
+            }
+            if (self::claim_and_apply($group['snapshot'], $group['live'], true, 'snapshot ' . $key)) {
+                $count += count($group['live']);
+            }
+        }
+        foreach (Term_Restore::remove_created($created_terms) as $warning) {
+            self::warn($warning);
+        }
+        return $count;
+    }
+
+    /**
+     * Whether rollback-session undoes this snapshot on its own, newest
+     * first, because it covers only part of its object (pass 1 of
+     * restore_session()).
+     */
+    private static function is_session_reverse_snapshot(array $snapshot): bool
+    {
+        return in_array($snapshot['object_type'], [ 'db_rows', 'db_cleanup', 'acf_options', 'option_set', 'redirection_item', 'plugin_table_rows', 'buddypress_rows', 'bbpress_posts', 'crm_rows', 'amelia_rows', 'helpdesk_ticket', 'action_scheduler', 'surecart_object', Wc_Shipping_Zone_Snapshot::TYPE, Wc_Shipping_Zone_Snapshot::CREATE_TYPE ], true)
+            || self::is_compiled_widget_snapshot($snapshot);
+    }
+
+    /**
+     * Record ledger rows as undone, then restore the snapshot (issue #593).
+     * Rows another request undid first are skipped with a warning; a
+     * restore that throws releases the claim again and rethrows, so a
+     * failed undo stays retryable.
+     *
+     * @param int[]   $ids   The ledger rows this restore undoes.
+     * @param array[] $first Snapshots restored before $snapshot, under the
+     *                       same claim (issue #756).
+     * @return bool Whether the snapshot was restored.
+     */
+    private static function claim_and_apply(array $snapshot, array $ids, bool $for_caller, string $label, array $first = []): bool
+    {
+        if (! Snapshot_Store::claim_rows($ids)) {
+            self::warn(sprintf('%s skipped: another request undid it while this rollback ran.', $label));
+            return false;
+        }
+        try {
+            foreach ($first as $earlier) {
+                self::apply_for_caller($earlier);
+            }
+            if ($for_caller) {
+                self::apply_for_caller($snapshot);
+            } else {
+                self::apply_snapshot($snapshot);
+            }
+        } catch (\Throwable $e) {
+            Snapshot_Store::release_rollback('', $ids);
+            throw $e;
+        }
+        // A file restore its own site check refused left the file as it
+        // was (issue #602), and a creation undo can leave its post untouched
+        // (issue #756): not undone, so not recorded or counted as such.
+        if (self::restore_failed($snapshot)) {
+            Snapshot_Store::release_rollback('', $ids);
+            return false;
+        }
+        return true;
+    }
+
+    /** How many of these ledger rows hold a snapshot a personal data erasure redacted. Undecodable rows are left to the unwind, which reports them. */
+    private static function erased_rows(array $rows): int
+    {
+        $erased = 0;
+        foreach ($rows as $row) {
+            try {
+                $erased += Snapshot_Redactor::is_erased(Snapshot::unserialize((string) $row['before_blob'])) ? 1 : 0;
+            } catch (\RuntimeException $e) {
+                unset($e);
+            }
+        }
+        return $erased;
+    }
+
+    /**
+     * Refuse a named session the current user did not start, unless they
+     * may manage the site. Code running with no user (cron, WP-CLI without
+     * --user, a tool undoing its own run) is not acting for anyone and is
+     * not refused, like refused_post(). A session with no undo points left
+     * is left to restore_session()'s own pruned or unknown answer.
+     *
+     * @throws Mutation_Failed When the session belongs to someone else.
+     */
+    private static function assert_session_owner(string $session_id): void
+    {
+        $owner = Snapshot_Store::foreign_session_owner($session_id);
+        if (null === $owner) {
+            return;
+        }
+        throw new Mutation_Failed(sprintf(
+            0 === $owner
+                ? 'Session "%s" has no recorded owner (it was written outside any user account), so only a site administrator can roll it back. Nothing was restored.'
+                : 'Session "%s" was started by another user, so only they or a site administrator can roll it back. Nothing was restored.',
+            esc_html($session_id)
+        ));
+    }
+
+    /**
+     * A stable per-object dedup key for restore_session(), derived from the
+     * unserialized snapshot rather than the DB row's object_id column. That
+     * column is a BIGINT and is always 0 for 'option' snapshots (see
+     * Snapshot_Store::db_object_id()); the option's real identity, its name,
+     * only exists inside the serialized blob. Keying on the raw column would
+     * collapse every distinct option in a session onto the same "option:0"
+     * identity, restoring only the first one seen and silently skipping the
+     * rest while still counting them as processed.
+     */
+    private static function object_identity(array $snapshot): string
+    {
+        // Every compile snapshot is an 'option' snapshot of the ONE shared
+        // manifest option, but it only ever describes one widget. Keyed by the
+        // option name, all compiles in a session collapsed onto one identity.
+        if (self::is_compiled_widget_snapshot($snapshot)) {
+            return 'compiled_widget:' . (int) ($snapshot['data']['compiled_widget']['spec_id'] ?? 0);
+        }
+        if ('option' === $snapshot['object_type']) {
+            return 'option:' . $snapshot['data']['name'];
+        }
+        // A page_build snapshot IS the oldest possible state of its page -
+        // "did not exist yet". Keying it as post:<id> lets restore_session's
+        // oldest-first dedup pick it over any later 'post' snapshot of the
+        // same page, so a session rollback deletes the created page instead
+        // of restoring an intermediate edit of it.
+        if ('page_build' === $snapshot['object_type']) {
+            return 'post:' . $snapshot['object_id'];
+        }
+        // Same reasoning for a media import: the snapshot IS the oldest state
+        // of that attachment ("did not exist yet"), keyed as post:<id> so a
+        // session rollback deletes the import instead of restoring any later
+        // 'post' snapshot of the same attachment (e.g. an update-media edit).
+        if ('media_import' === $snapshot['object_type']) {
+            return 'post:' . $snapshot['object_id'];
+        }
+        // And for a post create-post, duplicate-post or a spec builder
+        // created (issue #192): its oldest state is "did not exist yet".
+        if (Post_Creation_Snapshot::OBJECT_TYPE === $snapshot['object_type']) {
+            return 'post:' . $snapshot['object_id'];
+        }
+        // And for a comment create-comment or reply-to-comment posted
+        // (issue #284): keyed as comment:<id> so a later moderate-comment or
+        // edit-comment in the same session cannot bring it back from the trash.
+        if (Comment_Creation_Snapshot::OBJECT_TYPE === $snapshot['object_type']) {
+            return 'comment:' . $snapshot['object_id'];
+        }
+        // And for a menu create-menu made, or a user create-user made (issue
+        // #598): keyed like the menu's term and the user's own snapshots, so
+        // a session that created and then edited one unwinds to "did not
+        // exist yet", whose refusal then keeps it if the edit stayed.
+        if (Menu_Creation_Snapshot::OBJECT_TYPE === $snapshot['object_type']) {
+            return 'nav_menu:' . $snapshot['object_id'];
+        }
+        if (User_Creation_Snapshot::OBJECT_TYPE === $snapshot['object_type']) {
+            return 'user:' . $snapshot['object_id'];
+        }
+        // And for an order orders.create made (issue #292): keyed like the
+        // order's full snapshots, so a session that created and then edited
+        // an order unwinds to "did not exist yet" and trashes it.
+        if (Wc_Order_Snapshot::CREATE_TYPE === $snapshot['object_type']) {
+            return Wc_Order_Snapshot::TYPE . ':' . $snapshot['object_id'];
+        }
+        // Likewise for a zone or webhook a woo-write op created: a session
+        // that created and then edited one unwinds to "did not exist yet".
+        if (Wc_Shipping_Zone_Snapshot::CREATE_TYPE === $snapshot['object_type']) {
+            return Wc_Shipping_Zone_Snapshot::TYPE . ':' . $snapshot['object_id'];
+        }
+        if (Wc_Webhook_Snapshot::CREATE_TYPE === $snapshot['object_type']) {
+            return Wc_Webhook_Snapshot::TYPE . ':' . $snapshot['object_id'];
+        }
+        // And for a booking bookings.create made (issue #659).
+        if (Wc_Booking_Snapshot::CREATE_TYPE === $snapshot['object_type']) {
+            return Wc_Booking_Snapshot::TYPE . ':' . $snapshot['object_id'];
+        }
+        // And for a membership memberships.grant made (PR #573).
+        if (Wc_User_Membership_Snapshot::CREATE_TYPE === $snapshot['object_type']) {
+            return Wc_User_Membership_Snapshot::TYPE . ':' . $snapshot['object_id'];
+        }
+        // And for a FunnelKit funnel a theme-write op created (issue #500).
+        if (FunnelKit_Funnel_Snapshot::CREATE_TYPE === $snapshot['object_type']) {
+            return FunnelKit_Funnel_Snapshot::TYPE . ':' . $snapshot['object_id'];
+        }
+        // And for a product or variation an import created: its oldest
+        // state is "did not exist yet", whatever later edits followed.
+        if ('wc_product_create' === $snapshot['object_type']) {
+            return 'post:' . $snapshot['object_id'];
+        }
+        // A file write's object_id is its operation id; the object is the
+        // file, so a session that wrote one file several times unwinds to the
+        // oldest snapshot of it: the file as it was before the session.
+        if (File_Write_Snapshot::TYPE === $snapshot['object_type']) {
+            return 'file:' . ($snapshot['data']['path'] ?? $snapshot['object_id']);
+        }
+        // Users, like posts, are identified by an int object_id, so the raw
+        // object_type:object_id key is already stable and distinct.
+        return $snapshot['object_type'] . ':' . $snapshot['object_id'];
+    }
+
+    /** A compile-custom-widget snapshot: one widget's manifest entry plus bytes. */
+    private static function is_compiled_widget_snapshot(array $snapshot): bool
+    {
+        return 'option' === $snapshot['object_type']
+            && is_array($snapshot['data']['compiled_widget'] ?? null);
+    }
+
+    /**
+     * Put the network's active_sitewide_plugins back as a network plugin
+     * write found it (issue #557, Plugin_Network_Scope::snapshot_data()).
+     */
+    private static function restore_network_plugins(array $state): void
+    {
+        if (! is_multisite()) {
+            return;
+        }
+        if (! empty($state['existed'])) {
+            update_site_option('active_sitewide_plugins', (array) ($state['value'] ?? []));
+        } else {
+            delete_site_option('active_sitewide_plugins');
+        }
+    }
+
+    private static function restore_compiled_widget_entry(array $state): void
+    {
+        $manifest = self::compiled_widget_manifest();
+        if (null !== $manifest) {
+            $manifest::restore_entry($state);
+        }
+    }
+
+    /**
+     * The compiled-widget manifest class, when this build ships it. The only
+     * place Rollback_Service names it, so a build without the compiler has
+     * exactly one thing to remove.
+     */
+    private static function compiled_widget_manifest(): ?string
+    {
+        // The widget compiler is part of the off-directory add-on, so no
+        // snapshot in this build carries a compiled-widget payload.
+        return null;
+    }
+
+    /**
+     * Restore a WordPress option to its pre-mutation state. Unlike a post,
+     * an option has no trash/soft-delete; the only two prior states a
+     * mutation could have started from are "existed with this value" (put
+     * it back with update_option()) or "didn't exist yet" (the mutation
+     * introduced it, so delete_option() removes it entirely rather than
+     * leaving a value behind that was never there before).
+     */
+    private static function apply_option_snapshot(array $snapshot): void
+    {
+        // A compiled-widget snapshot carries the single manifest entry it
+        // changed plus the generated file's previous bytes. Restoring those
+        // together is the only correct undo: putting the whole option back
+        // would revert every other widget compiled since, and putting the old
+        // hash back against the new bytes would leave the widget inert.
+        $manifest = self::compiled_widget_manifest();
+        if (null !== $manifest && self::is_compiled_widget_snapshot($snapshot)) {
+            $manifest::restore($snapshot['data']['compiled_widget']);
+            return;
+        }
+
+        /*
+         * Filter: the option snapshot a rollback is about to put back. An
+         * option holding many independent entries (TablePress's table id
+         * map, issue #555) narrows it to the entries the undone write
+         * touched, so entries written since are kept.
+         */
+        $snapshot = (array) apply_filters('wpmcp_rollback_option_snapshot', $snapshot);
+        $name     = (string) $snapshot['data']['name'];
+        if ($snapshot['data']['existed']) {
+            update_option($name, $snapshot['data']['value']);
+        } else {
+            delete_option($name);
+        }
+        self::options_restored([ $name ]);
+    }
+
+    /**
+     * Announce the options a rollback just put back (issue #316), so code
+     * that derives state from them (a theme's generated CSS) can rebuild it
+     * instead of serving what the undone write produced.
+     *
+     * @param string[] $names
+     */
+    private static function options_restored(array $names): void
+    {
+        // A page builder's global design data (issue #391) feeds generated
+        // stylesheets its own saves rebuild; rebuild them the way the write did.
+        Builder_Design_Refresh::after_options($names);
+
+        /** Action: options restored by a rollback, as a list of option names. */
+        do_action('wpmcp_rollback_options_restored', $names);
+    }
+
+    /**
+     * Put back ONE term's row inside Yoast's `wpseo_taxonomy_meta` option
+     * (see Snapshot::capture_yoast_term_seo()), leaving every other term's
+     * row as it is now. Goes through write_yoast_term_seo_row(), the same
+     * path the write took, which handles Yoast's re-validation of the option
+     * and refreshes the term's indexable.
+     */
+    private static function apply_yoast_term_seo_snapshot(array $snapshot): void
+    {
+        $data     = (array) $snapshot['data'];
+        $taxonomy = (string) ($data['taxonomy'] ?? '');
+        $term_id  = (int) ($data['term_id'] ?? 0);
+        if ('' === $taxonomy || $term_id <= 0) {
+            return;
+        }
+
+        $row = ! empty($data['existed']) && is_array($data['row'] ?? null) ? (array) $data['row'] : null;
+
+        self::write_yoast_term_seo_row($taxonomy, $term_id, $row);
+    }
+
+    /**
+     * Replace every All in One SEO row of one post or term with $rows
+     * (issue #294): the SEO write and the rollback of an 'aioseo_row'
+     * snapshot both go through here, so the write and its undo take one path.
+     * Lives in the safety layer so the restore needs none of the SEO classes.
+     *
+     * Delete, then insert each row as given, primary key included, so a
+     * restore brings back the same ids and an empty $rows leaves none. Any
+     * failure is a Mutation_Failed. AIOSEO memoizes SELECTs per request, so
+     * its cache for the table is busted when the plugin is loaded.
+     *
+     * @param array<int, array<string, mixed>> $rows
+     */
+    public static function write_aioseo_rows(string $kind, int $id, array $rows): void
+    {
+        global $wpdb;
+
+        $table = Snapshot::aioseo_table($kind);
+        if (null === $table || $id <= 0) {
+            return;
+        }
+        [$name, $column] = $table;
+
+        try {
+            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- third-party table with no WP API; AIOSEO's own cache is busted below.
+            if (false === $wpdb->delete($name, [$column => $id], ['%d'])) {
+                throw new Mutation_Failed('Could not clear the SEO row of ' . esc_html($kind) . ' ' . (int) $id . '.');
+            }
+            foreach ($rows as $row) {
+                $row          = (array) $row;
+                $row[$column] = $id;
+                // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- third-party table with no WP API.
+                if (false === $wpdb->insert($name, $row)) {
+                    throw new Mutation_Failed('Could not write the SEO row of ' . esc_html($kind) . ' ' . (int) $id . ': ' . esc_html($wpdb->last_error));
+                }
+            }
+        } finally {
+            if (function_exists('aioseo')) {
+                $db = aioseo()->core->db ?? null;
+                if (is_object($db) && method_exists($db, 'bustCache')) {
+                    $db->bustCache(Snapshot::AIOSEO_TABLES[$kind][0]);
+                }
+            }
+        }
+    }
+
+    /**
+     * Replace one term's row inside Yoast's `wpseo_taxonomy_meta` option,
+     * or remove it when $row is null. Used by the term SEO write (issue #67)
+     * and by the rollback of a 'yoast_term_seo' snapshot, so the write and
+     * its undo take one path. Lives here, in the safety layer, so the
+     * restore has no dependency on the paid SEO classes.
+     *
+     * With Yoast loaded every save of the option is re-validated through its
+     * sanitize_option filter, and that validation keeps the previously
+     * stored value for any key missing from the new row. Yoast also drops a
+     * key whose value is its default ('default' for noindex), so a cleared
+     * flag would be missing and the old 'noindex' would silently survive.
+     * The row is therefore removed in one save (leaving no old value to
+     * keep) and written in a second. Both run inside the caller's single
+     * Safe_Mutation, after its snapshot.
+     *
+     * Yoast renders from its indexables table and rebuilds a term's
+     * indexable only on `edited_term`, so that core action is fired after
+     * the save, or the page would keep showing the old values.
+     */
+    public static function write_yoast_term_seo_row(string $taxonomy, int $term_id, ?array $row): void
+    {
+        $yoast_loaded = class_exists('WPSEO_Taxonomy_Meta');
+
+        $option = get_option(\WPMCP\Safety\Snapshot::YOAST_TAXONOMY_META_OPTION, []);
+        $option = is_array($option) ? $option : [];
+
+        if ($yoast_loaded || null === $row) {
+            unset($option[$taxonomy][$term_id]);
+            if (isset($option[$taxonomy]) && [] === $option[$taxonomy]) {
+                unset($option[$taxonomy]);
+            }
+            update_option(\WPMCP\Safety\Snapshot::YOAST_TAXONOMY_META_OPTION, $option);
+        }
+
+        if (null !== $row) {
+            $option = get_option(\WPMCP\Safety\Snapshot::YOAST_TAXONOMY_META_OPTION, []);
+            $option = is_array($option) ? $option : [];
+            if (! isset($option[$taxonomy]) || ! is_array($option[$taxonomy])) {
+                $option[$taxonomy] = [];
+            }
+            $option[$taxonomy][$term_id] = $row;
+            update_option(\WPMCP\Safety\Snapshot::YOAST_TAXONOMY_META_OPTION, $option);
+        }
+
+        $term = get_term($term_id, $taxonomy);
+        if ($yoast_loaded && $term instanceof \WP_Term) {
+            clean_term_cache($term_id, $taxonomy);
+            // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Core hook, fired so Yoast rebuilds the term indexable.
+            do_action('edited_term', $term_id, (int) $term->term_taxonomy_id, $taxonomy, []);
+        }
+    }
+
+    /**
+     * Restore a WooCommerce order's prior status.
+     *
+     * update-order-status only ever changes the status, so the undo is simply
+     * to set the captured status back through WC_Order's CRUD setter, which
+     * writes to whichever store (HPOS or legacy CPT) is active. There is no
+     * delete-order tool, so the order always still exists here and is restored
+     * in place; a null captured status means the order did not exist at
+     * capture time, so there is nothing to restore.
+     */
+    private static function apply_wc_order_snapshot(array $snapshot): void
+    {
+        if (empty($snapshot['data']['status'])) {
+            return;
+        }
+
+        if (! function_exists('wc_get_order')) {
+            return;
+        }
+
+        $order = wc_get_order((int) $snapshot['object_id']);
+        if (! $order) {
+            return;
+        }
+
+        $order->set_status((string) $snapshot['data']['status']);
+        $order->save();
+    }
+
+    /**
+     * Restore a user's editable profile to its pre-mutation state.
+     *
+     * Update_User only ever changes profile fields (never role, never
+     * password), and there is no delete-user tool, so the user always still
+     * exists here and is restored in place: the captured columns go back via
+     * wp_update_user() and the usermeta is reconciled the same way the post
+     * path reconciles post_meta (purge keys the mutation added, then re-write
+     * every captured key/value exactly). user_pass is never in the snapshot,
+     * so it is never touched.
+     */
+    private static function apply_user_snapshot(array $snapshot): void
+    {
+        $user_id = (int) $snapshot['object_id'];
+
+        if (! empty($snapshot['data']['fields'])) {
+            // wp_update_user() unslashes; the snapshot holds raw stored values.
+            // Its save filters would rewrite them again, so they stand down.
+            $fields = wp_slash(array_merge(['ID' => $user_id], $snapshot['data']['fields']));
+            Save_Filters::without(self::USER_SAVE_FILTERS, static fn () => wp_update_user($fields));
+            clean_user_cache($user_id);
+        }
+
+        $snapshotted_meta = (array) $snapshot['data']['meta'];
+        $current_meta     = get_user_meta($user_id);
+
+        // Purge any usermeta key that didn't exist at snapshot time.
+        foreach (array_keys(array_diff_key($current_meta, $snapshotted_meta)) as $key) {
+            delete_user_meta($user_id, $key);
+        }
+
+        // Restore snapshotted keys/values exactly as captured.
+        foreach ($snapshotted_meta as $key => $values) {
+            delete_user_meta($user_id, $key);
+            foreach ((array) $values as $v) {
+                add_user_meta($user_id, $key, self::slash_meta_value(maybe_unserialize($v)));
+            }
+        }
+    }
+
+    /** The filters wp_update_comment() runs over a row before it is saved. */
+    private const COMMENT_SAVE_FILTERS = [
+        'pre_user_id',
+        'pre_comment_user_agent',
+        'pre_comment_author_name',
+        'pre_comment_content',
+        'pre_comment_user_ip',
+        'pre_comment_author_url',
+        'pre_comment_author_email',
+        'comment_save_pre',
+    ];
+
+    /** The comment columns a save filter can rewrite, pinned to their captured values on restore. */
+    private const COMMENT_TEXT_COLUMNS = [
+        'comment_content',
+        'comment_author',
+        'comment_author_email',
+        'comment_author_url',
+        'comment_author_IP',
+        'comment_agent',
+    ];
+
+    /** The filters wp_update_user() runs over the profile fields a snapshot holds. */
+    private const USER_SAVE_FILTERS = [
+        'pre_user_display_name',
+        'pre_user_email',
+        'pre_user_url',
+        'pre_user_nickname',
+        'pre_user_first_name',
+        'pre_user_last_name',
+        'pre_user_description',
+    ];
+
+    /**
+     * The filters wp_insert_post() runs over the text columns a post
+     * snapshot holds (sanitize_post() in the db context): the content,
+     * excerpt and title, plus the content_filtered column that shares the
+     * content's kses. For a user without unfiltered_html these carry kses.
+     */
+    private const POST_SAVE_FILTERS = Save_Filters::POST;
+
+    /**
+     * The sanitize filters add_post_meta() runs over each of these keys.
+     * Core kses-filters the footnotes key this way for a user without
+     * unfiltered_html, and a registered meta's sanitize callback hooks here too.
+     *
+     * @param string[] $keys
+     * @return string[]
+     */
+    private static function post_meta_save_filters(int $post_id, array $keys): array
+    {
+        $subtype = (string) get_object_subtype('post', $post_id);
+        $hooks   = [];
+        foreach ($keys as $key) {
+            $hooks[] = 'sanitize_post_meta_' . $key;
+            if ('' !== $subtype) {
+                $hooks[] = 'sanitize_post_meta_' . $key . '_for_' . $subtype;
+            }
+        }
+        return $hooks;
+    }
+
+    /**
+     * Give the revisions a post restore saved the restored meta (issue #872).
+     *
+     * wp_update_post() saves a revision before the snapshotted meta is back,
+     * and a builder that copies its layout rows onto each revision on
+     * save_post (Cornerstone's _cornerstone_data, Elementor's _elementor_data,
+     * core's revisioned meta) copies the layout being undone. Only rows the
+     * revision already carries are touched: a snapshotted key gets the
+     * restored values, a key the restore purged from the post goes. Only
+     * revisions this restore created are written, so earlier history keeps
+     * what it recorded.
+     *
+     * @param int[]                $revision_ids
+     * @param array<string, array> $snapshotted_meta
+     * @param string[]             $purged_keys
+     */
+    private static function sync_restore_revisions(int $post_id, array $revision_ids, array $snapshotted_meta, array $purged_keys): void
+    {
+        foreach (array_unique($revision_ids) as $revision_id) {
+            if ($revision_id <= 0 || wp_is_post_revision($revision_id) !== $post_id) {
+                continue;
+            }
+            $keys = array_map('strval', array_keys((array) get_metadata('post', $revision_id)));
+            $keys = array_values(array_filter($keys, static fn (string $key): bool => isset($snapshotted_meta[ $key ]) || in_array($key, $purged_keys, true)));
+            if ([] === $keys) {
+                continue;
+            }
+            Save_Filters::without(self::post_meta_save_filters($revision_id, $keys), static function () use ($revision_id, $keys, $snapshotted_meta): void {
+                foreach ($keys as $key) {
+                    // The *_metadata() calls, since the post meta wrappers
+                    // write to a revision's parent instead.
+                    delete_metadata('post', $revision_id, $key);
+                    foreach ((array) ($snapshotted_meta[ $key ] ?? []) as $v) {
+                        add_metadata('post', $revision_id, $key, self::slash_meta_value(maybe_unserialize($v)));
+                    }
+                }
+            });
+        }
+    }
+
+    /**
+     * Restore a comment to its pre-mutation state.
+     *
+     * moderate-comment and edit-comment only ever change an existing comment
+     * (status, content, author fields), so in that case the comment still
+     * exists here and is restored in place: the captured row goes back via
+     * wp_update_comment() and the commentmeta is reconciled the same way the
+     * post/user paths reconcile their meta (purge keys the mutation added,
+     * then re-write every captured key/value exactly).
+     *
+     * delete-comment (force) destroys the row entirely, so wp_update_comment()
+     * would silently no-op. When the comment no longer exists it is resurrected
+     * via wp_insert_comment() instead. WordPress core has NO import_id
+     * equivalent for comments, so the original comment_ID CANNOT be preserved:
+     * the resurrected comment gets a fresh auto-increment ID. Rather than fail
+     * or pretend otherwise, the content, author, status, dates, thread
+     * association and commentmeta are restored honestly under the new ID.
+     */
+    private static function apply_comment_snapshot(array $snapshot): void
+    {
+        if (! $snapshot['data']['comment']) {
+            return;
+        }
+
+        $comment_id = (int) $snapshot['object_id'];
+
+        if (get_comment($comment_id)) {
+            self::update_comment_verbatim((array) $snapshot['data']['comment']);
+            clean_comment_cache($comment_id);
+            self::reconcile_comment_meta($comment_id, (array) $snapshot['data']['meta']);
+            return;
+        }
+
+        self::resurrect_comment($snapshot['data']['comment'], (array) $snapshot['data']['meta']);
+    }
+
+    /**
+     * Write a captured comment row back through wp_update_comment() without
+     * its save filters touching the text columns.
+     *
+     * wp_update_comment() runs the comment save filters (kses, balanceTags,
+     * the note mention class sanitizer) over the row, which would rewrite
+     * the captured HTML instead of restoring it. Lifting those filters is
+     * not enough on its own: when wp_filter_kses is not hooked, core hooks
+     * it again itself for a commenter without unfiltered_html. So the text
+     * columns are also pinned to their captured values on
+     * wp_update_comment_data, the last stop before the row is written. The
+     * update still runs through core, so status transitions, comment counts
+     * and the edit_comment action behave as for any other update.
+     */
+    private static function update_comment_verbatim(array $captured): void
+    {
+        $pin = static function ($data) use ($captured) {
+            if (is_array($data)) {
+                foreach (self::COMMENT_TEXT_COLUMNS as $column) {
+                    if (array_key_exists($column, $captured)) {
+                        $data[ $column ] = $captured[ $column ];
+                    }
+                }
+            }
+            return $data;
+        };
+        $row = wp_slash($captured);
+
+        Save_Filters::without(self::COMMENT_SAVE_FILTERS, static function () use ($row, $pin) {
+            add_filter('wp_update_comment_data', $pin, PHP_INT_MAX);
+            try {
+                return wp_update_comment($row);
+            } finally {
+                remove_filter('wp_update_comment_data', $pin, PHP_INT_MAX);
+            }
+        });
+    }
+
+    /**
+     * Re-insert a force-deleted comment. The original comment_ID cannot be
+     * reused (no import_id for comments in WordPress core), so it is dropped
+     * and WordPress assigns a new one; every other captured field, plus the
+     * commentmeta, is restored under that new ID.
+     */
+    private static function resurrect_comment(array $comment_row, array $meta): void
+    {
+        unset($comment_row['comment_ID']);
+        $new_comment_id = wp_insert_comment(wp_slash($comment_row));
+        if (! $new_comment_id) {
+            throw new Mutation_Failed('Rollback failed to resurrect a force-deleted comment.');
+        }
+        self::reconcile_comment_meta((int) $new_comment_id, $meta);
+    }
+
+    /**
+     * Reconcile a comment's commentmeta back to the captured map: delete any
+     * key the mutation added, then re-write every captured key/value exactly.
+     * Shared by the in-place restore and the resurrection path.
+     */
+    private static function reconcile_comment_meta(int $comment_id, array $snapshotted_meta): void
+    {
+        $current_meta = get_comment_meta($comment_id);
+
+        foreach (array_keys(array_diff_key($current_meta, $snapshotted_meta)) as $key) {
+            delete_comment_meta($comment_id, $key);
+        }
+
+        foreach ($snapshotted_meta as $key => $values) {
+            delete_comment_meta($comment_id, $key);
+            foreach ((array) $values as $v) {
+                add_comment_meta($comment_id, $key, self::slash_meta_value(maybe_unserialize($v)));
+            }
+        }
+    }
+
+    /**
+     * Columns from a full get_post($id, ARRAY_A) row that are safe to feed
+     * back into wp_update_post()/wp_insert_post(). Excluded:
+     *  - 'ID' is merged in separately by the caller.
+     *  - 'filter' is a WP_Post runtime property (value 'raw'), not a real
+     *    column; wp_insert_post() would choke trying to sanitize it as post
+     *    data via sanitize_post() semantics for an unknown filter context.
+     *  - 'comment_count' is derived (recalculated from the comments table),
+     *    never written directly.
+     *  - 'guid' is dropped for the in-place wp_update_post() path per the
+     *    fix brief: wp_update_post() ignores it anyway (it always re-reads
+     *    the existing row's guid for updates), so passing it is a no-op
+     *    there but excluding it avoids relying on that internal behavior.
+     *    The resurrection path (wp_insert_post with import_id) keeps guid,
+     *    since there the original value both matters (permalink identity)
+     *    and is honored by WordPress core.
+     */
+    private static function restore_columns(array $post, bool $keep_guid): array
+    {
+        $excluded = ['ID', 'filter', 'comment_count'];
+        if (! $keep_guid) {
+            $excluded[] = 'guid';
+        }
+        return array_diff_key($post, array_flip($excluded));
+    }
+
+    /**
+     * Columns core rewrites on every save, so they are put back directly
+     * after the wp_update_post()/wp_insert_post() restore.
+     *
+     * - guid: both core write paths run it through its db-context sanitizing
+     *   filters, which entity-encode the "&" in a custom post type's
+     *   "?post_type=x&p=N" guid ("&#038;" on an update, "&amp;" on an
+     *   insert), so a post a write merely re-saved came back with a
+     *   different guid than it had.
+     * - post_modified, post_modified_gmt: wp_update_post() always stamps the
+     *   current time and wp_insert_post() copies post_date, so every
+     *   rollback reset them (issue #320).
+     * - post_date: a draft's date floats (post_date_gmt stays zero) and
+     *   wp_update_post() moves it to the current time on every save unless
+     *   edit_date is set, so a restored draft came back dated now (#498).
+     *
+     * A restore that promises the captured row should return the captured
+     * row.
+     */
+    private const VERBATIM_POST_COLUMNS = ['guid', 'post_date', 'post_modified', 'post_modified_gmt'];
+
+    /**
+     * Write the captured values of VERBATIM_POST_COLUMNS back byte for byte.
+     * A column the snapshot lacks (older blobs) or holds empty is left as
+     * core wrote it, so this is a no-op for snapshots that never had them.
+     */
+    private static function restore_verbatim_columns(int $object_id, array $captured): void
+    {
+        $current = get_post($object_id, ARRAY_A);
+        if (! $current) {
+            return;
+        }
+        $changes = [];
+        foreach (self::VERBATIM_POST_COLUMNS as $column) {
+            $value = $captured[ $column ] ?? null;
+            if (is_string($value) && '' !== $value && ($current[ $column ] ?? null) !== $value) {
+                $changes[ $column ] = $value;
+            }
+        }
+        if ([] === $changes) {
+            return;
+        }
+        global $wpdb;
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- core offers no unsanitized write of these columns; the post cache is cleaned below.
+        $wpdb->update($wpdb->posts, $changes, [ 'ID' => $object_id ], array_fill(0, count($changes), '%s'), [ '%d' ]);
+        clean_post_cache($object_id);
+    }
+
+    /**
+     * True if $current (a live get_post(ARRAY_A) row) is plausibly the same
+     * post the snapshot was captured from, rather than a different post that
+     * has since reclaimed the same ID. post_date_gmt is set once at
+     * creation and never changes on update, making it a reliable identity
+     * check that costs nothing extra to capture.
+     *
+     * Except for a draft with a floating date (post_date_gmt still the zero
+     * date): its first save to any other status, trash included, stamps
+     * both dates with the time of that save (issue #589). The snapshot of
+     * such a draft has no fixed date to compare, so the post type stands in
+     * for it; an id is only ever reclaimed by an explicit import_id after
+     * the original row was deleted.
+     */
+    private static function is_same_post(array $current, array $snapshotted): bool
+    {
+        $captured = $snapshotted['post_date_gmt'] ?? null;
+        if ('0000-00-00 00:00:00' === $captured) {
+            return ($current['post_type'] ?? null) === ($snapshotted['post_type'] ?? null);
+        }
+        return ($current['post_date_gmt'] ?? null) === $captured;
+    }
+
+    /**
+     * Take a post the snapshot predates out of the trash the WordPress way
+     * before its columns are written back (issue #589): wp_untrash_post()
+     * fires untrash_post and untrashed_post, deletes _wp_trash_meta_status
+     * and _wp_trash_meta_time, gives the slug back from _wp_desired_post_slug
+     * and returns the comments wp_trash_post() moved to post-trashed. The
+     * status it restores is the snapshot's own, not core's default draft.
+     * A post that is not in the trash, or a snapshot taken while it already
+     * was, needs nothing here.
+     *
+     * @param array<string, mixed> $current     The post row as it is now.
+     * @param array<string, mixed> $snapshotted The post row the snapshot holds.
+     */
+    private static function untrash_for_restore(int $post_id, array $current, array $snapshotted): void
+    {
+        $status = (string) ($snapshotted['post_status'] ?? '');
+        if ('trash' !== ($current['post_status'] ?? '') || '' === $status || 'trash' === $status) {
+            return;
+        }
+        $to_status = static fn (): string => $status;
+        add_filter('wp_untrash_post_status', $to_status, PHP_INT_MAX);
+        try {
+            Save_Filters::untrash_post($post_id);
+        } finally {
+            remove_filter('wp_untrash_post_status', $to_status, PHP_INT_MAX);
+        }
+    }
+
+    /**
+     * Every object_type apply_snapshot() below actually knows how to restore.
+     * List_Operations reads this rather than keeping its own copy: the copy
+     * had gone stale for six object types at once, so every one of those
+     * operations was reported to agents (and to the audit-log screen's
+     * Restore button) as un-rollbackable while the tools that wrote them
+     * reported recoverable: true. Add a branch below, get the listing for
+     * free.
+     *
+     * @return string[]
+     */
+    public static function restorable_object_types(): array
+    {
+        return [
+            'post',
+            'option',
+            'user',
+            'comment',
+            'wc_order',
+            'wc_order_full',
+            'wc_order_create',
+            'wc_subscription',
+            'wc_booking',
+            'wc_booking_create',
+            'wc_booking_rules',
+            'wc_user_membership',
+            'wc_user_membership_create',
+            'wc_shipping_zone',
+            'wc_shipping_zone_create',
+            'wc_webhook',
+            'wc_webhook_create',
+            'db_rows',
+            'redirect',
+            'term',
+            'yoast_term_seo',
+            'aioseo_row',
+            'redirection_item',
+            'plugin_table_rows',
+            'buddypress_rows',
+            'bbpress_posts',
+            'crm_rows',
+            'helpdesk_ticket',
+            'action_scheduler',
+            'surecart_object',
+            'funnelkit_funnel',
+            'funnelkit_funnel_create',
+            'amelia_rows',
+            'db_cleanup',
+            'wc_tax_rate',
+            'wc_tax_rate_create',
+            'php_snippet',
+            'code_snippet',
+            'page_build',
+            'media_import',
+            'wc_product_create',
+            Post_Creation_Snapshot::OBJECT_TYPE,
+            Comment_Creation_Snapshot::OBJECT_TYPE,
+            Menu_Creation_Snapshot::OBJECT_TYPE,
+            User_Creation_Snapshot::OBJECT_TYPE,
+            'elementor_global_classes',
+            'elementor_global_variables',
+            'theme_scaffold',
+            'package_install',
+            'acf_structure',
+            'acf_options',
+            'option_set',
+            'site_template',
+            'core_files',
+            'file_write',
+        ];
+    }
+
+    /**
+     * Restore an object to the exact state captured in $snapshot.
+     *
+     * For 'post' objects this must be a FULL restore, not an additive merge:
+     * any meta key that exists on the object now but was NOT present in the
+     * snapshot (i.e. it was added by the mutation being undone) must be
+     * deleted. Otherwise a rollback can leave orphan meta behind, violating
+     * the safety invariant that a restored object matches its pre-mutation
+     * state exactly.
+     *
+     * A force-deleted post's row is gone entirely (unlike trash, which only
+     * changes post_status), so wp_update_post() would silently no-op here.
+     * When the post no longer exists, re-insert it at the same ID via
+     * wp_insert_post()'s import_id instead of updating it.
+     *
+     * Both paths now pass the FULL captured row (post_type, post_author,
+     * post_parent, post_name/slug, dates, menu_order, post_excerpt,
+     * comment_status, ping_status, etc.), not just content/title/status:
+     * a partial restore silently reconstructs missing columns from
+     * wp_insert_post()'s defaults, e.g. a force-deleted 'page' comes back
+     * as a plain 'post'.
+     *
+     * wp_insert_post()'s import_id is only honored if that ID is free; on a
+     * collision it silently falls back to a new auto-increment ID. If that
+     * happens here we'd otherwise end up with a "restored" post masquerading
+     * at the wrong ID with no error, so the returned ID is verified against
+     * the requested one and a Mutation_Failed is thrown on any mismatch or
+     * WP_Error instead of leaving that wrong-ID post in place.
+     *
+     * Whether to update in place or resurrect is decided by identity, not
+     * mere existence of a row at $object_id: post_date_gmt is immutable
+     * after creation, so if a post exists at that ID but its post_date_gmt
+     * doesn't match the snapshot, it is a DIFFERENT post that has since
+     * reclaimed the original ID (e.g. a manual re-import after the original
+     * was force-deleted), not the object being rolled back. Treating that
+     * case as "exists, update in place" would silently overwrite an
+     * unrelated post's content; routing it through resurrect() instead lets
+     * the import_id collision check catch it and fail loudly.
+     *
+     * A 'files' entry in $snapshot['data'] (only ever present for an
+     * attachment's force-delete snapshot, see Delete_Media/File_Backup) is
+     * restored LAST, after the post row above is back: the physical bytes
+     * are only meaningful once the attachment record they belong to exists
+     * again. Every other object type, and posts without a 'files' key,
+     * never reach that branch, so this is purely additive.
+     */
+    public static function apply_snapshot(array $snapshot): void
+    {
+        // Every restore path ends here, so a snapshot a personal data
+        // erasure redacted (issue #478) is refused even by a caller that
+        // skipped the checks in restore_operation() and restore_session().
+        if (Snapshot_Redactor::is_erased($snapshot)) {
+            throw new Mutation_Failed('Rollback refused: ' . esc_html(Snapshot_Redactor::refusal($snapshot)));
+        }
+        // A write that held the multilingual plugin's sync between
+        // translations off (apply-page-text, issue #498) is undone the same
+        // way, so restoring the translation never rewrites its source.
+        if (! empty($snapshot['data']['hold_translation_sync'])) {
+            unset($snapshot['data']['hold_translation_sync']);
+            do_action('wpmcp_rollback_hold_translation_sync');
+            try {
+                self::apply_snapshot($snapshot);
+            } finally {
+                do_action('wpmcp_rollback_release_translation_sync');
+            }
+            return;
+        }
+        // A post snapshot that also carries a compiled widget's enabled flag
+        // (set-widget-status, update-custom-widget): restore the post first,
+        // then the flag, so the undo brings back the spec AND the compiled
+        // path it was rendering through.
+        // A network plugin write (issue #557) put back the site's
+        // active_plugins and the network's active_sitewide_plugins.
+        if (is_array($snapshot['data']['network_plugins'] ?? null)) {
+            $network = $snapshot['data']['network_plugins'];
+            unset($snapshot['data']['network_plugins']);
+            self::apply_snapshot($snapshot);
+            self::restore_network_plugins($network);
+            return;
+        }
+        if (is_array($snapshot['data']['compiled_widget_entry'] ?? null)) {
+            $entry = $snapshot['data']['compiled_widget_entry'];
+            unset($snapshot['data']['compiled_widget_entry']);
+            self::apply_snapshot($snapshot);
+            self::restore_compiled_widget_entry($entry);
+            return;
+        }
+
+        // Terms the write created as a side effect go once the rest of the
+        // snapshot is back (issue #588, Term_Restore::remove_created()).
+        $created_terms = Term_Restore::take_created($snapshot);
+        if ([] !== $created_terms) {
+            self::apply_snapshot($snapshot);
+            foreach (Term_Restore::remove_created($created_terms) as $warning) {
+                self::warn($warning);
+            }
+            return;
+        }
+
+        if ('option' === $snapshot['object_type']) {
+            self::apply_option_snapshot($snapshot);
+            return;
+        }
+
+        if ('user' === $snapshot['object_type']) {
+            self::apply_user_snapshot($snapshot);
+            return;
+        }
+
+        if ('comment' === $snapshot['object_type']) {
+            self::apply_comment_snapshot($snapshot);
+            return;
+        }
+
+        if ('wc_order' === $snapshot['object_type']) {
+            self::apply_wc_order_snapshot($snapshot);
+            return;
+        }
+
+        // Wc_Order_Snapshot::TYPE and ::CREATE_TYPE, spelled as literals so
+        // the restorable-types parity test sees them.
+        if ('wc_order_full' === $snapshot['object_type']) {
+            $warning = Wc_Order_Snapshot::restore($snapshot);
+            if (null !== $warning) {
+                self::warn($warning);
+            }
+            return;
+        }
+
+        // Wc_Subscription_Snapshot::TYPE (issue #658), a literal for the
+        // restorable-types parity test.
+        if ('wc_subscription' === $snapshot['object_type']) {
+            self::warn_if(Wc_Subscription_Snapshot::restore($snapshot));
+            return;
+        }
+
+        // Wc_Booking_Snapshot::TYPE, ::CREATE_TYPE and ::RULES_TYPE (issue
+        // #659), literals for the restorable-types parity test.
+        if ('wc_booking' === $snapshot['object_type']) {
+            self::warn_if(Wc_Booking_Snapshot::restore($snapshot));
+            return;
+        }
+        if ('wc_booking_create' === $snapshot['object_type']) {
+            self::warn_if(Wc_Booking_Snapshot::undo_creation($snapshot));
+            return;
+        }
+        if ('wc_booking_rules' === $snapshot['object_type']) {
+            self::warn_if(Wc_Booking_Snapshot::restore_rules($snapshot));
+            return;
+        }
+
+        // Wc_User_Membership_Snapshot::TYPE and ::CREATE_TYPE (PR #573),
+        // literals for the restorable-types parity test.
+        if ('wc_user_membership' === $snapshot['object_type']) {
+            self::warn_if(Wc_User_Membership_Snapshot::restore($snapshot));
+            return;
+        }
+        if ('wc_user_membership_create' === $snapshot['object_type']) {
+            self::warn_if(Wc_User_Membership_Snapshot::undo_creation($snapshot));
+            return;
+        }
+
+        if ('wc_order_create' === $snapshot['object_type']) {
+            $warning = Wc_Order_Snapshot::undo_creation($snapshot);
+            if (null !== $warning) {
+                self::warn($warning);
+            }
+            return;
+        }
+
+        // Wc_Shipping_Zone_Snapshot and Wc_Webhook_Snapshot types, spelled
+        // as literals for the restorable-types parity test (issue #292).
+        if ('wc_shipping_zone' === $snapshot['object_type']) {
+            self::warn_if(Wc_Shipping_Zone_Snapshot::restore($snapshot));
+            return;
+        }
+
+        if ('wc_shipping_zone_create' === $snapshot['object_type']) {
+            self::warn_if(Wc_Shipping_Zone_Snapshot::undo_creation($snapshot));
+            return;
+        }
+
+        if ('wc_webhook' === $snapshot['object_type']) {
+            self::warn_if(Wc_Webhook_Snapshot::restore($snapshot));
+            return;
+        }
+
+        if ('wc_webhook_create' === $snapshot['object_type']) {
+            self::warn_if(Wc_Webhook_Snapshot::undo_creation($snapshot));
+            return;
+        }
+
+        if ('db_rows' === $snapshot['object_type']) {
+            self::apply_db_rows_snapshot($snapshot);
+            return;
+        }
+
+        if ('redirect' === $snapshot['object_type']) {
+            self::apply_redirect_snapshot($snapshot);
+            return;
+        }
+
+        if ('term' === $snapshot['object_type']) {
+            self::apply_term_snapshot($snapshot);
+            return;
+        }
+
+        if ('yoast_term_seo' === $snapshot['object_type']) {
+            self::apply_yoast_term_seo_snapshot($snapshot);
+            return;
+        }
+
+        if ('wc_tax_rate' === $snapshot['object_type']) {
+            self::apply_wc_tax_rate_snapshot($snapshot);
+            return;
+        }
+
+        // Wc_Tax_Rate_Creation_Snapshot::OBJECT_TYPE, spelled as a literal
+        // for the restorable-types parity test (issue #761).
+        if ('wc_tax_rate_create' === $snapshot['object_type']) {
+            self::warn_if(Wc_Tax_Rate_Creation_Snapshot::undo_creation($snapshot));
+            return;
+        }
+
+        if ('aioseo_row' === $snapshot['object_type']) {
+            $data = (array) $snapshot['data'];
+            if (! empty($data['table_exists'])) {
+                self::write_aioseo_rows((string) ($data['kind'] ?? ''), (int) ($data['id'] ?? 0), (array) ($data['rows'] ?? []));
+            }
+            return;
+        }
+
+        if ('redirection_item' === $snapshot['object_type']) {
+            self::warn_if(Redirection_Item_Snapshot::restore($snapshot));
+            return;
+        }
+
+        // Plugin_Table_Rows_Snapshot::TYPE, spelled as a literal for the restorable-types parity test.
+        if ('plugin_table_rows' === $snapshot['object_type']) {
+            Plugin_Table_Rows_Snapshot::restore($snapshot);
+            /**
+             * Action: a plugin table's rows were put back by a rollback
+             * (issue #867), so an integration that caches what it derives
+             * from them can rebuild it. Passes the rows' kind.
+             */
+            do_action('wpmcp_rollback_table_rows_restored', (string) ($snapshot['data']['kind'] ?? ''));
+            return;
+        }
+
+        // Db_Cleanup_Snapshot::TYPE, spelled as a literal for the restorable-types parity test.
+        if ('db_cleanup' === $snapshot['object_type']) {
+            self::warn_if(Db_Cleanup_Snapshot::restore($snapshot));
+            return;
+        }
+
+        // BuddyPress_Rows_Snapshot::TYPE, spelled as a literal for the restorable-types parity test.
+        if ('buddypress_rows' === $snapshot['object_type']) {
+            self::warn_if(BuddyPress_Rows_Snapshot::restore($snapshot));
+            return;
+        }
+
+        // BbPress_Posts_Snapshot::TYPE, spelled as a literal for the restorable-types parity test.
+        if ('bbpress_posts' === $snapshot['object_type']) {
+            self::warn_if(BbPress_Posts_Snapshot::restore($snapshot));
+            return;
+        }
+
+        // Helpdesk_Ticket_Snapshot::TYPE, spelled as a literal for the restorable-types parity test.
+        if ('helpdesk_ticket' === $snapshot['object_type']) {
+            self::warn_if(Helpdesk_Ticket_Snapshot::restore($snapshot));
+            return;
+        }
+
+        // Action_Scheduler_Snapshot::TYPE, spelled as a literal for the restorable-types parity test.
+        if ('action_scheduler' === $snapshot['object_type']) {
+            self::warn_if(Action_Scheduler_Snapshot::restore($snapshot));
+            return;
+        }
+
+        // SureCart_Snapshot::TYPE, spelled as a literal for the restorable-types parity test.
+        if ('surecart_object' === $snapshot['object_type']) {
+            self::warn_if(SureCart_Snapshot::restore($snapshot));
+            return;
+        }
+
+        // Crm_Rows_Snapshot::TYPE, spelled as a literal for the restorable-types parity test.
+        if ('crm_rows' === $snapshot['object_type']) {
+            self::warn_if(Crm_Rows_Snapshot::restore($snapshot));
+            return;
+        }
+
+        // FunnelKit_Funnel_Snapshot::TYPE and ::CREATE_TYPE, spelled as
+        // literals for the restorable-types parity test (issue #500).
+        if ('funnelkit_funnel' === $snapshot['object_type']) {
+            self::warn_if(FunnelKit_Funnel_Snapshot::restore($snapshot));
+            return;
+        }
+
+        if ('funnelkit_funnel_create' === $snapshot['object_type']) {
+            self::warn_if(FunnelKit_Funnel_Snapshot::undo_creation($snapshot));
+            return;
+        }
+
+        // Amelia_Rows_Snapshot::TYPE, spelled as a literal for the restorable-types parity test.
+        if ('amelia_rows' === $snapshot['object_type']) {
+            self::warn_if(Amelia_Rows_Snapshot::restore($snapshot));
+            return;
+        }
+
+        if ('php_snippet' === $snapshot['object_type']) {
+            self::apply_php_snippet_snapshot($snapshot);
+            return;
+        }
+
+        // Code_Snippet_Snapshot::TYPE, spelled as a literal for the restorable-types parity test.
+        if ('code_snippet' === $snapshot['object_type']) {
+            self::warn_if(Code_Snippet_Snapshot::restore($snapshot));
+            return;
+        }
+
+        if ('page_build' === $snapshot['object_type']) {
+            self::apply_page_build_snapshot($snapshot);
+            return;
+        }
+
+        if ('media_import' === $snapshot['object_type']) {
+            self::apply_media_import_snapshot($snapshot);
+            return;
+        }
+
+        if ('wc_product_create' === $snapshot['object_type']) {
+            self::apply_wc_product_create_snapshot($snapshot);
+            return;
+        }
+
+        // Spelled as a literal (Post_Creation_Snapshot::OBJECT_TYPE) like
+        // every other branch here, so the restorable-types parity test sees it.
+        if ('post_create' === $snapshot['object_type']) {
+            self::apply_post_create_snapshot($snapshot);
+            return;
+        }
+
+        // Comment_Creation_Snapshot::OBJECT_TYPE, spelled as a literal for the same reason.
+        if ('comment_create' === $snapshot['object_type']) {
+            self::apply_comment_create_snapshot($snapshot);
+            return;
+        }
+
+        // Menu_Creation_Snapshot::OBJECT_TYPE and User_Creation_Snapshot::OBJECT_TYPE,
+        // spelled as literals for the restorable-types parity test (issue #598).
+        if ('menu_create' === $snapshot['object_type']) {
+            self::warn_if(Menu_Creation_Snapshot::undo_creation($snapshot));
+            return;
+        }
+
+        if ('user_create' === $snapshot['object_type']) {
+            self::warn_if(User_Creation_Snapshot::undo_creation($snapshot));
+            return;
+        }
+
+        if ('elementor_global_classes' === $snapshot['object_type']) {
+            self::apply_elementor_global_classes_snapshot($snapshot);
+            return;
+        }
+
+        if ('elementor_global_variables' === $snapshot['object_type']) {
+            self::apply_elementor_global_variables_snapshot($snapshot);
+            return;
+        }
+
+        if ('theme_scaffold' === $snapshot['object_type']) {
+            self::apply_theme_scaffold_snapshot($snapshot);
+            return;
+        }
+
+        // Site_Template_Snapshot::TYPE, spelled as a literal for the restorable-types parity test.
+        if ('site_template' === $snapshot['object_type']) {
+            Site_Template_Snapshot::restore($snapshot);
+            return;
+        }
+
+        if ('package_install' === $snapshot['object_type']) {
+            self::apply_package_install_snapshot($snapshot);
+            return;
+        }
+
+        // File_Write_Snapshot::TYPE, spelled as a literal for the restorable-types parity test.
+        if ('file_write' === $snapshot['object_type']) {
+            foreach (File_Write_Snapshot::restore($snapshot) as $warning) {
+                self::warn($warning);
+            }
+            return;
+        }
+
+        // Core_Files_Snapshot::TYPE, spelled as a literal for the restorable-types parity test.
+        if ('core_files' === $snapshot['object_type']) {
+            foreach (Core_Files_Snapshot::restore($snapshot) as $warning) {
+                self::warn($warning);
+            }
+            return;
+        }
+
+        if ('acf_structure' === $snapshot['object_type']) {
+            self::apply_acf_structure_snapshot($snapshot);
+            return;
+        }
+
+        if ('acf_options' === $snapshot['object_type']) {
+            self::apply_acf_options_snapshot($snapshot);
+            return;
+        }
+
+        if ('option_set' === $snapshot['object_type']) {
+            self::apply_option_set_snapshot($snapshot);
+            return;
+        }
+
+        if ('post' !== $snapshot['object_type']) {
+            return;
+        }
+
+        $object_id = (int) $snapshot['object_id'];
+
+        // Revisions saved while the row goes back (issue #872): a builder
+        // copies its layout meta onto each one on save_post, before the
+        // snapshotted meta below is back, so they are corrected after it.
+        $restore_revisions = [];
+        $collect_revision  = static function ($revision_id) use (&$restore_revisions): void {
+            $restore_revisions[] = (int) $revision_id;
+        };
+        add_action('_wp_put_post_revision', $collect_revision);
+        try {
+            if ($snapshot['data']['post']) {
+                $current = get_post($object_id, ARRAY_A);
+                if ($current && self::is_same_post($current, $snapshot['data']['post'])) {
+                    self::untrash_for_restore($object_id, $current, (array) $snapshot['data']['post']);
+                    $postarr = array_merge(['ID' => $object_id], self::restore_columns($snapshot['data']['post'], false));
+                    // wp_update_post() unslashes its input; the snapshot holds
+                    // the raw stored columns, so they are slashed first or every
+                    // backslash (block JSON escapes such as \u003c) is lost.
+                    // Its save filters would rewrite the stored HTML (kses for
+                    // a user without unfiltered_html), so they stand down.
+                    $postarr = wp_slash($postarr);
+                    Save_Filters::without(self::POST_SAVE_FILTERS, static fn () => wp_update_post($postarr));
+                } else {
+                    self::resurrect($object_id, $snapshot['data']['post'], $snapshot['data']['comments'] ?? []);
+                }
+                self::restore_verbatim_columns($object_id, (array) $snapshot['data']['post']);
+            }
+        } finally {
+            remove_action('_wp_put_post_revision', $collect_revision);
+        }
+
+        $snapshotted_meta = (array) $snapshot['data']['meta'];
+        $current_meta     = get_post_meta($object_id);
+        $is_elementor     = self::is_elementor_document($snapshotted_meta) || self::is_elementor_document($current_meta);
+
+        // Purge any meta key that didn't exist at snapshot time (newly added by the mutation).
+        $purged_keys = array_map('strval', array_keys(array_diff_key($current_meta, $snapshotted_meta)));
+        foreach ($purged_keys as $key) {
+            delete_post_meta($object_id, $key);
+        }
+
+        // Restore snapshotted keys/values exactly as captured, without the
+        // meta sanitizers filtering the stored values a second time.
+        $meta_filters = self::post_meta_save_filters($object_id, array_map('strval', array_keys($snapshotted_meta)));
+        Save_Filters::without($meta_filters, static function () use ($object_id, $snapshotted_meta): void {
+            foreach ($snapshotted_meta as $key => $values) {
+                delete_post_meta($object_id, $key);
+                foreach ((array) $values as $v) {
+                    // add_post_meta() unslashes too; slash so the value lands byte-for-byte.
+                    add_post_meta($object_id, $key, self::slash_meta_value(maybe_unserialize($v)));
+                }
+            }
+        });
+
+        self::sync_restore_revisions($object_id, $restore_revisions, $snapshotted_meta, $purged_keys);
+
+        // Restore taxonomy term assignments captured at snapshot time. Older
+        // snapshots predating term capture simply have no 'terms' key, so
+        // this is a no-op for them (backward compatible).
+        foreach ((array) ($snapshot['data']['terms'] ?? []) as $taxonomy => $term_ids) {
+            wp_set_object_terms($object_id, array_map('intval', (array) $term_ids), (string) $taxonomy, false);
+        }
+
+        self::restore_files($snapshot['data']['files'] ?? null);
+
+        if ($is_elementor) {
+            self::refresh_elementor_caches($object_id, $snapshotted_meta);
+        }
+
+        if (isset($snapshotted_meta['_fl_builder_data']) || isset($current_meta['_fl_builder_data'])) {
+            Beaver_Builder_Cache::clear($object_id);
+        }
+
+        if (isset($snapshotted_meta[ Avada_Cache::STATUS_META_KEY ]) || isset($current_meta[ Avada_Cache::STATUS_META_KEY ])) {
+            Avada_Cache::invalidate($object_id);
+        }
+
+        foreach (['breakdance', 'oxygen'] as $engine_builder) {
+            foreach (Breakdance_Cache::data_keys($engine_builder) as $engine_key) {
+                if (isset($snapshotted_meta[ $engine_key ]) || isset($current_meta[ $engine_key ])) {
+                    Breakdance_Cache::regenerate($object_id, $engine_builder);
+                    break;
+                }
+            }
+        }
+
+        // Bricks' page CSS file is rebuilt from the restored layout (issue
+        // #914); its rows, editor mode included, came back with the post's meta.
+        foreach ([Bricks_Cache::CONTENT_KEY, Bricks_Cache::HEADER_KEY, Bricks_Cache::FOOTER_KEY, Bricks_Cache::EDITOR_MODE_KEY] as $bricks_key) {
+            if (isset($snapshotted_meta[ $bricks_key ]) || isset($current_meta[ $bricks_key ])) {
+                Bricks_Cache::regenerate($object_id);
+                break;
+            }
+        }
+
+        // BeTheme's local style file is rebuilt from the restored layout
+        // (issue #643); its rows came back with the post's meta.
+        if (isset($snapshotted_meta[ BeTheme_Cache::META_KEY ]) || isset($current_meta[ BeTheme_Cache::META_KEY ])) {
+            BeTheme_Cache::refresh($object_id);
+        }
+
+        foreach (Oxygen_Classic_Cache::LAYOUT_KEYS as $classic_key) {
+            if (isset($snapshotted_meta[ $classic_key ]) || isset($current_meta[ $classic_key ])) {
+                Oxygen_Classic_Cache::refresh($object_id);
+                break;
+            }
+        }
+
+        self::refresh_woocommerce_product($object_id);
+        self::refresh_woocommerce_coupon($object_id);
+
+        /**
+         * Action: a post was put back by a rollback (issue #287), so code that
+         * caches output derived from its content (a block suite's per-post
+         * stylesheet) can rebuild it instead of serving the undone write's.
+         */
+        do_action('wpmcp_rollback_post_restored', $object_id);
+    }
+
+    /**
+     * Drop WooCommerce's coupon lookups after a raw restore of a shop_coupon
+     * post (issue #195). WooCommerce resolves a code to a coupon id through
+     * an object-cache entry keyed by the code, and its own save path only
+     * clears the entry for the code it is saving. A rollback of a code change
+     * writes wp_posts directly, so without this the NEW code would keep
+     * resolving to the coupon after it has been put back to the old one.
+     * Invalidating the whole 'coupons' group is what WooCommerce itself does
+     * when coupon data changes in bulk; it costs one cache prefix bump.
+     *
+     * No-op when WooCommerce is absent or the post is not a coupon.
+     */
+    private static function refresh_woocommerce_coupon(int $object_id): void
+    {
+        if (! class_exists('WC_Cache_Helper') || 'shop_coupon' !== get_post_type($object_id)) {
+            return;
+        }
+        \WC_Cache_Helper::invalidate_cache_group('coupons');
+    }
+
+    /**
+     * Restore a WooCommerce tax rate captured by Snapshot::capture_wc_tax_rate()
+     * (issue #195): update it in place when it still exists, or re-insert it
+     * at its original id when it was deleted, then put its postcode and city
+     * rows back exactly.
+     *
+     * Every write goes through WC_Tax's own internal CRUD helpers, so the
+     * 'taxes' cache group is invalidated and the woocommerce_tax_rate_added /
+     * _updated actions fire exactly as they do for an edit in wp-admin. The
+     * resurrection passes tax_rate_id through _insert_tax_rate(), which
+     * forwards unknown keys to $wpdb->insert() unchanged; the returned id is
+     * then checked, and a mismatch (the id was somehow taken) is a loud
+     * Mutation_Failed rather than a "restored" rate at the wrong id.
+     *
+     * Restoring store tax configuration is itself a store-settings write, so,
+     * like the redirect restore, it re-checks the capability the write tools
+     * require instead of trusting whoever reached the rollback.
+     */
+    private static function apply_wc_tax_rate_snapshot(array $snapshot): void
+    {
+        $data = (array) ($snapshot['data'] ?? []);
+        $row  = $data['rate'] ?? null;
+        if (! is_array($row) || ! class_exists('WC_Tax')) {
+            return;
+        }
+
+        if (! current_user_can('manage_woocommerce')) {
+            throw new Mutation_Failed('Rollback refused: restoring a tax rate requires the manage_woocommerce capability.');
+        }
+
+        $tax_rate_id = (int) $snapshot['object_id'];
+        if ($tax_rate_id <= 0) {
+            return;
+        }
+
+        $fields = array_diff_key($row, ['tax_rate_id' => true]);
+        $live   = \WC_Tax::_get_tax_rate($tax_rate_id, ARRAY_A);
+
+        if (is_array($live) && ! empty($live)) {
+            \WC_Tax::_update_tax_rate($tax_rate_id, $fields);
+        } else {
+            $inserted = (int) \WC_Tax::_insert_tax_rate(array_merge(['tax_rate_id' => $tax_rate_id], $fields));
+            if ($inserted !== $tax_rate_id) {
+                throw new Mutation_Failed(sprintf(
+                    'Rollback failed to restore tax rate %d at its original id (got %d).',
+                    (int) $tax_rate_id,
+                    (int) $inserted
+                ));
+            }
+        }
+
+        \WC_Tax::_update_tax_rate_postcodes($tax_rate_id, array_map('strval', (array) ($data['postcodes'] ?? [])));
+        \WC_Tax::_update_tax_rate_cities($tax_rate_id, array_map('strval', (array) ($data['cities'] ?? [])));
+    }
+
+    /**
+     * Slash a meta value for add_post_meta(), strings inside objects too.
+     * add_post_meta() unslashes with map_deep(), which walks object
+     * properties, while wp_slash() skips objects, so a value holding objects
+     * (a Beaver Builder node map is an array of stdClass) would otherwise
+     * lose every backslash in those strings on restore. Identical to
+     * wp_slash() for strings and arrays.
+     *
+     * @param mixed $value freshly unserialized, so mutating its objects is safe
+     * @return mixed
+     */
+    private static function slash_meta_value($value)
+    {
+        return map_deep($value, static fn ($item) => is_string($item) ? addslashes($item) : $item);
+    }
+
+    /** Whether a post meta map (get_post_meta() shape) carries Elementor document data. */
+    private static function is_elementor_document(array $meta): bool
+    {
+        return isset($meta['_elementor_data']) || isset($meta['_elementor_page_settings']);
+    }
+
+    /**
+     * Drop Elementor's derived caches after a raw post restore.
+     *
+     * The meta restore above puts back whatever `_elementor_css` and render
+     * cache the snapshot held, while the CSS file on disk was regenerated for
+     * the content being rolled back, so the page would be served that CSS for
+     * the restored data. A kit's settings feed every document's CSS, so
+     * restoring the kit purges site-wide.
+     */
+    private static function refresh_elementor_caches(int $object_id, array $snapshotted_meta): void
+    {
+        Elementor_Cache::invalidate_document($object_id);
+
+        $type = $snapshotted_meta['_elementor_template_type'][0] ?? get_post_meta($object_id, '_elementor_template_type', true);
+        if ('kit' === maybe_unserialize($type)) {
+            Elementor_Cache::clear_all();
+        }
+    }
+
+    /**
+     * Bring WooCommerce's derived data back in line after a raw post restore.
+     *
+     * The post path above writes wp_posts and wp_postmeta directly, which is
+     * exactly right for the snapshot contract but bypasses WooCommerce's CRUD
+     * layer. For a product or variation that layer maintains three things the
+     * raw restore leaves stale: per-product transients (the variable parent's
+     * cached variation price range among them), the wc_product_meta_lookup
+     * row that sorting and filtering read, and, for a variation, the parent's
+     * synced _price range and stock status. Without this, rolling back a
+     * variation price change restores the variation's own meta while the
+     * storefront keeps showing the un-rolled-back parent range.
+     *
+     * No-op when WooCommerce is absent or the post is not a product.
+     */
+    private static function refresh_woocommerce_product(int $object_id): void
+    {
+        if (! function_exists('wc_get_product') || ! class_exists('WC_Product_Data_Store_CPT')) {
+            return;
+        }
+
+        $post_type = get_post_type($object_id);
+        if (! in_array($post_type, ['product', 'product_variation'], true)) {
+            return;
+        }
+
+        wc_delete_product_transients($object_id);
+        self::refresh_woocommerce_lookup_row($object_id);
+
+        if ('product_variation' !== $post_type) {
+            return;
+        }
+
+        $parent_id = (int) wp_get_post_parent_id($object_id);
+        if ($parent_id <= 0 || ! class_exists('WC_Product_Variable')) {
+            return;
+        }
+
+        // sync() re-reads the children's _price rows, rewrites the parent's
+        // _price range and stock status, refreshes the parent's lookup row
+        // and saves the parent through the CRUD layer, which is the same path
+        // a variation save() takes.
+        wc_delete_product_transients($parent_id);
+        \WC_Product_Variable::sync($parent_id);
+    }
+
+    /**
+     * Rewrite one product's wc_product_meta_lookup row from its (restored)
+     * postmeta. WooCommerce keeps update_lookup_table() protected on the data
+     * store and only calls it from its own save path, which a raw meta restore
+     * never goes through; the anonymous subclass is the narrowest way to reach
+     * it without re-implementing the row's column mapping.
+     */
+    private static function refresh_woocommerce_lookup_row(int $object_id): void
+    {
+        $refresher = new class extends \WC_Product_Data_Store_CPT {
+            public function refresh(int $id): void
+            {
+                $this->update_lookup_table($id, 'wc_product_meta_lookup');
+            }
+        };
+        $refresher->refresh($object_id);
+    }
+
+    /**
+     * Restore the exact before-image rows captured by update-rows /
+     * delete-rows (issue #82; snapshot shape documented at
+     * Snapshot::capture_db_rows()).
+     *
+     * THE ROLLBACK PATH ITSELF PERFORMS DB WRITES, so a forged or stale
+     * snapshot must never become a write primitive the write tools would
+     * refuse. Everything is re-validated against the LIVE database before a
+     * single row is touched:
+     *  - the table must still exist (Database_Guard::valid_table() resolves
+     *    the exact real name, which is then bound with %i);
+     *  - the table must not be protected (users/usermeta by default) - a
+     *    legitimate snapshot can never reference one, because the write
+     *    tools refuse protected tables before capturing anything;
+     *  - a non-empty primary key must be declared in the snapshot, and every
+     *    captured row must carry a non-null value for each PK column;
+     *  - every captured column name must exactly match a live column of the
+     *    table (closes both column-name injection, since %i quotes an
+     *    identifier but does not check that it exists, and silent schema
+     *    drift: a dropped column means the promised exact restore is
+     *    impossible, so fail loudly instead).
+     * Any violation throws Mutation_Failed before any write happens.
+     *
+     * Per row, the restore is an upsert keyed on the primary key: if a row
+     * exists at the captured PK it is updated back to the captured values
+     * ($wpdb->update(), parameterized); if not, the full captured row -
+     * INCLUDING its original PK values - is reinserted ($wpdb->insert()),
+     * which is what preserves auto-increment ids across a delete + rollback.
+     * (Caveat: the table's auto-increment counter itself is not rewound, so
+     * ids handed out between the delete and the rollback are simply skipped.)
+     *
+     * Conflict detection compares the CURRENT row against what the operation
+     * left behind (before-image overlaid with the update's 'set' map, or
+     * absence for a delete). Any drift - a third-party edit, a vanished row,
+     * a reclaimed PK - is reported via warn() but does not stop the restore:
+     * the captured before-image always wins, matching the safety invariant
+     * that a restored object equals its pre-mutation state exactly.
+     */
+    private static function apply_db_rows_snapshot(array $snapshot): void
+    {
+        global $wpdb;
+
+        // Every database tool is gated at manage_options (raw table access is
+        // phpMyAdmin-level power), but the rollback tools are - and must stay -
+        // edit_posts, so lower-privileged identities can undo their own content
+        // writes. Without this check, an edit_posts caller could mutate raw
+        // tables by replaying an administrator's operation through
+        // rollback-operation. Enforce the database tools' own gate here, on
+        // the one snapshot type whose restore IS a raw table write.
+        if (! current_user_can('manage_options')) {
+            throw new Mutation_Failed('Rollback refused: restoring raw table rows requires the manage_options capability.');
+        }
+
+        $data = (array) ($snapshot['data'] ?? []);
+        $rows = (array) ($data['rows'] ?? []);
+        if ([] === $rows) {
+            return; // Nothing was captured, so there is nothing to restore.
+        }
+
+        $table = \WPMCP\Tools\Database\Database_Guard::scoped_table((string) ($data['table'] ?? ''));
+        if (is_wp_error($table)) {
+            throw new Mutation_Failed('Rollback refused: ' . esc_html($table->get_error_message()));
+        }
+        if (\WPMCP\Tools\Database\Database_Guard::is_protected($table)) {
+            throw new Mutation_Failed('Rollback refused: table "' . esc_html($table) . '" is protected.');
+        }
+
+        $primary_key = array_values(array_map('strval', (array) ($data['primary_key'] ?? [])));
+        if ([] === $primary_key) {
+            throw new Mutation_Failed('Rollback refused: db_rows snapshot has no primary key.');
+        }
+
+        $live_columns = \WPMCP\Tools\Database\Database_Guard::columns($table);
+        foreach ($primary_key as $column) {
+            if (! in_array($column, $live_columns, true)) {
+                throw new Mutation_Failed('Rollback refused: primary-key column "' . esc_html($column) . '" is not a column of "' . esc_html($table) . '".');
+            }
+        }
+
+        $operation = (string) ($data['operation'] ?? '');
+        $set       = (array) ($data['set'] ?? []);
+
+        // The restore is as raw a write as the operation it undoes, so the
+        // same caches are stale afterwards (issue #182): without the
+        // invalidation, get_option() and friends keep serving the value the
+        // rollback just overwrote. It runs in `finally` so that a
+        // Mutation_Failed on a later row still invalidates the rows already
+        // restored.
+        $attempted = [];
+        try {
+            foreach ($rows as $row) {
+                $row = (array) $row;
+
+                foreach (array_keys($row) as $column) {
+                    if (! in_array((string) $column, $live_columns, true)) {
+                        throw new Mutation_Failed('Rollback refused: captured column "' . esc_html((string) $column) . '" is not a column of "' . esc_html($table) . '".');
+                    }
+                }
+
+                $where = [];
+                foreach ($primary_key as $column) {
+                    if (! isset($row[ $column ])) {
+                        throw new Mutation_Failed('Rollback refused: a captured row is missing primary-key value "' . esc_html($column) . '".');
+                    }
+                    $where[ $column ] = $row[ $column ];
+                }
+
+                $current = \WPMCP\Tools\Database\Database_Guard::before_image($table, $where, 1)[0] ?? null;
+                $pk_desc = self::describe_pk($where);
+
+                if ('delete' === $operation) {
+                    if (null !== $current) {
+                        self::warn("Row {$pk_desc} in \"{$table}\" was recreated after the delete; it was overwritten with the captured before-image.");
+                    }
+                } else {
+                    if (null === $current) {
+                        self::warn("Row {$pk_desc} in \"{$table}\" was deleted after the operation; the captured before-image was reinserted.");
+                    } elseif (! self::row_matches($current, array_merge($row, $set))) {
+                        self::warn("Row {$pk_desc} in \"{$table}\" changed after the operation; the captured before-image was restored over it.");
+                    }
+                }
+
+                // Recorded before the write: a write that fails part-way may
+                // still have changed the row, so it is invalidated too.
+                $attempted[] = $row;
+
+                if (null === $current) {
+                    // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- reinserts a captured before-image row into the Database_Guard-validated table it was deleted from; no WP API covers raw table rows.
+                    if (false === $wpdb->insert($table, $row)) {
+                        throw new Mutation_Failed('Rollback failed to reinsert row ' . esc_html($pk_desc) . ' into "' . esc_html($table) . '": ' . (esc_html($wpdb->last_error) ?: 'insert failed'));
+                    }
+                    continue;
+                }
+
+                $restore = array_diff_key($row, array_flip($primary_key));
+                if ([] === $restore) {
+                    continue; // PK-only table: existing row is already the before-image.
+                }
+                // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- restores a captured before-image row in the Database_Guard-validated table; undo-critical write, no WP API covers raw table rows. Not cached: the object caches over this table are invalidated right after via Database_Guard::invalidate_caches().
+                if (false === $wpdb->update($table, $restore, $where)) {
+                    throw new Mutation_Failed('Rollback failed to restore row ' . esc_html($pk_desc) . ' in "' . esc_html($table) . '": ' . (esc_html($wpdb->last_error) ?: 'update failed'));
+                }
+            }
+        } finally {
+            if ([] !== $attempted) {
+                Database_Guard::invalidate_caches($table, ['rows' => $attempted]);
+            }
+        }
+    }
+
+    /**
+     * Undo a build-page composition (issue #57). Unlike every other snapshot
+     * type, a 'page_build' snapshot records what the operation CREATED
+     * (recorded after the mutation, since the ids cannot exist before it),
+     * so its restore is a deletion: the created page's pre-operation state
+     * was nonexistence. The menu items placed by the build go first, then
+     * the page itself - force-deleted, matching how resurrect() treats
+     * force-deletion as the true inverse of creation.
+     *
+     * The page is only deleted if it is plausibly still the page the build
+     * created: post_date_gmt is set once at creation and never changes on
+     * update, so a mismatch means a DIFFERENT post has since reclaimed the
+     * id and deleting it would destroy an unrelated object. That case warns
+     * and leaves the post untouched (a non-fatal conflict, like the db_rows
+     * drift warnings). Later edits to the created page keep post_date_gmt,
+     * so an edited page is still honestly removed by the rollback.
+     */
+    private static function apply_page_build_snapshot(array $snapshot): void
+    {
+        $data = (array) ($snapshot['data'] ?? []);
+
+        foreach ((array) ($data['menu_item_ids'] ?? []) as $item_id) {
+            $item = get_post((int) $item_id);
+            if ($item && 'nav_menu_item' === $item->post_type) {
+                wp_delete_post((int) $item_id, true);
+            }
+        }
+
+        $post_id = (int) $snapshot['object_id'];
+        $current = get_post($post_id);
+        if (! $current) {
+            return; // Already gone; nothing left to undo.
+        }
+
+        if (($data['post_date_gmt'] ?? null) !== $current->post_date_gmt) {
+            self::warn("Post {$post_id} is not the page this build created (the id was reclaimed by another post); it was left untouched.");
+            return;
+        }
+
+        wp_delete_post($post_id, true);
+    }
+
+    /**
+     * Undo a media import (issue #64: import-stock-image / upload-svg).
+     * Same creation-snapshot semantics as 'page_build': the snapshot records
+     * the attachment the tool CREATED, so restoring it means deleting that
+     * attachment again - wp_delete_attachment(force) removes both the post
+     * row and the physical files, the true inverse of the import. The same
+     * post_date_gmt identity check protects an unrelated post that has since
+     * reclaimed the id, and a non-attachment at the id is likewise left
+     * untouched with a warning rather than destroyed.
+     */
+    private static function apply_media_import_snapshot(array $snapshot): void
+    {
+        $data     = (array) ($snapshot['data'] ?? []);
+        $media_id = (int) $snapshot['object_id'];
+        $current  = get_post($media_id);
+        if (! $current) {
+            return; // Already gone; nothing left to undo.
+        }
+
+        if ('attachment' !== $current->post_type || ($data['post_date_gmt'] ?? null) !== $current->post_date_gmt) {
+            self::warn("Post {$media_id} is not the attachment this import created (the id was reclaimed); it was left untouched.");
+            return;
+        }
+
+        wp_delete_attachment($media_id, true);
+    }
+
+    /**
+     * Undo the creation of a WooCommerce product or variation
+     * (apply-product-import). Same creation-snapshot semantics as
+     * 'media_import': the snapshot names what the operation CREATED, so the
+     * restore deletes it permanently through WooCommerce's CRUD layer, which
+     * also clears its lookup row and caches. A created variable product takes
+     * every variation under it along; a variation created under a product
+     * that already existed is removed and the parent's price range and stock
+     * status are re-synced from the variations that remain.
+     *
+     * The same post_date_gmt and post type identity check as the other
+     * creation restores protects an unrelated post that has since reclaimed
+     * the id: it is left untouched with a warning.
+     */
+    private static function apply_wc_product_create_snapshot(array $snapshot): void
+    {
+        $data       = (array) ($snapshot['data'] ?? []);
+        $product_id = (int) $snapshot['object_id'];
+        $current    = get_post($product_id);
+        if (! $current) {
+            return; // Already gone; nothing left to undo.
+        }
+
+        if (($data['post_type'] ?? null) !== $current->post_type || ($data['post_date_gmt'] ?? null) !== $current->post_date_gmt) {
+            self::warn("Post {$product_id} is not the product this import created (the id was reclaimed); it was left untouched.");
+            return;
+        }
+        if (! function_exists('wc_get_product')) {
+            self::warn("WooCommerce is not active, so product {$product_id} created by an import was left in place.");
+            return;
+        }
+
+        $children = get_posts([
+            'post_type'      => 'product_variation',
+            'post_parent'    => $product_id,
+            'post_status'    => 'any',
+            'fields'         => 'ids',
+            'posts_per_page' => -1,
+        ]);
+        foreach ($children as $child_id) {
+            $child = wc_get_product((int) $child_id);
+            if ($child) {
+                $child->delete(true);
+            }
+        }
+
+        $product = wc_get_product($product_id);
+        if ($product) {
+            $product->delete(true);
+        } else {
+            wp_delete_post($product_id, true);
+        }
+
+        $parent_id = (int) ($data['parent_id'] ?? 0);
+        if ($parent_id > 0 && class_exists('WC_Product_Variable')) {
+            $parent = wc_get_product($parent_id);
+            if ($parent && $parent->is_type('variable')) {
+                wc_delete_product_transients($parent_id);
+                \WC_Product_Variable::sync($parent_id);
+            }
+        }
+    }
+
+    /**
+     * Post types whose creation is undone by deactivating rather than
+     * trashing: the custom widget and block spec stores, where post status
+     * draft is the store's own "inactive" (set-widget-status and
+     * set-block-status use the same switch). A draft spec stops rendering in
+     * both the dynamic and the compiled form and stays editable.
+     */
+    private const DEACTIVATE_ON_CREATION_ROLLBACK = ['wpmcp_widget', 'wpmcp_block'];
+
+    /** Post types a creation undo removes instead of trashing: menu items (issue #598) and fonts (issue #712). */
+    private const REMOVE_ON_CREATION_ROLLBACK = ['nav_menu_item', 'wp_font_face', 'wp_font_family'];
+
+    /**
+     * Undo a creation recorded by Post_Creation_Snapshot (create-post,
+     * duplicate-post, create-custom-widget, create-custom-block; issue #192).
+     *
+     * Deliberately non-destructive, unlike 'page_build' and 'media_import':
+     * every created post is moved to the trash, where restore-post can bring
+     * it back, and a custom widget or block spec is deactivated instead,
+     * unless the row is marked remove_on_rollback (import-bundle, issue #297),
+     * in which case the spec is trashed like any other post. Nothing is
+     * permanently deleted, except a menu item add-menu-item added (issue
+     * #598), which is removed the way remove-menu-item removes one: it is a
+     * link in a menu, not content, and a trashed item is listed nowhere.
+     *
+     * Each post gets the same identity check as the other creation restores:
+     * post_type and post_date_gmt are fixed at creation, so a mismatch means
+     * a different post has since reclaimed the id; it is left untouched with
+     * a warning. A post that is already gone, already in the trash, or (for a
+     * spec) already inactive needs nothing.
+     */
+    private static function apply_post_create_snapshot(array $snapshot): void
+    {
+        self::$post_create_untouched = false;
+        $created = (array) ($snapshot['data']['created'] ?? []);
+
+        // Children first, so no trashed parent is ever left with live children.
+        foreach (array_reverse($created) as $entry) {
+            $post_id = (int) ($entry['post_id'] ?? 0);
+            $current = $post_id > 0 ? get_post($post_id) : null;
+            if (! $current) {
+                continue; // Already gone; nothing left to undo.
+            }
+
+            if (($entry['post_type'] ?? null) !== $current->post_type || ($entry['post_date_gmt'] ?? null) !== $current->post_date_gmt) {
+                self::$post_create_untouched = true;
+                // A draft has no post_date_gmt until it is published or
+                // dated, so for one created as a draft a mismatch is a later
+                // change of the post, not proof of a reclaimed id (issue #756).
+                if (($entry['post_type'] ?? null) === $current->post_type && '0000-00-00 00:00:00' === ($entry['post_date_gmt'] ?? null)) {
+                    self::warn("Post {$post_id} was published or dated after this operation created it as a draft, so it may not be the post this operation created; it was left untouched. Undo the later operations on it first, newest first, or roll back the whole session.");
+                } else {
+                    self::warn("Post {$post_id} is not the post this operation created (the id was reclaimed); it was left untouched.");
+                }
+                continue;
+            }
+
+            // A menu item add-menu-item created is removed, the way
+            // remove-menu-item and core's wp_delete_nav_menu_item() remove
+            // one (issue #598): a menu item in the trash is listed nowhere
+            // and only holds its menu's position. It is a link, not content.
+            // Font Library posts (issue #712) go the same way: core has no
+            // trash for fonts, and deleting a face takes its stored files.
+            if (in_array($current->post_type, self::REMOVE_ON_CREATION_ROLLBACK, true)) {
+                if (! wp_delete_post($post_id, true)) {
+                    self::$post_create_untouched = true;
+                    self::warn("Post {$post_id} ({$current->post_type}) created by this operation could not be removed; it was left in place.");
+                }
+                continue;
+            }
+
+            // An import-bundle row (issue #297) asks for removal instead: its
+            // specs were created inactive, so deactivating would undo nothing.
+            if (empty($snapshot['data']['remove_on_rollback']) && in_array($current->post_type, self::DEACTIVATE_ON_CREATION_ROLLBACK, true)) {
+                if ('draft' !== $current->post_status && 'trash' !== $current->post_status) {
+                    // wp_update_post() re-saves the whole row to change the
+                    // status, and its save filters (kses for a user without
+                    // unfiltered_html) would rewrite the stored columns.
+                    $updated = Save_Filters::without(
+                        self::POST_SAVE_FILTERS,
+                        static fn () => wp_update_post(['ID' => $post_id, 'post_status' => 'draft'], true)
+                    );
+                    if (is_wp_error($updated) || 0 === $updated) {
+                        self::$post_create_untouched = true;
+                        self::warn("Spec {$post_id} created by this operation could not be deactivated.");
+                    }
+                }
+                continue;
+            }
+
+            // A translation leaves its source's translation group first
+            // (create-translation, issue #498), so the group is exactly as
+            // it was before, not left naming a post in the trash.
+            if (is_array($snapshot['data']['translation_group'] ?? null) && $post_id === (int) ($created[0]['post_id'] ?? 0)) {
+                do_action('wpmcp_rollback_translation_group', ['translation' => $post_id] + $snapshot['data']['translation_group']);
+            }
+
+            if ('trash' === $current->post_status) {
+                continue;
+            }
+            // wp_trash_post() changes the status through wp_update_post(),
+            // which would run the same save filters over the whole row.
+            if (! Save_Filters::without(self::POST_SAVE_FILTERS, static fn () => wp_trash_post($post_id))) {
+                self::$post_create_untouched = true;
+                self::warn("Post {$post_id} created by this operation could not be moved to the trash; it was left in place.");
+                continue;
+            }
+            self::$trashed[] = [ 'id' => $post_id, 'post_type' => (string) $current->post_type, 'title' => (string) $current->post_title ];
+        }
+    }
+
+    /**
+     * Undo a comment creation recorded by Comment_Creation_Snapshot
+     * (create-comment, reply-to-comment; issue #284). Non-destructive like
+     * the post creation undo: the comment is moved to the trash, where it can
+     * be restored. The identity check (post and comment_date_gmt, both fixed
+     * at creation) keeps a comment that has since reclaimed the id untouched.
+     */
+    private static function apply_comment_create_snapshot(array $snapshot): void
+    {
+        $comment_id = (int) $snapshot['object_id'];
+        $current    = $comment_id > 0 ? get_comment($comment_id) : null;
+        if (! $current) {
+            return; // Already gone; nothing left to undo.
+        }
+
+        $data = (array) ($snapshot['data'] ?? []);
+        if ((int) ($data['comment_post_ID'] ?? 0) !== (int) $current->comment_post_ID || ($data['comment_date_gmt'] ?? null) !== $current->comment_date_gmt) {
+            self::warn("Comment {$comment_id} is not the comment this operation created (the id was reclaimed); it was left untouched.");
+            return;
+        }
+
+        if ('trash' === $current->comment_approved) {
+            return;
+        }
+        if (! wp_trash_comment($comment_id)) {
+            self::warn("Comment {$comment_id} created by this operation could not be moved to the trash; it was left in place.");
+        }
+    }
+
+    /**
+     * Undo a managed-redirect write (issue #128; snapshot shape documented at
+     * Snapshot::capture_redirect()).
+     *
+     * Like the db_rows path, THE ROLLBACK ITSELF PERFORMS A RAW TABLE WRITE,
+     * so it enforces the write tools' own gate here rather than inheriting
+     * the rollback tools' deliberately lower edit_posts gate. Without this,
+     * an edit_posts caller could add or remove site-wide redirects by
+     * replaying an administrator's operation through rollback-operation.
+     *
+     * Two prior states are possible, and they are exactly the two an option
+     * snapshot has:
+     *  - the path already had a redirect: put the captured row back. If the
+     *    row still exists it is overwritten in place (which is what restores
+     *    a source_path that update-redirect renamed, since the id is
+     *    unchanged); if it is gone, the full captured row is reinserted
+     *    INCLUDING its original id, so a deleted redirect comes back as the
+     *    same row rather than a copy.
+     *  - the path had no redirect: the write introduced one, so whatever now
+     *    owns that path is deleted.
+     * A row that has since been reclaimed by a different source path is
+     * reported as a warning, not silently overwritten, matching how every
+     * other restore path treats a reclaimed identity.
+     */
+    /**
+     * Restore a taxonomy term to its captured state.
+     *
+     * Three cases, mirroring apply_redirect_snapshot():
+     *  - the term did not exist at capture time: delete whatever now holds
+     *    that (taxonomy, slug), which undoes a create-term;
+     *  - the term existed and still does: overwrite its fields and meta;
+     *  - the term existed and is gone: resurrect it at its ORIGINAL term_id,
+     *    because post-to-term relationships are stored by term_taxonomy_id
+     *    and a term that comes back with a fresh id is silently detached from
+     *    every post that was filed under it.
+     *
+     * Deleting a term is not routed through wp_delete_term() in the
+     * "undo a create" case only when the term is the taxonomy default; that
+     * would move posts to a replacement term, which is a second mutation the
+     * user never asked for. It is reported instead.
+     */
+    private static function apply_term_snapshot(array $snapshot): void
+    {
+        if (! current_user_can('manage_categories')) {
+            throw new Mutation_Failed('Rollback refused: restoring a term requires the manage_categories capability.');
+        }
+
+        $data     = (array) ($snapshot['data'] ?? []);
+        $taxonomy = (string) ($data['taxonomy'] ?? '');
+        $slug     = (string) ($data['slug'] ?? '');
+
+        if ('' === $taxonomy || ! taxonomy_exists($taxonomy)) {
+            self::warn(sprintf('Taxonomy "%s" no longer exists, so its term could not be restored.', $taxonomy));
+            return;
+        }
+
+        $captured = is_array($data['term'] ?? null) ? (array) $data['term'] : null;
+
+        if (empty($data['existed'])) {
+            $current = get_term_by('slug', $slug, $taxonomy);
+            if ($current instanceof \WP_Term) {
+                wp_delete_term($current->term_id, $taxonomy);
+            }
+            return;
+        }
+
+        if (null === $captured) {
+            return;
+        }
+
+        $term_id = (int) ($captured['term_id'] ?? 0);
+        if ($term_id <= 0) {
+            return;
+        }
+
+        // Something else may have taken the captured slug since the
+        // operation. Restoring onto it would fail the taxonomy's unique-slug
+        // rule, so the squatter is cleared first, exactly as the redirect
+        // path does for its UNIQUE source_path.
+        $holder = get_term_by('slug', $slug, $taxonomy);
+        if ($holder instanceof \WP_Term && (int) $holder->term_id !== $term_id) {
+            self::warn(sprintf(
+                'Term slug "%s" in %s had been taken by term #%d since the operation; it was removed so the captured term could be restored.',
+                $slug,
+                $taxonomy,
+                (int) $holder->term_id
+            ));
+            wp_delete_term((int) $holder->term_id, $taxonomy);
+        }
+
+        $was_missing = null === get_term($term_id, $taxonomy);
+
+        if ($was_missing) {
+            self::resurrect_term($term_id, $taxonomy, $captured);
+        } else {
+            $fields = wp_slash([
+                'name'        => (string) ($captured['name'] ?? ''),
+                'slug'        => $slug,
+                'description' => (string) ($captured['description'] ?? ''),
+                'parent'      => (int) ($captured['parent'] ?? 0),
+            ]);
+            // The name and description go back as captured, not through
+            // their save filters again. The slug keeps its filters: it is
+            // stored sanitized and must stay unique.
+            $filters = [
+                'pre_term_name',
+                'pre_term_description',
+                "pre_{$taxonomy}_name",
+                "pre_{$taxonomy}_description",
+            ];
+            Save_Filters::without($filters, static fn () => wp_update_term($term_id, $taxonomy, $fields));
+            clean_term_cache([$term_id], $taxonomy);
+        }
+
+        self::restore_term_meta($term_id, (array) ($data['meta'] ?? []));
+
+        // Only a resurrection needs the relationships rebuilt: an in-place
+        // update never removed them, and re-adding them there would fight
+        // with assignments made after the operation.
+        if ($was_missing) {
+            self::restore_term_objects($term_id, $taxonomy, $data);
+            // Then what the delete changed around the term (Term_Restore).
+            foreach (Term_Restore::after_refile($term_id, $taxonomy, $data) as $warning) {
+                self::warn($warning);
+            }
+        }
+    }
+
+    /**
+     * Refile the objects that were assigned to a term before it was deleted.
+     *
+     * wp_delete_term() removes the wp_term_relationships rows along with the
+     * term, so without this a restored term comes back empty: correct-looking
+     * in wp-admin, and silently detached from all of its content.
+     */
+    private static function restore_term_objects(int $term_id, string $taxonomy, array $data): void
+    {
+        $objects = array_map('intval', (array) ($data['objects'] ?? []));
+
+        foreach ($objects as $object_id) {
+            if ($object_id > 0) {
+                wp_set_object_terms($object_id, [$term_id], $taxonomy, true);
+            }
+        }
+
+        if (! empty($data['objects_truncated'])) {
+            self::warn(sprintf(
+                'Term %d held more than %d objects when it was captured; the %d most recent were reattached and the rest were not.',
+                $term_id,
+                \WPMCP\Safety\Snapshot::MAX_TERM_OBJECTS,
+                count($objects)
+            ));
+        }
+
+        // Only with an object refiled: an empty list reaches
+        // clean_term_cache() as "term_taxonomy_id IN ()", a SQL error.
+        if ([] !== $objects) {
+            wp_update_term_count_now([$term_id], $taxonomy);
+        }
+    }
+
+    /**
+     * Re-insert a deleted term at its original term_id.
+     *
+     * wp_insert_term() always allocates a new id, so the row goes in
+     * directly. term_taxonomy_id is likewise preserved: it is the column
+     * wp_term_relationships joins on, so reusing it is what actually
+     * reattaches the posts rather than merely recreating a same-named term.
+     */
+    private static function resurrect_term(int $term_id, string $taxonomy, array $captured): void
+    {
+        global $wpdb;
+
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Restoring a deleted term at its original id; no core API preserves term_id or term_taxonomy_id. Not cached: clean_term_cache() runs once both rows are back.
+        $wpdb->insert($wpdb->terms, [
+            'term_id'    => $term_id,
+            'name'       => (string) ($captured['name'] ?? ''),
+            'slug'       => (string) ($captured['slug'] ?? ''),
+            'term_group' => (int) ($captured['term_group'] ?? 0),
+        ]);
+
+        $term_taxonomy_id = (int) ($captured['term_taxonomy_id'] ?? 0);
+        $row              = [
+            'term_id'     => $term_id,
+            'taxonomy'    => $taxonomy,
+            'description' => (string) ($captured['description'] ?? ''),
+            'parent'      => (int) ($captured['parent'] ?? 0),
+            'count'       => (int) ($captured['count'] ?? 0),
+        ];
+        if ($term_taxonomy_id > 0) {
+            $row['term_taxonomy_id'] = $term_taxonomy_id;
+        }
+
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- See above; term_taxonomy_id is what wp_term_relationships joins on. clean_term_cache() below invalidates.
+        $wpdb->insert($wpdb->term_taxonomy, $row);
+
+        clean_term_cache([$term_id], $taxonomy);
+    }
+
+    /** Replace a term's meta with the captured map. */
+    private static function restore_term_meta(int $term_id, array $meta): void
+    {
+        $existing = get_term_meta($term_id);
+        if (is_array($existing)) {
+            foreach (array_keys($existing) as $key) {
+                delete_term_meta($term_id, (string) $key);
+            }
+        }
+
+        foreach ($meta as $key => $values) {
+            foreach ((array) $values as $value) {
+                add_term_meta($term_id, (string) $key, self::slash_meta_value(maybe_unserialize($value)));
+            }
+        }
+    }
+
+    /**
+     * Undo one stored PHP snippet write (issue #85; snapshot shape
+     * documented at Snapshot::capture_php_snippet()).
+     *
+     * manage_options is required for the same reason the redirect path
+     * requires it: the store holds PHP source, and restoring a record is a
+     * site-administration action, not a content edit.
+     *
+     * Two cases, and only the one captured record is touched either way, so
+     * snippets created or edited after this operation survive the rollback:
+     *  - the id existed: put the captured record back, with ONE deliberate
+     *    departure from verbatim, below.
+     *  - the id did not exist: the write created it, so remove it.
+     *
+     * THE STATUS FLAG IS NEVER RESTORED AS ACTIVE. rollback-operation and
+     * rollback-session are not in Opt_In_Gates and do not consult the PHP
+     * execution gate, the license check, the governance toggle or the
+     * identity scope of activate-php-snippet, and write no activation entry
+     * to the governance trail. Restoring a captured status='active'
+     * would make an undo a second, ungoverned door to activation (undo a
+     * deactivate-php-snippet, or an update that forced the snippet back to
+     * inactive, and the snippet is armed again). An open exec gate is not
+     * enough either, since it is only one part of that contract, so the
+     * restore is unconditionally INACTIVE. Every other field is restored
+     * exactly, and re-activation goes
+     * back through activate-php-snippet. This does not depend on "nothing
+     * executes from the status flag yet", which stops being true the moment
+     * the documented executor lands.
+     */
+    private static function apply_php_snippet_snapshot(array $snapshot): void
+    {
+        if (! current_user_can('manage_options')) {
+            throw new Mutation_Failed('Rollback refused: restoring a stored PHP snippet requires the manage_options capability.');
+        }
+
+        $data = (array) ($snapshot['data'] ?? []);
+        $id   = (string) ($data['id'] ?? '');
+        if ('' === $id) {
+            return;
+        }
+
+        if (empty($data['existed'])) {
+            \WPMCP\Tools\Code\Php_Snippet_Store::delete($id);
+            return;
+        }
+
+        $record = $data['record'] ?? null;
+        if (! is_array($record)) {
+            throw new Mutation_Failed('Rollback refused: the captured PHP snippet record is missing or malformed.');
+        }
+
+        // Restore under the key the record was captured under, which is what
+        // every snippet tool resolves it by. A record whose own id field had
+        // drifted would otherwise be written to a second, ghost key while the
+        // real one stayed as the undone write left it.
+        $record['id']     = $id;
+        $record['status'] = \WPMCP\Tools\Code\Php_Snippet_Store::STATUS_INACTIVE;
+
+        \WPMCP\Tools\Code\Php_Snippet_Store::save($record);
+    }
+
+    private static function apply_redirect_snapshot(array $snapshot): void
+    {
+        if (! current_user_can('manage_options')) {
+            throw new Mutation_Failed('Rollback refused: restoring a managed redirect requires the manage_options capability.');
+        }
+
+        $data   = (array) ($snapshot['data'] ?? []);
+        $source = (string) ($data['source_path'] ?? '');
+        if ('' === $source) {
+            return;
+        }
+
+        if (empty($data['existed'])) {
+            \WPMCP\Tools\Redirects\Redirect_Store::delete_by_source($source);
+            return;
+        }
+
+        $row = (array) ($data['row'] ?? []);
+        $id  = (int) ($row['id'] ?? 0);
+        if ($id <= 0) {
+            return;
+        }
+
+        $current = \WPMCP\Tools\Redirects\Redirect_Store::get($id);
+        if (null === $current) {
+            \WPMCP\Tools\Redirects\Redirect_Store::insert_raw($row);
+            return;
+        }
+
+        // Restoring the captured source_path onto this id would collide with
+        // the UNIQUE key if some other row has taken that path in the
+        // meantime. Clear the squatter first: it is either the row this
+        // operation created (create-redirect on a path that was later
+        // re-pointed) or a third-party duplicate that cannot coexist with the
+        // state we promised to restore.
+        $holder = \WPMCP\Tools\Redirects\Redirect_Store::find_by_source($source);
+        if (null !== $holder && $holder['id'] !== $id) {
+            self::warn(sprintf(
+                'Redirect source "%s" had been taken by redirect #%d since the operation; it was removed so the captured redirect could be restored.',
+                $source,
+                $holder['id']
+            ));
+            \WPMCP\Tools\Redirects\Redirect_Store::delete($holder['id']);
+        }
+
+        \WPMCP\Tools\Redirects\Redirect_Store::overwrite($id, $row);
+    }
+
+    /**
+     * Undo an Elementor v4 global classes write (issue #132: create / update /
+     * delete / reorder a Class Manager entry).
+     *
+     * Unlike every other Elementor edit, the class set is not a single post:
+     * since Elementor 4.2 each class is its own post while order and labels
+     * live on the kit, so the snapshot captures the WHOLE prior class set
+     * (items + order) and the undo replays it through Elementor's repository,
+     * which computes the create/update/delete diff. That restores an edited
+     * class, resurrects a deleted one and puts the order back in a single
+     * step.
+     *
+     * The repository call is made here rather than through the Elementor tool
+     * layer on purpose: the safety layer must be able to restore without
+     * depending on the tool that wrote. If Elementor is no longer present the
+     * snapshot cannot be applied, which is warned about rather than silently
+     * treated as a successful rollback.
+     */
+    private static function apply_elementor_global_classes_snapshot(array $snapshot): void
+    {
+        $data       = (array) ($snapshot['data'] ?? []);
+        $repository = '\\Elementor\\Modules\\GlobalClasses\\Global_Classes_Repository';
+
+        if (! class_exists($repository) || ! is_callable([$repository, 'make'])) {
+            self::warn('Elementor global classes cannot be restored: Elementor 4.0+ is no longer available on this site.');
+            return;
+        }
+
+        $items = is_array($data['items'] ?? null) ? $data['items'] : [];
+        $order = is_array($data['order'] ?? null) ? array_values($data['order']) : [];
+
+        try {
+            call_user_func([$repository, 'make'])->put($items, $order);
+        } catch (\Throwable $e) {
+            self::warn('Elementor refused the global classes restore: ' . $e->getMessage());
+        }
+
+        // Class styles are compiled into generated CSS across the site.
+        Elementor_Cache::clear_all();
+    }
+
+    /**
+     * Undo an Elementor 4 global variables write (create / update / delete a
+     * design token).
+     *
+     * Elementor keeps every variable in one JSON record on the kit and bumps a
+     * watermark on each save, so replaying the change through its service
+     * could never reproduce the prior record. The snapshot holds the record's
+     * raw bytes instead (or that there was none), and the undo puts exactly
+     * those back, which also revives a soft-deleted variable. The generated
+     * CSS is cleared so the restored tokens render on the next view.
+     */
+    private static function apply_elementor_global_variables_snapshot(array $snapshot): void
+    {
+        $data   = (array) ($snapshot['data'] ?? []);
+        $kit_id = (int) ($data['kit_id'] ?? $snapshot['object_id'] ?? 0);
+
+        if ($kit_id <= 0 || ! get_post($kit_id)) {
+            self::warn('Elementor global variables cannot be restored: the kit they belonged to no longer exists.');
+            return;
+        }
+
+        // Written here, not through the Elementor tool layer, so the safety
+        // layer can restore without depending on the tool that wrote.
+        if (! empty($data['exists'])) {
+            update_post_meta($kit_id, '_elementor_global_variables', wp_slash((string) ($data['raw'] ?? '')));
+        } else {
+            delete_post_meta($kit_id, '_elementor_global_variables');
+        }
+        clean_post_cache($kit_id);
+
+        Elementor_Cache::clear_all();
+    }
+
+    /**
+     * Restore one piece of ACF structure (issue #291) to its captured tree:
+     * the field group, ACF post type or ACF taxonomy post plus every acf-field
+     * post beneath it. Posts under the key now that were not captured (a new
+     * group, or a field an update added) are deleted; every captured post is
+     * restored through the ordinary post path, which updates in place or
+     * resurrects a force-deleted field at its original ID. ACF's own caches
+     * for every touched key are flushed afterwards, since the restore writes
+     * rows underneath ACF rather than through it.
+     *
+     * Restoring structure needs the capability ACF itself demands for editing
+     * it, so rollback cannot become a way around ACF's own admin gate.
+     */
+    private static function apply_acf_structure_snapshot(array $snapshot): void
+    {
+        $capability = function_exists('acf_get_setting') ? (string) acf_get_setting('capability') : 'manage_options';
+        if (! current_user_can('' === $capability ? 'manage_options' : $capability)) {
+            throw new Mutation_Failed(esc_html(sprintf('Rollback refused: restoring ACF structure requires the %s capability.', $capability)));
+        }
+
+        $data     = (array) ($snapshot['data'] ?? []);
+        $key      = (string) ($data['key'] ?? $snapshot['object_id']);
+        $captured = (array) ($data['posts'] ?? []);
+
+        $root    = Snapshot::acf_structure_root_id($key);
+        $current = null === $root ? [] : Snapshot::acf_structure_tree($root);
+        $touched = [];
+        foreach ($current as $id) {
+            $touched[ $id ] = get_post($id, ARRAY_A);
+        }
+
+        // Children first, so a parent is never deleted with live children.
+        foreach (array_reverse($current) as $id) {
+            if (! isset($captured[ (string) $id ])) {
+                wp_delete_post($id, true);
+            }
+        }
+
+        foreach ($captured as $id => $post_data) {
+            self::apply_snapshot([
+                'object_type' => 'post',
+                'object_id'   => (int) $id,
+                'data'        => (array) $post_data,
+            ]);
+            $touched[ (int) $id ] = (array) ($post_data['post'] ?? []);
+        }
+
+        self::flush_acf_caches(array_filter($touched));
+    }
+
+    /** Drop ACF's stores and cached lookups for every restored or removed structure post. */
+    private static function flush_acf_caches(array $rows): void
+    {
+        if (! function_exists('acf_flush_field_cache')) {
+            return;
+        }
+        foreach ($rows as $row) {
+            $type = (string) ($row['post_type'] ?? '');
+            $key  = (string) ($row['post_name'] ?? '');
+            if ('acf-field' === $type) {
+                acf_flush_field_cache([
+                    'key'    => $key,
+                    'name'   => (string) ($row['post_excerpt'] ?? ''),
+                    'parent' => (int) ($row['post_parent'] ?? 0),
+                ]);
+            } elseif (in_array($type, Snapshot::ACF_STRUCTURE_POST_TYPES, true) && function_exists('acf_flush_internal_post_type_cache')) {
+                acf_flush_internal_post_type_cache([ 'key' => $key ], $type);
+            }
+        }
+        foreach ([ 'fields', 'field-groups', 'post-types', 'taxonomies' ] as $store) {
+            $instance = acf_get_store($store);
+            if ($instance) {
+                $instance->reset();
+            }
+        }
+    }
+
+    /**
+     * Restore every option an option_set snapshot captured (issue #285), each
+     * the way apply_option_snapshot() restores one: the captured value goes
+     * back, or the option is deleted when the write created it.
+     */
+    private static function apply_option_set_snapshot(array $snapshot): void
+    {
+        foreach ((array) ($snapshot['data']['options'] ?? []) as $name => $state) {
+            $state = (array) $state;
+            if (! empty($state['existed'])) {
+                update_option((string) $name, $state['value'] ?? null);
+            } else {
+                delete_option((string) $name);
+            }
+        }
+        self::options_restored(array_map('strval', array_keys((array) ($snapshot['data']['options'] ?? []))));
+    }
+
+    /**
+     * Restore the option rows an ACF options page write touched (issue #291):
+     * rows under the captured field names that the write added are deleted,
+     * and every captured row gets its captured value back. The in-request
+     * value store is reset so a later get_field() in the same request reads
+     * the restored rows instead of ACF's memo of the undone ones.
+     */
+    private static function apply_acf_options_snapshot(array $snapshot): void
+    {
+        $data    = (array) ($snapshot['data'] ?? []);
+        $post_id = (string) ($data['post_id'] ?? '');
+        $names   = array_map('strval', (array) ($data['names'] ?? []));
+        $rows    = (array) ($data['rows'] ?? []);
+
+        foreach (Snapshot::acf_option_names($post_id, $names) as $name) {
+            if (! array_key_exists($name, $rows)) {
+                delete_option($name);
+            }
+        }
+        foreach ($rows as $name => $value) {
+            update_option((string) $name, $value);
+        }
+
+        if (function_exists('acf_get_store')) {
+            $values = acf_get_store('values');
+            if ($values) {
+                $values->reset();
+            }
+        }
+    }
+
+    /**
+     * Undo a create-child-theme scaffold (see Snapshot::capture_theme_scaffold()).
+     *
+     * Only the scaffold's own files are touched: each is put back to its
+     * captured bytes, or deleted when it did not exist before. The directory
+     * is removed only when the scaffold created it AND nothing else has been
+     * added to it since; anything a person added afterwards is left in place
+     * with a warning, never deleted as collateral.
+     *
+     * A scaffold that is currently the active theme (or the parent of it) is
+     * left alone with a warning: deleting the active theme's files would take
+     * the front end down, which is the opposite of what an undo is for.
+     * Switch themes first (itself an undoable operation), then roll back.
+     */
+    private static function apply_theme_scaffold_snapshot(array $snapshot): void
+    {
+        $data = (array) ($snapshot['data'] ?? []);
+        $slug = (string) ($data['slug'] ?? '');
+
+        if ('' === $slug || sanitize_key($slug) !== $slug) {
+            self::warn('Child theme scaffold cannot be restored: the snapshot carries no valid theme slug.');
+            return;
+        }
+
+        $dir = trailingslashit(get_theme_root()) . $slug;
+        if (is_link($dir)) {
+            self::warn(sprintf('Child theme "%s" was not rolled back: its directory is now a symlink.', $slug));
+            return;
+        }
+        if (! is_dir($dir)) {
+            if (! empty($data['dir_existed'])) {
+                self::warn(sprintf('Child theme "%s" was not rolled back: its directory no longer exists.', $slug));
+            }
+            return;
+        }
+        if (get_stylesheet() === $slug || get_template() === $slug) {
+            self::warn(sprintf('Child theme "%s" is the active theme, so its files were left in place. Switch to another theme, then roll back again.', $slug));
+            return;
+        }
+
+        $fs        = self::direct_filesystem();
+        $too_large = (array) ($data['too_large'] ?? []);
+        foreach (Snapshot::THEME_SCAFFOLD_FILES as $file) {
+            $path = $dir . '/' . $file;
+            if (in_array($file, $too_large, true)) {
+                self::warn(sprintf('Child theme "%s": %s was too large to capture and was left as it is.', $slug, $file));
+                continue;
+            }
+            if (is_link($path)) {
+                self::warn(sprintf('Child theme "%s": %s is now a symlink and was left as it is.', $slug, $file));
+                continue;
+            }
+            $before = $data['files'][ $file ] ?? null;
+            if (null === $before) {
+                if (is_file($path)) {
+                    $fs->delete($path);
+                }
+                continue;
+            }
+            // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_decode -- decodes the file bytes Snapshot::capture_theme_scaffold() encoded, not obfuscation.
+            $bytes = base64_decode((string) $before, true);
+            if (false === $bytes || ! $fs->put_contents($path, $bytes, 0644)) {
+                self::warn(sprintf('Child theme "%s": %s could not be restored.', $slug, $file));
+            }
+        }
+
+        if (empty($data['dir_existed'])) {
+            $left = array_diff((array) scandir($dir), ['.', '..']);
+            if ([] === $left) {
+                $fs->rmdir($dir);
+            } else {
+                self::warn(sprintf('Child theme "%s": the scaffold files were removed, but the directory was kept because it holds files the scaffold did not create.', $slug));
+            }
+        }
+
+        // WP_Theme caches parsed headers per directory, and
+        // wp_clean_themes_cache() only flushes themes it still finds on disk,
+        // so the removed child's own entry is dropped explicitly first;
+        // otherwise wp_get_theme() keeps reporting it as installed.
+        wp_get_theme($slug)->cache_delete();
+        wp_clean_themes_cache();
+    }
+
+    /**
+     * Undo install-package-from-zip (see Snapshot::capture_package_install()).
+     *
+     * A fresh install is removed. A replaced package is put back from the
+     * archive File_Backup::backup_directory() took of its prior directory,
+     * and only when that archive still exists: without it the current
+     * version is left alone with a warning, because deleting it would leave
+     * less than either version.
+     *
+     * A fresh install that is now active (the plugin, or the theme or its
+     * parent) is left in place with a warning, like a child-theme scaffold:
+     * deleting live code is the opposite of what an undo is for. Deactivate
+     * or switch first (both undoable), then roll back again.
+     */
+    private static function apply_package_install_snapshot(array $snapshot): void
+    {
+        $data = (array) ($snapshot['data'] ?? []);
+        $type = (string) ($data['type'] ?? '');
+        $slug = (string) ($data['slug'] ?? '');
+
+        if (! in_array($type, ['plugin', 'theme'], true) || 1 !== preg_match(Snapshot::PACKAGE_SLUG_PATTERN, $slug)) {
+            self::warn('Package install cannot be rolled back: the snapshot carries no valid package.');
+            return;
+        }
+
+        $label = sprintf('%s "%s"', 'theme' === $type ? 'Theme' : 'Plugin', $slug);
+        $dir   = trailingslashit('theme' === $type ? get_theme_root() : WP_PLUGIN_DIR) . $slug;
+        if (is_link($dir)) {
+            self::warn(sprintf('%s was not rolled back: its directory is now a symlink.', $label));
+            return;
+        }
+
+        $fs = self::direct_filesystem();
+
+        if (empty($data['existed'])) {
+            if (! is_dir($dir)) {
+                return;
+            }
+            if (self::package_is_active($type, $slug)) {
+                self::warn(sprintf('%s is active, so it was left in place. Deactivate it (or switch themes), then roll back again.', $label));
+                return;
+            }
+            if (! $fs->delete($dir, true)) {
+                self::warn(sprintf('%s could not be removed.', $label));
+            }
+            self::clean_package_caches($type, $slug);
+            return;
+        }
+
+        if (! empty($data['was_empty'])) {
+            if (is_dir($dir)) {
+                $fs->delete($dir, true);
+            }
+            wp_mkdir_p($dir);
+            self::clean_package_caches($type, $slug);
+            return;
+        }
+
+        $backup = (string) ($data['backup_operation_id'] ?? '');
+        if ('' === $backup || ! File_Backup::has_directory_backup($backup)) {
+            self::warn(sprintf('%s was not rolled back: the backup of its previous version is no longer available.', $label));
+            return;
+        }
+
+        if (is_dir($dir) && ! $fs->delete($dir, true)) {
+            self::warn(sprintf('%s could not be removed, so its previous version was not restored.', $label));
+            return;
+        }
+        if (! File_Backup::restore_directory($backup, $dir)) {
+            self::warn(sprintf('%s: its previous version could not be fully restored.', $label));
+        }
+        self::clean_package_caches($type, $slug);
+    }
+
+    /** Whether the plugin in $slug (any file of it) or the theme $slug is live. */
+    private static function package_is_active(string $type, string $slug): bool
+    {
+        if ('theme' === $type) {
+            return get_stylesheet() === $slug || get_template() === $slug;
+        }
+
+        if (! function_exists('get_plugins')) {
+            require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        }
+        wp_clean_plugins_cache(false);
+        foreach (array_keys(get_plugins('/' . $slug)) as $file) {
+            if (is_plugin_active($slug . '/' . $file)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static function clean_package_caches(string $type, string $slug): void
+    {
+        if ('theme' === $type) {
+            wp_get_theme($slug)->cache_delete();
+            wp_clean_themes_cache();
+            return;
+        }
+        if (! function_exists('wp_clean_plugins_cache')) {
+            require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        }
+        wp_clean_plugins_cache(false);
+    }
+
+    /**
+     * A direct-method WP_Filesystem for the theme scaffold restore. Plugin
+     * Check promotes WordPress.WP.AlternativeFunctions to an error, so file
+     * writes and deletes go through WP_Filesystem; the direct transport is
+     * used explicitly because a rollback cannot stop to prompt for FTP
+     * credentials, and the scaffold being undone was written the same way.
+     */
+    private static function direct_filesystem(): \WP_Filesystem_Direct
+    {
+        require_once ABSPATH . 'wp-admin/includes/class-wp-filesystem-base.php';
+        require_once ABSPATH . 'wp-admin/includes/class-wp-filesystem-direct.php';
+        return new \WP_Filesystem_Direct(null);
+    }
+
+    /** Human-readable "pk=value" description of a row's primary-key values, for warnings and errors. */
+    private static function describe_pk(array $where): string
+    {
+        $parts = [];
+        foreach ($where as $column => $value) {
+            $parts[] = $column . '=' . (is_scalar($value) ? (string) $value : wp_json_encode($value));
+        }
+        return '(' . implode(', ', $parts) . ')';
+    }
+
+    /**
+     * Loose column-wise equality between a live DB row and an expected state.
+     * MySQL hands every value back as a string (or null), while the expected
+     * side mixes captured strings with raw tool-arg values (ints, bools), so
+     * both sides are compared as strings, with null only ever equal to null.
+     * Only columns present in $expected are compared. False mismatches (e.g.
+     * float formatting) merely produce a spurious warning, never a failure.
+     */
+    private static function row_matches(array $current, array $expected): bool
+    {
+        foreach ($expected as $column => $value) {
+            $live = $current[ $column ] ?? null;
+            if (null === $value || null === $live) {
+                if ($value !== $live) {
+                    return false;
+                }
+                continue;
+            }
+            if ((string) $live !== (string) $value) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Restore an attachment's backed-up physical files, when present. Only
+     * a snapshot of an attachment's files carries a 'files' entry
+     * (['operation_id' => ..., 'manifest' => [original_abs_path => stored_filename]]);
+     * every other snapshot has no such key, making this a no-op for them.
+     * An optional 'created' list names files the operation wrote beside the
+     * originals (optimize-media's WebP/AVIF copies), which are deleted.
+     */
+    private static function restore_files(?array $files): void
+    {
+        if (empty($files['manifest']) || empty($files['operation_id'])) {
+            return;
+        }
+        File_Backup::restore((string) $files['operation_id'], (array) $files['manifest']);
+        File_Backup::remove_created((array) ($files['created'] ?? []), (array) $files['manifest']);
+    }
+
+    /**
+     * Re-insert a force-deleted post at its original ID and restore its
+     * comments. wp_insert_post() only honors 'import_id' when that ID is
+     * still free; on a collision it silently returns a new auto-increment
+     * ID instead of the one we asked for. Since a wrong-ID "restore" would
+     * violate the safety guarantee (the caller thinks operation X was
+     * undone, but a different post now exists at a different ID and the
+     * original ID is still missing/occupied by someone else), that case is
+     * treated as a hard failure rather than silently accepted.
+     */
+    private static function resurrect(int $object_id, array $post_columns, array $comments): void
+    {
+        $postarr = wp_slash(array_merge(['import_id' => $object_id], self::restore_columns($post_columns, true)));
+        $result  = Save_Filters::without(self::POST_SAVE_FILTERS, static fn () => wp_insert_post($postarr, true));
+
+        if (is_wp_error($result)) {
+            throw new Mutation_Failed('Rollback failed to resurrect post ' . (int) $object_id . ': ' . esc_html($result->get_error_message()));
+        }
+
+        $new_id = (int) $result;
+        if ($new_id !== $object_id) {
+            // WordPress ignored import_id and inserted a copy at a new ID.
+            // A failed restore must leave nothing behind (issue #984: a
+            // duplicate form action is a second notification), so the copy
+            // goes before the failure is reported.
+            if ($new_id > 0) {
+                wp_delete_post($new_id, true);
+            }
+            throw new Mutation_Failed(
+                'Rollback could not resurrect post ' . (int) $object_id . ' at its original ID '
+                . '(import_id collision; WordPress inserted it as post ' . (int) $new_id . ' instead). '
+                . 'The site no longer has a free slot for the original ID, so the restore was aborted.'
+            );
+        }
+
+        self::restore_comments($object_id, $comments);
+    }
+
+    /**
+     * Recreate the comments (and their commentmeta) captured for a
+     * force-deleted post. wp_insert_comment() always assigns a fresh
+     * auto-increment comment_ID (WordPress core has no "import_id"
+     * equivalent for comments), so original comment IDs are not preserved;
+     * the content, author, dates, and thread association with the post are.
+     */
+    private static function restore_comments(int $post_id, array $comments): void
+    {
+        if (self::$blank_commenter_data) {
+            $exact    = $comments;
+            $comments = array_map(static fn ($c) => is_array($c) ? Snapshot::redact_comment($c, '') : $c, $comments);
+            if ($comments !== $exact) {
+                self::warn(sprintf(
+                    'post %d restored, but its comments came back with the commenter email, IP and user agent blank: restoring those exactly requires the "moderate_comments" capability.',
+                    $post_id
+                ));
+            }
+        }
+        foreach ($comments as $comment) {
+            $meta = $comment['meta'] ?? [];
+            unset($comment['comment_ID'], $comment['meta']);
+            $comment['comment_post_ID'] = $post_id;
+
+            $new_comment_id = wp_insert_comment(wp_slash($comment));
+            if (! $new_comment_id) {
+                continue;
+            }
+
+            foreach ((array) $meta as $key => $values) {
+                foreach ((array) $values as $v) {
+                    add_comment_meta($new_comment_id, $key, self::slash_meta_value(maybe_unserialize($v)));
+                }
+            }
+        }
+    }
+}

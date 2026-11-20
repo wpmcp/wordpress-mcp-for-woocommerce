@@ -1,0 +1,1991 @@
+<?php
+
+namespace WPMCP\Tools\Database;
+
+use WPMCP\Tools\Content\Content_Guard;
+use WPMCP\Tools\Meta\Secret_Options;
+use WPMCP\Tools\WooCommerce\Gateway_Secrets;
+
+if (! defined('ABSPATH')) {
+    exit;
+}
+
+/**
+ * Security core for the database tools: validates read-only SQL for the
+ * `query` tool, and validates/protects table names for the structured write
+ * tools. is_read_only_sql() is the safety boundary for the flexible read
+ * path, so every rejection case here is exercised exhaustively by
+ * DatabaseGuardTest.
+ */
+class Database_Guard
+{
+    public const MAX_ROWS = 1000;
+    public const BEFORE_IMAGE_CAP = 500;
+    public const AUDIT_OPTION = 'wpmcp_db_write_audit_log';
+    public const AUDIT_MAX = 100;
+
+    /**
+     * Set once an audit log written before PR #584's write-time masking has
+     * been masked in place. Under the locked wpmcp_db_write_audit_log prefix,
+     * so update-option cannot clear it (clearing would only re-run the pass).
+     */
+    public const AUDIT_MASKED_OPTION = 'wpmcp_db_write_audit_log_masked';
+
+    /** Placeholder written over secret values in query results. */
+    public const SECRET_MASK = '[REDACTED]';
+
+    /** users-table columns that are always masked when user-table reads are opted in. */
+    public const SECRET_USER_COLUMNS = ['user_pass', 'user_activation_key'];
+
+    /** usermeta meta_keys whose meta_value is always masked when user-table reads are opted in. */
+    public const SECRET_META_KEYS = ['session_tokens'];
+
+    /** Unprefixed names of the network-wide tables on multisite (base_prefix + name). */
+    public const NETWORK_TABLES = ['users', 'usermeta', 'blogs', 'blogmeta', 'signups', 'site', 'sitemeta', 'sitecategories', 'registration_log'];
+
+    /** Schemas that are never the site's own, whatever the server lists. */
+    public const SYSTEM_SCHEMAS = ['information_schema', 'performance_schema', 'mysql', 'sys'];
+
+    /** SHOW forms a site-scoped caller may run: they name one table, which the identifier scan then checks. */
+    private const SCOPED_SHOW_PATTERN = '/^SHOW\s+(?:(?:FULL|EXTENDED)\s+)*(?:COLUMNS|FIELDS|INDEX|INDEXES|KEYS)\b|^SHOW\s+CREATE\s+TABLE\b/i';
+
+    /** Per-request cache of the detected NO_BACKSLASH_ESCAPES state. Null = not yet detected. */
+    private static ?bool $no_backslash_escapes_cache = null;
+
+    /** Test seam: whether an override for NO_BACKSLASH_ESCAPES is active. */
+    private static bool $no_backslash_escapes_override_set = false;
+
+    /** Test seam: the forced NO_BACKSLASH_ESCAPES value, when overridden. */
+    private static ?bool $no_backslash_escapes_override = null;
+
+    /** Test seam: force no_backslash_escapes_active() to a fixed value. Pass null to clear the override and resume live detection. */
+    public static function set_no_backslash_escapes_override(?bool $value): void
+    {
+        self::$no_backslash_escapes_override     = $value;
+        self::$no_backslash_escapes_override_set = null !== $value;
+    }
+
+    /**
+     * Whether the active MySQL sql_mode contains NO_BACKSLASH_ESCAPES, which
+     * changes how string literals end (backslash stops being an escape
+     * character). Detected once per request via $wpdb and cached; a test
+     * override seam lets pure-unit tests force either state without a live
+     * server actually running in that mode. Defaults to false (the ordinary,
+     * backslash-escapes-quotes MySQL default) if $wpdb is unavailable.
+     */
+    public static function no_backslash_escapes_active(): bool
+    {
+        if (self::$no_backslash_escapes_override_set) {
+            return (bool) self::$no_backslash_escapes_override;
+        }
+
+        if (null !== self::$no_backslash_escapes_cache) {
+            return self::$no_backslash_escapes_cache;
+        }
+
+        global $wpdb;
+        $mode = '';
+        if (isset($wpdb) && is_object($wpdb) && method_exists($wpdb, 'get_var')) {
+            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- reads the live session sql_mode (no WP API exists); memoized per request in $no_backslash_escapes_cache.
+            $mode = (string) $wpdb->get_var('SELECT @@SESSION.sql_mode');
+        }
+
+        self::$no_backslash_escapes_cache = false !== stripos($mode, 'NO_BACKSLASH_ESCAPES');
+        return self::$no_backslash_escapes_cache;
+    }
+
+    /**
+     * Normalize SQL for safe keyword scanning: replace every comment with a
+     * space and every string/backtick-identifier literal with an empty
+     * placeholder, so keywords cannot hide inside comments, strings, or
+     * quoted identifiers. Pure (no DB) when $no_backslash_escapes is passed
+     * explicitly; otherwise resolves it via no_backslash_escapes_active(),
+     * which may query $wpdb once per request. Does NOT special-case /*!
+     * executable comments; the caller rejects those before normalizing.
+     *
+     * With $preserve_backtick_identifiers, backtick-quoted identifiers are
+     * emitted as their space-delimited CONTENTS instead of the blank ``
+     * placeholder. Keyword scanning must never use this (a keyword could
+     * then hide inside a quoted identifier); it exists for table-NAME
+     * scanning (sql_mentions_user_tables), where blanking identifiers would
+     * be the bypass: `wp_users` names exactly the same table as wp_users.
+     */
+    public static function normalize_sql(
+        string $sql,
+        ?bool $no_backslash_escapes = null,
+        bool $preserve_backtick_identifiers = false
+    ): string {
+        $no_backslash_escapes ??= self::no_backslash_escapes_active();
+
+        $out = '';
+        $len = strlen($sql);
+        $i   = 0;
+
+        while ($i < $len) {
+            $c   = $sql[ $i ];
+            $two = substr($sql, $i, 2);
+
+            if ('--' === $two || '#' === $c) {
+                $newline = strpos($sql, "\n", $i);
+                $i       = (false === $newline) ? $len : $newline + 1;
+                $out    .= ' ';
+                continue;
+            }
+
+            if ('/*' === $two) {
+                $end = strpos($sql, '*/', $i + 2);
+                $i   = (false === $end) ? $len : $end + 2;
+                $out .= ' ';
+                continue;
+            }
+
+            if ("'" === $c || '"' === $c) {
+                $quote = $c;
+                $i++;
+                while ($i < $len) {
+                    if (! $no_backslash_escapes && '\\' === $sql[ $i ]) {
+                        $i += 2;
+                        continue;
+                    }
+                    if ($sql[ $i ] === $quote) {
+                        if ($i + 1 < $len && $sql[ $i + 1 ] === $quote) {
+                            $i += 2;
+                            continue;
+                        }
+                        $i++;
+                        break;
+                    }
+                    $i++;
+                }
+                $out .= "''";
+                continue;
+            }
+
+            if ('`' === $c) {
+                $i++;
+                $identifier = '';
+                while ($i < $len && '`' !== $sql[ $i ]) {
+                    $identifier .= $sql[ $i ];
+                    $i++;
+                }
+                $i++;
+                // Space-delimit preserved contents so `wp_users` cannot fuse
+                // with adjacent text into a longer, non-matching token.
+                $out .= $preserve_backtick_identifiers ? ' ' . $identifier . ' ' : '``';
+                continue;
+            }
+
+            $out .= $c;
+            $i++;
+        }
+
+        return $out;
+    }
+
+    /**
+     * Validate that $sql is a single read-only statement. Pure (no DB).
+     *
+     * @return true|\WP_Error
+     */
+    public static function is_read_only_sql(string $sql)
+    {
+        // MySQL executes the body of /*! ... *\/ executable comments, so the
+        // guard cannot safely strip-and-trust them like ordinary comments.
+        // Refuse any SQL containing the marker outright.
+        // MariaDB does the same for /*M! ... *\/ (any case), so refuse that
+        // marker too.
+        if (false !== strpos($sql, '/*!') || false !== stripos($sql, '/*M!')) {
+            return new \WP_Error('executable_comment', 'Executable comments (/*! ... */, /*M! ... */) are not allowed.');
+        }
+
+        // Raw, sql_mode-independent file-access pre-scan. normalize_sql()
+        // decides where string literals end based on an assumed escape rule
+        // (backslash-escapes quotes) that only holds when the server's
+        // sql_mode does NOT contain NO_BACKSLASH_ESCAPES. When it does, a
+        // literal like 'a\' actually ends at that quote (the backslash is an
+        // ordinary character), one character earlier than normalize_sql()
+        // assumes, letting a real INTO OUTFILE/LOAD_FILE token hide inside
+        // what the guard mistakes for string content. Scanning the untouched
+        // raw SQL for these tokens closes that vector regardless of sql_mode
+        // or how literals are eventually parsed. A legitimate query that
+        // merely contains the literal word "outfile" or "dumpfile" would be
+        // rejected too; that rare false positive is an acceptable trade for
+        // a read-only tool where file I/O is never a legitimate need.
+        if (preg_match('/(into\s+outfile|into\s+dumpfile|outfile|dumpfile|load_file\s*\()/i', $sql)) {
+            return new \WP_Error('file_access_blocked', 'File-access SQL (OUTFILE/DUMPFILE/LOAD_FILE) is not allowed.');
+        }
+
+        // Raw, sql_mode-independent stacked-statement pre-scan. The guard
+        // does not rely solely on normalize_sql() (or on the driver) to
+        // reject a second statement: a literal-boundary desync between the
+        // guard and the live server (the same NO_BACKSLASH_ESCAPES class of
+        // bug fixed above, or any future normalize_sql regression) could
+        // otherwise hide a live ';' inside what the guard mistakes for
+        // string content. Normalize under BOTH escape assumptions and
+        // reject if either parse finds a non-trailing ';', so correctness
+        // does not depend on sql_mode detection having succeeded.
+        foreach ([false, true] as $assume_no_backslash_escapes) {
+            $probe = trim(self::normalize_sql($sql, $assume_no_backslash_escapes));
+            $probe = rtrim($probe, "; \t\r\n");
+            if (false !== strpos($probe, ';')) {
+                return new \WP_Error('multi_statement', 'Multiple SQL statements are not allowed.');
+            }
+        }
+
+        $normalized = trim(self::normalize_sql($sql));
+        if ('' === $normalized) {
+            return new \WP_Error('empty_sql', 'Empty query.');
+        }
+
+        // Multi-statement: any ';' that isn't the sole trailing character.
+        // (Redundant with the raw pre-scan above for the sql_mode that is
+        // actually active; kept so the error still surfaces even if the
+        // pre-scan above is ever narrowed.)
+        $without_trailing = rtrim($normalized, "; \t\r\n");
+        if (false !== strpos($without_trailing, ';')) {
+            return new \WP_Error('multi_statement', 'Multiple SQL statements are not allowed.');
+        }
+
+        // File-access vectors (comments are already normalized to spaces).
+        // No trailing \b: the load_file(...) branch ends in '(', and '('
+        // followed by another non-word char has no word boundary there, so a
+        // trailing \b would incorrectly let LOAD_FILE through.
+        if (preg_match('/\b(into\s+outfile|into\s+dumpfile|load_file\s*\(|load\s+data\b)/i', $normalized)) {
+            return new \WP_Error('file_access_blocked', 'File-access SQL (OUTFILE/DUMPFILE/LOAD_FILE/LOAD DATA) is not allowed.');
+        }
+
+        // First keyword must be read-only.
+        if (! preg_match('/^([a-z]+)/i', $normalized, $matches)) {
+            return new \WP_Error('not_read_only', 'Only read-only queries are allowed.');
+        }
+
+        $keyword = strtoupper($matches[1]);
+        $allowed = ['SELECT', 'SHOW', 'DESCRIBE', 'DESC', 'EXPLAIN', 'WITH'];
+        if (! in_array($keyword, $allowed, true)) {
+            return new \WP_Error('not_read_only', "Only read-only queries are allowed (got {$keyword}).");
+        }
+
+        // Whole-statement write/DDL denylist. Literals/comments are already
+        // stripped, so these match only real keyword tokens, never strings
+        // or identifiers (e.g. a column named delete_count, or the string
+        // 'please delete this').
+        if (preg_match('/\b(INSERT|UPDATE|DELETE|REPLACE|MERGE|DROP|TRUNCATE|ALTER|CREATE|RENAME|GRANT|REVOKE|HANDLER|CALL|LOCK|UNLOCK|PREPARE|EXECUTE|INTO)\b/i', $normalized)) {
+            return new \WP_Error('not_read_only', 'The query contains a write or unsafe keyword.');
+        }
+
+        return true;
+    }
+
+    /**
+     * Whether $sql references the users or usermeta table as a real
+     * identifier token. Matching runs against normalize_sql() output, where
+     * string literals and comments are already blanked, so a query that
+     * merely MENTIONS the table name inside a string (e.g. searching
+     * post_content for 'wp_users') is never a false positive. Backtick
+     * identifier contents are preserved (see normalize_sql) because
+     * `wp_users` is the same table as wp_users and must not evade the scan.
+     *
+     * Like the stacked-statement pre-scan in is_read_only_sql(), the SQL is
+     * normalized under BOTH escape assumptions and a hit under either counts:
+     * a literal-boundary desync between the guard and the live server must
+     * not be able to hide a user-table read inside assumed string content.
+     *
+     * Identifier chars around the match are excluded on both sides, so
+     * lookalike tables (wp_users_backup, my_wp_usermeta) do not match while
+     * schema-qualified (db.wp_users) and aliased (wp_users u) forms do.
+     * sql_identifiers() is consulted as well, for the server's exact
+     * double-dash comment rule.
+     */
+    public static function sql_mentions_user_tables(string $sql): bool
+    {
+        global $wpdb;
+
+        $names = array_unique([ (string) $wpdb->users, (string) $wpdb->usermeta ]);
+        $names = array_filter($names, static fn ($name) => '' !== $name);
+        if ([] === $names) {
+            return false;
+        }
+
+        $quoted  = array_map(static fn ($name) => preg_quote($name, '/'), $names);
+        $pattern = '/(?<![0-9a-z_$])(' . implode('|', $quoted) . ')(?![0-9a-z_$])/i';
+
+        foreach ([false, true] as $assume_no_backslash_escapes) {
+            $probe = self::normalize_sql($sql, $assume_no_backslash_escapes, true);
+            if (preg_match($pattern, $probe)) {
+                return true;
+            }
+        }
+
+        // normalize_sql() treats any "--" as a comment, but the server only
+        // does when whitespace follows, so "SELECT 1--1, user_pass FROM
+        // wp_users" hides the table from the probes above. The identifier
+        // scan applies the server's rule; an unparseable statement counts.
+        $identifiers = self::sql_identifiers($sql);
+        if (null === $identifiers) {
+            return true;
+        }
+
+        return [] !== array_intersect(array_map('strtolower', $names), $identifiers);
+    }
+
+    /**
+     * Read-path counterpart of is_protected(): decide whether a validated
+     * read-only query may touch the users/usermeta tables. Those tables hold
+     * password hashes (user_pass), activation keys, and login session tokens
+     * (usermeta session_tokens); an agent has no business reading any of
+     * them through the flexible SQL tool, and the dedicated user tools
+     * (list-users, get-user) already expose the safe profile fields.
+     *
+     * Returns false when the query does not touch the user tables, true when
+     * it does AND the site has opted in via the
+     * wpmcp_db_allow_user_table_reads filter, or a WP_Error
+     * (users_table_read_blocked) otherwise. Callers use the true return to
+     * apply result masking (see mask_user_secrets()).
+     *
+     * @return bool|\WP_Error
+     */
+    public static function guard_user_table_read(string $sql)
+    {
+        if (! self::sql_mentions_user_tables($sql)) {
+            return false;
+        }
+
+        /**
+         * Opt in to reads of the users/usermeta tables through the query
+         * tool. Even when enabled, secret columns are masked in results
+         * unless wpmcp_db_mask_user_secrets is also filtered to false.
+         *
+         * @param bool   $allow Default false.
+         * @param string $sql   The full query being validated.
+         */
+        if (apply_filters('wpmcp_db_allow_user_table_reads', false, $sql)) {
+            return true;
+        }
+
+        return new \WP_Error(
+            'users_table_read_blocked',
+            'Reads of the users/usermeta tables are blocked: they contain password hashes, '
+            . 'activation keys, and session tokens. Use the list-users or get-user tools for '
+            . 'safe user data, or opt in via the wpmcp_db_allow_user_table_reads filter.'
+        );
+    }
+
+    /**
+     * Best-effort defense in depth for opted-in user-table reads: overwrite
+     * secret values in result rows with SECRET_MASK. Masks the users-table
+     * secret columns (SECRET_USER_COLUMNS) wherever they appear as result
+     * keys, and meta_value on any row whose meta_key is a secret meta key
+     * (SECRET_META_KEYS, extendable via the wpmcp_db_masked_meta_keys
+     * filter). Column aliasing (SELECT user_pass AS p) can evade this, which
+     * is why it is layered BEHIND the opt-in filter rather than being the
+     * primary guard: the default posture is a flat refusal.
+     */
+    public static function mask_user_secrets(array $rows): array
+    {
+        $meta_keys = (array) apply_filters('wpmcp_db_masked_meta_keys', self::SECRET_META_KEYS);
+        $meta_keys = array_map('strtolower', array_map('strval', $meta_keys));
+
+        foreach ($rows as $index => $row) {
+            if (! is_array($row)) {
+                continue;
+            }
+
+            foreach (self::SECRET_USER_COLUMNS as $column) {
+                if (array_key_exists($column, $row)) {
+                    $rows[ $index ][ $column ] = self::SECRET_MASK;
+                }
+            }
+
+            if (
+                isset($row['meta_key'])
+                && in_array(strtolower((string) $row['meta_key']), $meta_keys, true)
+                && array_key_exists('meta_value', $row)
+            ) {
+                // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_value -- masking a meta_value column in already-fetched result rows, not building a meta query.
+                $rows[ $index ]['meta_value'] = self::SECRET_MASK;
+            }
+        }
+
+        return $rows;
+    }
+
+    /**
+     * Shortest stored credential the value scrub in mask_gateway_secrets()
+     * looks for anywhere in a result: shorter values ("yes", "live") would
+     * mask unrelated text. Credentials of any length are still masked by key
+     * on a row that names its gateway settings option.
+     */
+    public const GATEWAY_SECRET_SCRUB_MIN = 8;
+
+    /**
+     * Mask payment gateway credentials in database tool output (issue
+     * #528), with the shared Gateway_Secrets rule that get-option and
+     * call-rest use (#507). Two layers:
+     *  - a row whose option_name is a registered gateway's settings option
+     *    gets its option_value unserialized, masked by key with
+     *    Gateway_Secrets::mask_option() and serialized again;
+     *  - every other string cell (an aliased or option_name-less select, a
+     *    before_image, a JOIN) is scrubbed of the stored credential values
+     *    themselves, inside serialized arrays or as plain substrings.
+     * SQL that transforms a value (HEX, REVERSE...) can still evade the
+     * scrub, as it can mask_user_secrets(). Only the returned copy changes:
+     * callers keep the raw rows for snapshots and the audit log, so a
+     * rollback restores the exact stored credentials.
+     *
+     * @param array<int, mixed> $rows
+     * @return array<int, mixed>
+     */
+    public static function mask_gateway_secrets(array $rows): array
+    {
+        return self::mask_option_rows(self::mask_gateway_rows($rows));
+    }
+
+    /**
+     * wp_options rows with the credentials the secret registry and key-name
+     * heuristic cover masked in option_value (issue #865, Secret_Options):
+     * the same rule get-option applies, for a row that names its option.
+     * Runs after the gateway pass, which needs the raw values to scrub.
+     *
+     * @param array<int, mixed> $rows
+     * @return array<int, mixed>
+     */
+    private static function mask_option_rows(array $rows): array
+    {
+        foreach ($rows as $index => $row) {
+            if (is_array($row) && isset($row['option_name'], $row['option_value']) && is_string($row['option_name']) && is_string($row['option_value'])) {
+                $rows[ $index ]['option_value'] = Secret_Options::mask_row_value($row['option_name'], $row['option_value']);
+            }
+        }
+        return $rows;
+    }
+
+    /**
+     * Rows of a query that reads option_value (or sitemeta's meta_value) with
+     * every string cell masked by the key-name heuristic, whatever the cell
+     * is called: a select of the value column alone, or aliased, carries no
+     * option_name to match the registry against. The plain-lookup guard has
+     * already refused registered options, so the names left need only the
+     * heuristic. Only for a query guard_option_value_read() let through.
+     *
+     * @param array<int, mixed> $rows
+     * @return array<int, mixed>
+     */
+    public static function mask_option_value_cells(array $rows): array
+    {
+        foreach ($rows as $index => $row) {
+            if (! is_array($row)) {
+                continue;
+            }
+            foreach ($row as $column => $cell) {
+                if (is_string($cell)) {
+                    $rows[ $index ][ $column ] = Secret_Options::mask_row_value('', $cell);
+                }
+            }
+        }
+        return $rows;
+    }
+
+    /**
+     * The payment gateway pass of mask_gateway_secrets().
+     *
+     * @param array<int, mixed> $rows
+     * @return array<int, mixed>
+     */
+    private static function mask_gateway_rows(array $rows): array
+    {
+        if (! function_exists('WC') || ! class_exists('WC_Payment_Gateway')) {
+            return $rows;
+        }
+
+        // A before_image outlives the value it captured (the write has
+        // already replaced or deleted it), so the gateway rows in $rows add
+        // their own credentials to what is stored now.
+        $secrets = self::gateway_secret_values($rows);
+
+        foreach ($rows as $index => $row) {
+            if (! is_array($row)) {
+                continue;
+            }
+
+            $option = isset($row['option_name']) && is_string($row['option_name']) ? $row['option_name'] : '';
+            foreach ($row as $column => $value) {
+                if (! is_string($value)) {
+                    continue;
+                }
+                $masked = ('option_value' === $column && '' !== $option)
+                    ? self::mask_gateway_option_value($option, $value)
+                    : $value;
+                $masked = self::mask_audit_log_value($masked);
+                $rows[ $index ][ $column ] = self::scrub_gateway_secrets($masked, $secrets);
+            }
+        }
+
+        return $rows;
+    }
+
+    /**
+     * The non-empty credential values of every registered payment gateway,
+     * as stored now and as carried by any gateway settings row in $rows,
+     * longest first.
+     *
+     * @param array<int, mixed> $rows
+     * @return array<int, string>
+     */
+    private static function gateway_secret_values(array $rows): array
+    {
+        $registry = WC()->payment_gateways();
+        $gateways = is_object($registry) && method_exists($registry, 'payment_gateways') ? (array) $registry->payment_gateways() : [];
+
+        $values = [];
+        foreach ($gateways as $gateway) {
+            if ($gateway instanceof \WC_Payment_Gateway) {
+                self::collect_stored_gateway_secrets($gateway, get_option($gateway->get_option_key()), $values);
+            }
+        }
+
+        foreach ($rows as $row) {
+            if (! is_array($row) || ! is_string($row['option_name'] ?? null) || ! is_string($row['option_value'] ?? null)) {
+                continue;
+            }
+            $gateway = Gateway_Secrets::gateway_for_option($row['option_name']);
+            if (null !== $gateway) {
+                self::collect_stored_gateway_secrets($gateway, $row['option_value'], $values);
+            }
+        }
+
+        $values = array_values(array_unique($values));
+        usort($values, static fn (string $a, string $b): int => strlen($b) - strlen($a));
+        return $values;
+    }
+
+    /**
+     * Add the credential values of a gateway settings value, in whatever
+     * form it is stored (issue #729), to $values: by key when it decodes to
+     * settings, the whole value when it does not (mask_option() masks such
+     * a value whole, so it is the credential as far as the scrub knows).
+     *
+     * @param mixed              $stored
+     * @param array<int, string> $values
+     */
+    private static function collect_stored_gateway_secrets(\WC_Payment_Gateway $gateway, $stored, array &$values): void
+    {
+        $settings = Gateway_Secrets::decode_settings($stored);
+        if (null !== $settings) {
+            self::collect_gateway_secrets($gateway, $settings, $values);
+        } elseif (is_scalar($stored) && ! is_bool($stored) && strlen((string) $stored) >= self::GATEWAY_SECRET_SCRUB_MIN) {
+            $values[] = (string) $stored;
+        }
+    }
+
+    /**
+     * Add a gateway's credential values from $settings to $values, skipping
+     * those too short to scrub safely.
+     *
+     * @param array<mixed>      $settings
+     * @param array<int, string> $values
+     */
+    private static function collect_gateway_secrets(\WC_Payment_Gateway $gateway, array $settings, array &$values): void
+    {
+        foreach (Gateway_Secrets::secret_keys($gateway, $settings) as $key) {
+            $value = $settings[ $key ] ?? null;
+            if (is_scalar($value) && strlen((string) $value) >= self::GATEWAY_SECRET_SCRUB_MIN) {
+                $values[] = (string) $value;
+            }
+        }
+    }
+
+    /**
+     * A serialized database write audit log (AUDIT_OPTION) with the gateway
+     * credentials in every entry's before-image masked by key (issue #550).
+     * The log keeps the rows a write replaced, so it can hold a credential
+     * that has since been rotated away, which the scrub of the values stored
+     * now cannot recognize. Recognized by shape rather than by option_name,
+     * so a select that leaves the name out is masked too. Anything else
+     * comes back untouched.
+     */
+    private static function mask_audit_log_value(string $value): string
+    {
+        if (false === strpos($value, 's:6:"before";')) {
+            return $value;
+        }
+        $log = self::unserialize_array($value);
+        if (null === $log) {
+            return $value;
+        }
+
+        $changed = false;
+        foreach ($log as $index => $entry) {
+            if (! is_array($entry) || ! isset($entry['op'], $entry['table']) || ! is_array($entry['before'] ?? null)) {
+                continue;
+            }
+            $before = self::mask_gateway_secrets($entry['before']);
+            if ($before !== $entry['before']) {
+                $log[ $index ]['before'] = $before;
+                $changed = true;
+            }
+        }
+
+        return $changed ? serialize($log) : $value; // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize -- re-encodes the audit log in the same serialized form the options table stores.
+    }
+
+    /**
+     * A gateway settings option_value with its secrets masked by key, in the
+     * form it is stored in: a serialized array, JSON text or a serialized
+     * string, or masked whole when it holds no settings (issue #729).
+     */
+    private static function mask_gateway_option_value(string $option, string $value): string
+    {
+        $masked = Gateway_Secrets::mask_option($option, $value);
+        return is_string($masked) ? $masked : Gateway_Secrets::MASK;
+    }
+
+    /**
+     * Replace every stored credential in $value with the mask: element by
+     * element inside a serialized array (so the result stays valid
+     * serialized data), as a substring otherwise.
+     *
+     * @param array<int, string> $secrets
+     */
+    private static function scrub_gateway_secrets(string $value, array $secrets): string
+    {
+        $hit = false;
+        foreach ($secrets as $secret) {
+            if (false !== strpos($value, $secret)) {
+                $hit = true;
+                break;
+            }
+        }
+        if (! $hit) {
+            return $value;
+        }
+
+        $array = self::unserialize_array($value);
+        if (null !== $array) {
+            array_walk_recursive(
+                $array,
+                static function (&$item) use ($secrets): void {
+                    if (is_string($item)) {
+                        $item = str_replace($secrets, Gateway_Secrets::MASK, $item);
+                    }
+                }
+            );
+            return serialize($array); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize -- re-encodes a serialized cell in the same form it was read in.
+        }
+
+        return str_replace($secrets, Gateway_Secrets::MASK, $value);
+    }
+
+    /**
+     * A serialized array decoded without instantiating any class, or null
+     * when $value is not one.
+     *
+     * @return array<mixed>|null
+     */
+    private static function unserialize_array(string $value): ?array
+    {
+        if (! is_serialized($value)) {
+            return null;
+        }
+        // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize -- allowed_classes:false never instantiates an object; the value is only re-encoded for display.
+        $decoded = @unserialize($value, [ 'allowed_classes' => false ]);
+        return is_array($decoded) ? $decoded : null;
+    }
+
+    /**
+     * Whether the current caller is limited to the current site's tables
+     * (issue #526). On multisite, manage_options is a per-site capability,
+     * but every site shares one database: without this limit a sub-site
+     * administrator could read wp_sitemeta, the main site's options or any
+     * other site's tables, and write sitemeta to become a super admin.
+     * Network operators (manage_network_options) and single-site installs
+     * are not limited.
+     */
+    public static function scope_restricted(): bool
+    {
+        return is_multisite() && ! current_user_can('manage_network_options');
+    }
+
+    /**
+     * Pure: does $table belong to the site whose prefix is $prefix? It must
+     * start with that prefix and not be a network-wide table. On the main
+     * site (prefix === base prefix) a name continuing with digits and an
+     * underscore is another site's table (wp_2_options), so it is out too.
+     * Matching is case-insensitive, like the rest of this guard.
+     */
+    public static function table_in_site_scope(string $table, string $prefix, string $base_prefix, array $global_tables): bool
+    {
+        $table  = strtolower($table);
+        $prefix = strtolower($prefix);
+
+        if ('' === $table || '' === $prefix || 0 !== strpos($table, $prefix)) {
+            return false;
+        }
+
+        if (in_array($table, array_map('strtolower', array_map('strval', $global_tables)), true)) {
+            return false;
+        }
+
+        if ($prefix === strtolower($base_prefix) && preg_match('/^[0-9]+_/', substr($table, strlen($prefix)))) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /** Whether the current caller may use $table (always true when not scope_restricted()). */
+    public static function table_in_scope(string $table): bool
+    {
+        if (! self::scope_restricted()) {
+            return true;
+        }
+
+        global $wpdb;
+        return self::table_in_site_scope($table, (string) $wpdb->prefix, (string) $wpdb->base_prefix, self::network_tables());
+    }
+
+    /** The network-wide table names on this install, including custom user tables. */
+    private static function network_tables(): array
+    {
+        global $wpdb;
+
+        $names = [ (string) $wpdb->users, (string) $wpdb->usermeta ];
+        foreach (self::NETWORK_TABLES as $name) {
+            $names[] = $wpdb->base_prefix . $name;
+        }
+
+        return array_values(array_unique($names));
+    }
+
+    private static function out_of_scope_error(string $table): \WP_Error
+    {
+        return new \WP_Error(
+            'table_out_of_scope',
+            sprintf(
+                'Table "%s" is outside this site. On a multisite network the database tools only reach the current site\'s tables unless the user can manage the network.',
+                $table
+            )
+        );
+    }
+
+    /**
+     * valid_table() plus the multisite site scope: the name is checked as
+     * given (so an out-of-scope table is refused the same way whether or not
+     * it exists) and again as resolved.
+     *
+     * @return string|\WP_Error
+     */
+    public static function scoped_table(string $table)
+    {
+        $requested = trim($table);
+        if ('' !== $requested && ! self::table_in_scope($requested)) {
+            return self::out_of_scope_error($requested);
+        }
+
+        $real = self::valid_table($table);
+        if (is_wp_error($real)) {
+            return $real;
+        }
+
+        if (! self::table_in_scope($real)) {
+            return self::out_of_scope_error($real);
+        }
+
+        return $real;
+    }
+
+    /**
+     * Read-path counterpart of scoped_table() for the `query` tool. A
+     * site-scoped caller's SQL may not name any table outside the current
+     * site, however it is written: in FROM, JOIN, comma lists, subqueries,
+     * CTEs or UNIONs, backtick-quoted, double-quoted (ANSI_QUOTES) or
+     * schema-qualified. Rather than trusting a grammar to find every table
+     * position, every identifier in the statement is checked: one that names
+     * a table outside the site (by WordPress naming or against the live table
+     * list) or a schema other than the site's database refuses the query.
+     * SHOW is limited to the forms that name one table, and SQL the scan
+     * cannot tokenize is refused (fail closed).
+     *
+     * @return true|\WP_Error
+     */
+    public static function guard_query_scope(string $sql)
+    {
+        if (! self::scope_restricted()) {
+            return true;
+        }
+
+        $normalized = trim(self::normalize_sql($sql));
+        if (preg_match('/^SHOW\b/i', $normalized) && ! preg_match(self::SCOPED_SHOW_PATTERN, $normalized)) {
+            return new \WP_Error(
+                'show_out_of_scope',
+                'On a multisite network only SHOW COLUMNS, SHOW INDEX and SHOW CREATE TABLE are available inside this site. Use list-tables for this site\'s tables.'
+            );
+        }
+
+        $identifiers = self::sql_identifiers($sql);
+        if (null === $identifiers) {
+            return new \WP_Error('query_scope_unverified', 'The query could not be parsed to confirm it stays inside this site, so it was refused.');
+        }
+
+        global $wpdb;
+
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- the live table list decides which names are real tables; a cached list could miss a new network table.
+        $tables = array_map('strtolower', array_map('strval', (array) $wpdb->get_col('SHOW TABLES')));
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- the live schema list, so a query cannot reach another database on the same server.
+        $schemas = array_map('strtolower', array_map('strval', (array) $wpdb->get_col('SHOW DATABASES')));
+        $schemas = array_diff(array_unique(array_merge($schemas, self::SYSTEM_SCHEMAS)), [strtolower((string) DB_NAME)]);
+
+        $base_prefix = strtolower((string) $wpdb->base_prefix);
+        $globals     = self::network_tables();
+
+        foreach ($identifiers as $identifier) {
+            if (in_array($identifier, $schemas, true)) {
+                return new \WP_Error('schema_out_of_scope', sprintf('Schema "%s" is outside this site.', $identifier));
+            }
+
+            $wp_named  = '' !== $base_prefix && 0 === strpos($identifier, $base_prefix);
+            $candidate = $wp_named || in_array($identifier, $tables, true);
+            if ($candidate && ! self::table_in_site_scope($identifier, (string) $wpdb->prefix, (string) $wpdb->base_prefix, $globals)) {
+                return self::out_of_scope_error($identifier);
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Pure: every name in $sql that the server could read as an identifier,
+     * lowercased and de-duplicated: bare words, backtick-quoted names,
+     * double-quoted strings (identifiers under ANSI_QUOTES) and, to stay
+     * conservative, the words inside comments. Single-quoted literals are
+     * skipped. The SQL is lexed under both backslash-escape rules and both
+     * double-dash comment rules, and the results are unioned, so a literal
+     * boundary that differs between this scan and the live server cannot
+     * hide a name. Returns null when no lexing of $sql terminates cleanly.
+     *
+     * @return array<int, string>|null
+     */
+    public static function sql_identifiers(string $sql): ?array
+    {
+        $found  = [];
+        $parsed = false;
+
+        foreach ([false, true] as $no_backslash_escapes) {
+            foreach ([true, false] as $strict_double_dash) {
+                $identifiers = self::lex_identifiers($sql, $no_backslash_escapes, $strict_double_dash);
+                if (null === $identifiers) {
+                    continue;
+                }
+                $parsed = true;
+                foreach ($identifiers as $identifier) {
+                    $found[ $identifier ] = true;
+                }
+            }
+        }
+
+        return $parsed ? array_map('strval', array_keys($found)) : null;
+    }
+
+    /**
+     * One lexing pass for sql_identifiers(). With $strict_double_dash, "--"
+     * starts a comment only when followed by whitespace, a control character
+     * or the end (the MySQL and MariaDB rule, so "1--1" is arithmetic);
+     * otherwise any "--" does. Returns null on an unterminated quote,
+     * identifier or block comment.
+     *
+     * @return array<int, string>|null
+     */
+    private static function lex_identifiers(string $sql, bool $no_backslash_escapes, bool $strict_double_dash): ?array
+    {
+        $out = [];
+        $len = strlen($sql);
+        $i   = 0;
+
+        while ($i < $len) {
+            $c   = $sql[ $i ];
+            $two = substr($sql, $i, 2);
+
+            $dash_comment = '--' === $two
+                && (! $strict_double_dash || $i + 2 >= $len || ord($sql[ $i + 2 ]) <= 32);
+            if ('#' === $c || $dash_comment) {
+                $newline = strpos($sql, "\n", $i);
+                $end     = (false === $newline) ? $len : $newline;
+                self::collect_words(substr($sql, $i, $end - $i), $out);
+                $i = $end + 1;
+                continue;
+            }
+
+            if ('/*' === $two) {
+                $end = strpos($sql, '*/', $i + 2);
+                if (false === $end) {
+                    return null;
+                }
+                self::collect_words(substr($sql, $i + 2, $end - $i - 2), $out);
+                $i = $end + 2;
+                continue;
+            }
+
+            if ("'" === $c || '"' === $c || '`' === $c) {
+                $content = '';
+                $closed  = false;
+                $i++;
+                while ($i < $len) {
+                    $ch = $sql[ $i ];
+                    if ('`' !== $c && ! $no_backslash_escapes && '\\' === $ch) {
+                        $content .= substr($sql, $i + 1, 1);
+                        $i       += 2;
+                        continue;
+                    }
+                    if ($ch === $c) {
+                        if ($i + 1 < $len && $sql[ $i + 1 ] === $c) {
+                            $content .= $c;
+                            $i       += 2;
+                            continue;
+                        }
+                        $i++;
+                        $closed = true;
+                        break;
+                    }
+                    $content .= $ch;
+                    $i++;
+                }
+                if (! $closed) {
+                    return null;
+                }
+                if ("'" !== $c) {
+                    $out[] = strtolower($content);
+                }
+                continue;
+            }
+
+            if (preg_match('/[0-9A-Za-z_$\x80-\xFF]+/A', $sql, $match, 0, $i)) {
+                $out[] = strtolower($match[0]);
+                $i    += strlen($match[0]);
+                continue;
+            }
+
+            $i++;
+        }
+
+        return $out;
+    }
+
+    /** Add the bare words of a comment body to $out. */
+    private static function collect_words(string $text, array &$out): void
+    {
+        if (preg_match_all('/[0-9A-Za-z_$\x80-\xFF]+/', $text, $matches)) {
+            foreach ($matches[0] as $word) {
+                $out[] = strtolower($word);
+            }
+        }
+    }
+
+    /**
+     * Resolve a table name against the live table list. Every query that
+     * takes the result binds it with $wpdb->prepare()'s %i placeholder; the
+     * validation is what keeps the tools on real, non-protected tables, and
+     * it returns the exact real name (case and prefix as MySQL reports
+     * them), or a WP_Error if it does not exist.
+     *
+     * @return string|\WP_Error
+     */
+    public static function valid_table(string $table)
+    {
+        global $wpdb;
+
+        $table = trim($table);
+        if ('' === $table) {
+            return new \WP_Error('unknown_table', 'A table name is required.');
+        }
+
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- validates a caller-supplied table name against the live schema; a cached table list would validate against stale schema.
+        $tables = (array) $wpdb->get_col('SHOW TABLES');
+        foreach ($tables as $candidate) {
+            if (strtolower((string) $candidate) === strtolower($table)) {
+                return (string) $candidate;
+            }
+        }
+
+        return new \WP_Error('unknown_table', 'Unknown table.');
+    }
+
+    /** Pure: is $table in the protected list (case-insensitive)? */
+    public static function table_is_protected(string $table, array $protected): bool
+    {
+        $needle = strtolower($table);
+        foreach ($protected as $candidate) {
+            if (strtolower((string) $candidate) === $needle) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Table-name suffixes of WP MCP's own stores that hold raw copies of
+     * what a write replaced (issue #550): the snapshot ledger
+     * ({prefix}wpmcp_snapshots, on every site of a network). Its payload is
+     * the exact undo copy, gateway credentials included, encoded as base64
+     * gzip that no result scrub can see into, so the generic database tools
+     * do not reach it at all; list-operations and the rollback tools are
+     * the way in.
+     */
+    public const INTERNAL_STORE_TABLE_SUFFIXES = ['wpmcp_snapshots'];
+
+    /** Whether $table is one of WP MCP's internal raw-copy stores (case-insensitive). */
+    public static function is_internal_store_table(string $table): bool
+    {
+        $table = strtolower(trim($table));
+        foreach (self::INTERNAL_STORE_TABLE_SUFFIXES as $suffix) {
+            if ('' !== $table && str_ends_with($table, $suffix)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Read-path refusal for the internal raw-copy stores (issue #550): a
+     * query that names one anywhere (FROM, JOIN, a subquery, a UNION, quoted
+     * or schema-qualified, in any case) is refused, because once the table
+     * is reachable SELECT *, a UNION under positional aliases or a
+     * transform such as HEX() or FROM_BASE64() can carry the payload out
+     * under any column name. Single-quoted literals do not count; SQL the
+     * identifier scan cannot tokenize is refused when it contains a store's
+     * name at all (fail closed).
+     *
+     * @return true|\WP_Error
+     */
+    public static function guard_internal_store_read(string $sql)
+    {
+        $identifiers = self::sql_identifiers($sql);
+        if (null === $identifiers) {
+            $named = false;
+            foreach (self::INTERNAL_STORE_TABLE_SUFFIXES as $suffix) {
+                $named = $named || false !== stripos($sql, $suffix);
+            }
+        } else {
+            $named = [] !== array_filter($identifiers, [self::class, 'is_internal_store_table']);
+        }
+
+        if (! $named) {
+            return true;
+        }
+
+        return new \WP_Error(
+            'internal_store_read_blocked',
+            'Reads of the WP MCP snapshot ledger are blocked: it holds the exact undo copy of every '
+            . 'change, credentials included. Use list-operations to see the undo history and the '
+            . 'rollback tools to restore it.'
+        );
+    }
+
+    /**
+     * Read-path refusal for option values (issue #621). A payment gateway's
+     * live settings row cannot be masked at rest, and mask_gateway_secrets()
+     * only sees a value that comes back intact: REVERSE(), TO_BASE64(), a
+     * subquery, or a LIKE on option_value in the WHERE clause gets around
+     * it. So when the SQL names an options table (any site's) and can read
+     * option_value (by name, or through a * wildcard), it must be a plain
+     * lookup of named options that get-option would also return:
+     *
+     *   SELECT <columns> FROM <options table> [alias]
+     *   WHERE option_name = '<name>' | option_name IN ('<name>', ...) [LIMIT n]
+     *
+     * with no subquery, string literal or comment in the column list, and
+     * no name that is denylisted (Option_Guard::is_denylisted()) or a
+     * gateway settings option (woocommerce_*_settings). Anything else that
+     * reads option_value is refused; queries that never read it (names,
+     * counts) are untouched. SQL the lexer cannot read in every mode is
+     * treated as reading it (fail closed).
+     *
+     * @return true|\WP_Error
+     */
+    public static function guard_option_value_read(string $sql)
+    {
+        $reads = false;
+        foreach ([false, true] as $no_backslash_escapes) {
+            foreach ([true, false] as $strict_double_dash) {
+                $tokens = self::lex_tokens($sql, $no_backslash_escapes, $strict_double_dash);
+                if (null === $tokens) {
+                    $reads = $reads || false !== stripos($sql, 'option') || false !== stripos($sql, 'sitemeta');
+                    continue;
+                }
+                $reads = $reads || self::tokens_read_option_value($tokens);
+            }
+        }
+
+        if (! $reads || self::is_plain_option_lookup($sql)) {
+            return true;
+        }
+
+        return new \WP_Error(
+            'option_value_read_blocked',
+            'query reads option_value from the options table only as a plain lookup of named options: '
+            . "SELECT ... FROM <options table> WHERE option_name = '<name>' (or IN (...)), for options get-option "
+            . 'would return. Payment gateway settings, registered credential options and other sensitive options '
+            . 'are not readable here; use get-option, which masks credentials.'
+        );
+    }
+
+    /** Whether $table is an options table of this site or any site of the network. */
+    public static function is_options_table(string $table): bool
+    {
+        global $wpdb;
+        $table = strtolower(trim($table));
+        if ('' === $table) {
+            return false;
+        }
+        if (isset($wpdb->options) && strtolower((string) $wpdb->options) === $table) {
+            return true;
+        }
+        $prefix = strtolower((string) ($wpdb->base_prefix ?? $wpdb->prefix ?? 'wp_'));
+        return 1 === preg_match('/^' . preg_quote($prefix, '/') . '(\d+_)?options$/', $table);
+    }
+
+    /**
+     * Whether $table is the network's sitemeta table: on multisite it holds
+     * the network-wide options (get_site_option()), such as a backup
+     * plugin's remote storage credentials (issue #865).
+     */
+    public static function is_sitemeta_table(string $table): bool
+    {
+        global $wpdb;
+        $table = strtolower(trim($table));
+        if ('' === $table) {
+            return false;
+        }
+        if (isset($wpdb->sitemeta) && strtolower((string) $wpdb->sitemeta) === $table) {
+            return true;
+        }
+        $prefix = strtolower((string) ($wpdb->base_prefix ?? $wpdb->prefix ?? 'wp_'));
+        return $table === $prefix . 'sitemeta';
+    }
+
+    /** Whether the SQL names an options or sitemeta table and can read its value column. */
+    public static function reads_option_value(string $sql): bool
+    {
+        foreach ([false, true] as $no_backslash_escapes) {
+            foreach ([true, false] as $strict_double_dash) {
+                $tokens = self::lex_tokens($sql, $no_backslash_escapes, $strict_double_dash);
+                if (null === $tokens ? false !== stripos($sql, 'option') || false !== stripos($sql, 'sitemeta') : self::tokens_read_option_value($tokens)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** @param array<int, array{0: string, 1: string}> $tokens */
+    private static function tokens_read_option_value(array $tokens): bool
+    {
+        $names_options = false;
+        $reads_value   = false;
+        $previous      = null;
+        foreach ($tokens as $token) {
+            [ $type, $value ] = $token;
+            if ('id' === $type) {
+                $names_options = $names_options || self::is_options_table($value) || self::is_sitemeta_table($value);
+                $reads_value   = $reads_value || 'option_value' === $value || 'meta_value' === $value;
+            }
+            if ('p' === $type && '*' === $value && null !== $previous) {
+                // A wildcard column list: after SELECT, DISTINCT, ALL, a
+                // comma or a table qualifier. COUNT(*) and a * b are not.
+                $is_wildcard = ('id' === $previous[0] && in_array($previous[1], [ 'select', 'distinct', 'all', 'distinctrow' ], true))
+                    || ('p' === $previous[0] && in_array($previous[1], [ ',', '.' ], true));
+                $reads_value = $reads_value || $is_wildcard;
+            }
+            $previous = $token;
+        }
+        return $names_options && $reads_value;
+    }
+
+    /** Whether $sql is exactly the plain named-option lookup guard_option_value_read() allows. */
+    private static function is_plain_option_lookup(string $sql): bool
+    {
+        $name    = "'[A-Za-z0-9_.:\\-]+'";
+        $pattern = '/^\s*SELECT\s+(?<cols>[A-Za-z0-9_`.,()*+\-\s]+?)\s+FROM\s+`?(?<table>[A-Za-z0-9_$]+)`?'
+            . '(?:\s+(?:AS\s+)?`?(?<alias>[A-Za-z_][A-Za-z0-9_]*)`?)?'
+            . '\s+WHERE\s+(?:`?[A-Za-z_][A-Za-z0-9_]*`?\.)?`?(?:option_name|meta_key)`?\s*'
+            . '(?:=\s*(?<one>' . $name . ')|IN\s*\((?<list>\s*' . $name . '(?:\s*,\s*' . $name . ')*\s*)\))'
+            . '(?:\s+LIMIT\s+\d+(?:\s*,\s*\d+)?)?\s*;?\s*$/i';
+        if (1 !== preg_match($pattern, $sql, $m)) {
+            return false;
+        }
+        if (! self::is_options_table($m['table']) && ! self::is_sitemeta_table($m['table'])) {
+            return false;
+        }
+        if (1 === preg_match('/\b(select|from|where|union|into|having|join)\b/i', $m['cols'])) {
+            return false;
+        }
+        // A function over the value column (REVERSE, TO_BASE64, CONCAT) defeats
+        // the result mask. Harmless for an option with nothing to mask (the
+        // check below), refused for one that holds a credential. COUNT(*) is fine.
+        $cols = preg_replace('/\bCOUNT\s*\(\s*\*\s*\)/i', '', $m['cols']);
+        $transforms = false !== strpos((string) $cols, '(');
+        $alias = strtolower((string) ($m['alias'] ?? ''));
+        if (in_array($alias, [ 'where', 'join', 'inner', 'left', 'right', 'cross', 'natural', 'straight_join' ], true)) {
+            return false;
+        }
+
+        preg_match_all("/'([^']*)'/", (string) ($m['one'] ?? '') . (string) ($m['list'] ?? ''), $names);
+        foreach ($names[1] as $option) {
+            $gateway = function_exists('WC') && null !== Gateway_Secrets::gateway_for_option($option);
+            // A registered credential option (issue #865) is read through
+            // get-option, which masks it; a value-only select would not.
+            $secret = \WPMCP\Tools\Meta\Option_Guard::is_denylisted($option) || $gateway || Secret_Options::is_registered($option);
+            if ($secret || 1 === preg_match('/^woocommerce_.+_settings$/i', $option)) {
+                return false;
+            }
+            if ($transforms && self::transform_may_leak($m['table'], $option)) {
+                return false;
+            }
+        }
+        return [] !== $names[1];
+    }
+
+    /**
+     * Whether a function over the value column of $option in $table could
+     * return a credential the result mask would not see. Only the current
+     * site's options table is checked, against the stored row itself (not
+     * get_option(), which option filters can change); any other options
+     * table, sitemeta included, is refused, since its rows cannot be vouched
+     * for from here.
+     */
+    private static function transform_may_leak(string $table, string $option): bool
+    {
+        global $wpdb;
+        if (strtolower($table) !== strtolower((string) $wpdb->options)) {
+            return true;
+        }
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- the stored row, read raw so no option filter alters it; the name is a validated literal bound by prepare().
+        $raw = $wpdb->get_var($wpdb->prepare('SELECT option_value FROM %i WHERE option_name = %s', $wpdb->options, $option));
+        return null !== $raw && Secret_Options::mask_registered($option, $raw) !== $raw;
+    }
+
+    /**
+     * One lexing pass for guard_option_value_read(), the same rules as
+     * lex_identifiers(): identifiers (bare, backticked or double-quoted,
+     * lower-cased) as ['id', name], single-quoted strings as ['s', ''],
+     * every other non-space character as ['p', char]. Comments are dropped,
+     * but their words count as identifiers, as in lex_identifiers(), so a
+     * name hidden in a comment still fails closed. Null on an unterminated
+     * quote or block comment.
+     *
+     * @return array<int, array{0: string, 1: string}>|null
+     */
+    private static function lex_tokens(string $sql, bool $no_backslash_escapes, bool $strict_double_dash): ?array
+    {
+        $out = [];
+        $len = strlen($sql);
+        $i   = 0;
+
+        while ($i < $len) {
+            $c   = $sql[ $i ];
+            $two = substr($sql, $i, 2);
+
+            $dash_comment = '--' === $two
+                && (! $strict_double_dash || $i + 2 >= $len || ord($sql[ $i + 2 ]) <= 32);
+            if ('#' === $c || $dash_comment || '/*' === $two) {
+                if ('/*' === $two) {
+                    $end = strpos($sql, '*/', $i + 2);
+                    if (false === $end) {
+                        return null;
+                    }
+                    $body = substr($sql, $i + 2, $end - $i - 2);
+                    $i    = $end + 2;
+                } else {
+                    $newline = strpos($sql, "\n", $i);
+                    $end     = (false === $newline) ? $len : $newline;
+                    $body    = substr($sql, $i, $end - $i);
+                    $i       = $end + 1;
+                }
+                $words = [];
+                self::collect_words($body, $words);
+                foreach ($words as $word) {
+                    $out[] = [ 'id', $word ];
+                }
+                continue;
+            }
+
+            if ("'" === $c || '"' === $c || '`' === $c) {
+                $content = '';
+                $closed  = false;
+                $i++;
+                while ($i < $len) {
+                    $ch = $sql[ $i ];
+                    if ('`' !== $c && ! $no_backslash_escapes && '\\' === $ch) {
+                        $content .= substr($sql, $i + 1, 1);
+                        $i       += 2;
+                        continue;
+                    }
+                    if ($ch === $c) {
+                        if ($i + 1 < $len && $sql[ $i + 1 ] === $c) {
+                            $content .= $c;
+                            $i       += 2;
+                            continue;
+                        }
+                        $i++;
+                        $closed = true;
+                        break;
+                    }
+                    $content .= $ch;
+                    $i++;
+                }
+                if (! $closed) {
+                    return null;
+                }
+                $out[] = "'" === $c ? [ 's', '' ] : [ 'id', strtolower($content) ];
+                continue;
+            }
+
+            if (preg_match('/[0-9A-Za-z_$\x80-\xFF]+/A', $sql, $match, 0, $i)) {
+                $out[] = [ 'id', strtolower($match[0]) ];
+                $i    += strlen($match[0]);
+                continue;
+            }
+
+            if (ord($c) > 32) {
+                $out[] = [ 'p', $c ];
+            }
+            $i++;
+        }
+
+        return $out;
+    }
+
+    /**
+     * Whether writes to $table are refused. Defaults to the users and
+     * usermeta tables (credential/identity data with no business being
+     * touched by a generic row-write tool) and, on multisite, sitemeta;
+     * sites may extend the list via the wpmcp_db_protected_tables filter.
+     */
+    public static function is_protected(string $table): bool
+    {
+        global $wpdb;
+        $defaults = [$wpdb->users, $wpdb->usermeta];
+        if (is_multisite()) {
+            // Network options, including site_admins (the super admin list).
+            $defaults[] = $wpdb->sitemeta;
+        }
+        $protected = apply_filters('wpmcp_db_protected_tables', $defaults);
+        // The internal raw-copy stores are always protected, whatever the
+        // filter returns: update-rows and delete-rows echo the matched rows
+        // in before_image, and a write could forge an undo copy (#550).
+        return self::is_internal_store_table($table) || self::table_is_protected($table, (array) $protected);
+    }
+
+    /**
+     * Why a raw row write may not run because it reaches a post of one of
+     * WP MCP's private stores (issue #517), or null. Agent memory entries
+     * are published only by an administrator in wp-admin; with
+     * wpmcp_enable_db_writes on, update-rows on wp_posts would otherwise
+     * publish or rewrite one, insert-row would create one, an update could
+     * turn an ordinary post into one, and the meta rows that hold an entry's
+     * severity and targets could be changed under it. Chat conversations
+     * get the same rule, as everywhere else in the generic tools.
+     *
+     * $where is the write's WHERE map (empty for an insert) and $data the
+     * values it writes. The match runs against every row the WHERE selects,
+     * not the capped before-image, so a broad WHERE cannot slip past.
+     *
+     * @param array<string, mixed> $where
+     * @param array<string, mixed> $data
+     */
+    public static function store_rows_refusal(string $table, array $where, array $data): ?string
+    {
+        global $wpdb;
+
+        $types = Content_Guard::private_post_types();
+        $name  = strtolower($table);
+        $type  = null;
+
+        if (strtolower((string) $wpdb->posts) === $name) {
+            $written = isset($data['post_type']) && is_scalar($data['post_type']) ? (string) $data['post_type'] : '';
+            if (in_array($written, $types, true)) {
+                $type = $written;
+            } elseif ([] !== $where) {
+                $type = self::matched_store_type($table, $where, $types, false);
+            }
+        } elseif (strtolower((string) $wpdb->postmeta) === $name) {
+            $post_id = isset($data['post_id']) && is_numeric($data['post_id']) ? (int) $data['post_id'] : 0;
+            $written = $post_id > 0 ? (string) get_post_type($post_id) : '';
+            if (in_array($written, $types, true)) {
+                $type = $written;
+            } elseif ([] !== $where) {
+                $type = self::matched_store_type($table, $where, $types, true);
+            }
+        }
+
+        if (null === $type) {
+            return null;
+        }
+        $why = Content_Guard::store_refusal($type);
+        return 'Refusing to write rows of a WP MCP internal store (' . $type . ').' . (null === $why ? '' : ' ' . $why);
+    }
+
+    /**
+     * The private store type of any row $where selects in $table (wp_posts,
+     * or wp_postmeta joined to its post), or null when none does.
+     *
+     * @param array<string, mixed> $where
+     * @param string[]             $types
+     */
+    private static function matched_store_type(string $table, array $where, array $types, bool $meta): ?string
+    {
+        global $wpdb;
+
+        $alias      = $meta ? 'm' : 'p';
+        $conditions = [];
+        $values     = $meta ? [$table, $wpdb->posts] : [$table];
+        foreach ($where as $column => $value) {
+            if (null === $value) {
+                $conditions[] = '%i.%i IS NULL';
+                array_push($values, $alias, (string) $column);
+                continue;
+            }
+            $conditions[] = '%i.%i = %s';
+            array_push($values, $alias, (string) $column, $value);
+        }
+        $in = implode(', ', array_fill(0, count($types), '%s'));
+        foreach ($types as $type) {
+            $values[] = $type;
+        }
+
+        $from = $meta ? '%i AS m INNER JOIN %i AS p ON p.ID = m.post_id' : '%i AS p';
+        // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- the format string is assembled only from literal fragments ('%i AS p', '%i.%i = %s', a run of '%s'); every identifier and value is bound through $values, which the sniffs cannot count.
+        $sql = $wpdb->prepare('SELECT p.post_type FROM ' . $from . ' WHERE ' . implode(' AND ', $conditions) . ' AND p.post_type IN (' . $in . ') LIMIT 1', $values);
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- a guard read of the exact live rows the imminent raw write will touch, so a cache would let a stale answer through. $sql is prepared on the line above.
+        $found = $wpdb->get_var($sql);
+
+        return is_string($found) && '' !== $found ? $found : null;
+    }
+
+    /**
+     * Invalidate the object-cache entries a raw row write just made stale
+     * (issue #182).
+     *
+     * The row-write tools go straight to $wpdb, so none of the core write
+     * APIs that normally clear these caches ever run. Only users/usermeta
+     * are protected, which leaves wp_options, wp_posts, wp_postmeta and the
+     * term tables writable, and a write to any of them otherwise leaves
+     * get_option()/get_post()/get_post_meta()/get_term() serving the
+     * pre-write value for the rest of the request, and for the life of the
+     * entry under a persistent object cache.
+     *
+     * $context carries whatever the caller knows about which rows moved:
+     * 'rows' (the before-image), 'where', 'data' and, after an insert, the
+     * new row's 'insert_id' (the auto-increment key is not in the data the
+     * caller supplied, and it is what the posts/terms caches are keyed on).
+     * When the affected key can be derived from that, the invalidation is
+     * precise. When it cannot, the fallback drops the in-process cache and,
+     * for the core tables, bumps the persistent 'last_changed' key that
+     * WP_Query / get_terms() result caches hang off, so a Redis/Memcached
+     * backend does not keep serving pre-write result sets either. Note
+     * wp_options is autoloaded into a single `alloptions` blob, so the
+     * per-option key alone is not enough there.
+     *
+     * @param array{rows?: array, where?: array, data?: array, insert_id?: int} $context
+     */
+    public static function invalidate_caches(string $table, array $context = []): void
+    {
+        global $wpdb;
+
+        $name = strtolower($table);
+
+        if ($name === strtolower((string) $wpdb->options)) {
+            foreach (self::context_values($context, 'option_name') as $option) {
+                wp_cache_delete((string) $option, 'options');
+            }
+            // get_option() reads autoloaded options out of this blob, so the
+            // per-option delete above does not cover them.
+            wp_cache_delete('alloptions', 'options');
+            wp_cache_delete('notoptions', 'options');
+            return;
+        }
+
+        if ($name === strtolower((string) $wpdb->posts)) {
+            $ids = self::context_ids($context, 'ID');
+            if ([] === $ids) {
+                self::flush_runtime_cache();
+                wp_cache_set_posts_last_changed();
+                return;
+            }
+            foreach ($ids as $id) {
+                // The full core routine while the post still exists (insert,
+                // update). clean_post_cache() starts with get_post() and
+                // returns early once the row is gone, so after a delete it
+                // clears nothing: drop the per-id groups directly as well.
+                clean_post_cache((int) $id);
+                wp_cache_delete((int) $id, 'posts');
+                wp_cache_delete((int) $id, 'post_meta');
+            }
+            // Term relationships are cached per post type; the before-image
+            // is the only place that still knows the type after a delete.
+            foreach (self::context_rows($context) as $row) {
+                if (isset($row['ID'], $row['post_type'])) {
+                    clean_object_term_cache((int) $row['ID'], (string) $row['post_type']);
+                }
+            }
+            wp_cache_set_posts_last_changed();
+            return;
+        }
+
+        if ($name === strtolower((string) $wpdb->postmeta)) {
+            $ids = self::context_values($context, 'post_id');
+            if ([] === $ids) {
+                self::flush_runtime_cache();
+                return;
+            }
+            foreach ($ids as $id) {
+                wp_cache_delete((int) $id, 'post_meta');
+            }
+            return;
+        }
+
+        if ($name === strtolower((string) $wpdb->terms)) {
+            $ids = self::context_ids($context, 'term_id');
+            if ([] === $ids) {
+                self::flush_runtime_cache();
+                wp_cache_set_terms_last_changed();
+                return;
+            }
+            // Not clean_term_cache(): with no taxonomy it treats its ids as
+            // term_taxonomy_ids, which drift away from term_ids on any site
+            // that has ever shared or deleted a term, so it would clear the
+            // wrong term. A wp_terms row carries no taxonomy, so clear the
+            // 'terms' entry directly and bump last_changed, which every
+            // get_terms() result cache is keyed on.
+            foreach ($ids as $id) {
+                wp_cache_delete((int) $id, 'terms');
+            }
+            wp_cache_set_terms_last_changed();
+            return;
+        }
+
+        if ($name === strtolower((string) $wpdb->term_taxonomy)) {
+            $cleared = false;
+            // The before-image (or, on insert, the data) names both the term
+            // and its taxonomy, which is the precise form core wants.
+            foreach (self::context_rows($context) as $row) {
+                if (isset($row['term_id'], $row['taxonomy'])) {
+                    clean_term_cache((int) $row['term_id'], (string) $row['taxonomy']);
+                    $cleared = true;
+                }
+            }
+            if (! $cleared) {
+                // clean_term_cache()'s no-taxonomy form takes tt-ids, which is
+                // exactly what this table's key is.
+                $tt_ids = self::context_ids($context, 'term_taxonomy_id');
+                if ([] === $tt_ids) {
+                    self::flush_runtime_cache();
+                } else {
+                    foreach ($tt_ids as $tt_id) {
+                        clean_term_cache((int) $tt_id);
+                    }
+                }
+            }
+            wp_cache_set_terms_last_changed();
+            return;
+        }
+
+        if ($name === strtolower((string) $wpdb->term_relationships)) {
+            $object_ids = self::context_values($context, 'object_id');
+            if ([] === $object_ids) {
+                self::flush_runtime_cache();
+                wp_cache_set_terms_last_changed();
+                return;
+            }
+            // The row does not say what kind of object it links (post, user,
+            // comment...), so clear its relationship entry under every
+            // registered taxonomy; that is the per-taxonomy group
+            // clean_object_term_cache() would clear given the object type.
+            $taxonomies = get_taxonomies();
+            foreach ($object_ids as $object_id) {
+                foreach ($taxonomies as $taxonomy) {
+                    wp_cache_delete((int) $object_id, "{$taxonomy}_relationships");
+                }
+            }
+            wp_cache_set_terms_last_changed();
+            return;
+        }
+
+        if ($name === strtolower((string) $wpdb->termmeta)) {
+            $ids = self::context_values($context, 'term_id');
+            if ([] === $ids) {
+                self::flush_runtime_cache();
+                return;
+            }
+            foreach ($ids as $id) {
+                wp_cache_delete((int) $id, 'term_meta');
+            }
+            return;
+        }
+
+        if ($name === strtolower(\WPMCP\Tools\Redirects\Redirect_Store::table_name())) {
+            // The front-end redirect lookup is object-cached under a
+            // last_changed stamp; a runtime flush would not reach a
+            // persistent cache, so retire it explicitly.
+            \WPMCP\Tools\Redirects\Redirect_Store::invalidate_cache();
+            return;
+        }
+
+        // Unrecognised table (a custom or plugin table): anything could be
+        // memoized against it, so drop the runtime cache rather than guess.
+        self::flush_runtime_cache();
+    }
+
+    /**
+     * Collect the distinct values of $column from a write context, looking
+     * at the before-image rows first and then at the WHERE and data maps.
+     *
+     * @return array<int, scalar>
+     */
+    private static function context_values(array $context, string $column): array
+    {
+        $values = [];
+
+        foreach (self::context_rows($context) as $row) {
+            if (isset($row[ $column ])) {
+                $values[] = $row[ $column ];
+            }
+        }
+
+        foreach (['where'] as $bucket) {
+            $map = (array) ($context[ $bucket ] ?? []);
+            if (isset($map[ $column ]) && is_scalar($map[ $column ])) {
+                $values[] = $map[ $column ];
+            }
+        }
+
+        return array_values(array_unique(array_filter($values, 'is_scalar')));
+    }
+
+    /**
+     * context_values() for an auto-increment primary key: when nothing in
+     * the context names the key, an insert's 'insert_id' is the key.
+     *
+     * @return array<int, scalar>
+     */
+    private static function context_ids(array $context, string $column): array
+    {
+        $ids = self::context_values($context, $column);
+        if ([] === $ids && (int) ($context['insert_id'] ?? 0) > 0) {
+            $ids = [ (int) $context['insert_id'] ];
+        }
+
+        return $ids;
+    }
+
+    /**
+     * The before-image rows plus the data map treated as one more row (an
+     * insert has no before-image; its data IS the row).
+     *
+     * @return array<int, array>
+     */
+    private static function context_rows(array $context): array
+    {
+        $rows = [];
+        foreach ((array) ($context['rows'] ?? []) as $row) {
+            if (is_array($row)) {
+                $rows[] = $row;
+            }
+        }
+        $data = (array) ($context['data'] ?? []);
+        if ([] !== $data) {
+            $rows[] = $data;
+        }
+
+        return $rows;
+    }
+
+    /**
+     * Drop every in-process cache entry, leaving a persistent backend's
+     * other entries alone. Core's cache-compat shim defines
+     * wp_cache_flush_runtime() for every drop-in, so function_exists() is
+     * no test; a drop-in that does not support it would get
+     * _doing_it_wrong() and no flush at all. Those sites get the full
+     * wp_cache_flush() instead: expensive, but a stale read is the one
+     * outcome this method exists to prevent.
+     */
+    private static function flush_runtime_cache(): void
+    {
+        if (wp_cache_supports('flush_runtime')) {
+            wp_cache_flush_runtime();
+            return;
+        }
+
+        wp_cache_flush();
+    }
+
+    /**
+     * Capture the rows an equality-AND WHERE will affect, before an
+     * update/delete runs. Since issue #82 this doubles as the snapshot
+     * payload for the recoverable path (see recoverability_probe()) and,
+     * with a limit of 1 and a primary-key WHERE, as the current-row fetch
+     * used by Rollback_Service's conflict detection.
+     *
+     * @param string   $table A validated real table name.
+     * @param array    $where col => value (equality AND).
+     * @param int|null $limit Row cap; defaults to BEFORE_IMAGE_CAP.
+     */
+    public static function before_image(string $table, array $where, ?int $limit = null): array
+    {
+        global $wpdb;
+
+        if ([] === $where) {
+            return [];
+        }
+
+        $conditions = [];
+        $values     = [$table];
+        foreach ($where as $column => $value) {
+            // Match $wpdb->update()/delete() semantics exactly: a null WHERE
+            // value means "IS NULL" there, so it must here too. Rendering it
+            // as "= %s" would prepare to "= ''", capturing NOTHING while the
+            // mutation touches the NULL rows: a silently incomplete
+            // before-image behind a recoverable:true promise.
+            if (null === $value) {
+                $conditions[] = '%i IS NULL';
+                $values[]     = (string) $column;
+                continue;
+            }
+            $conditions[] = '%i = %s';
+            $values[]     = (string) $column;
+            $values[]     = $value;
+        }
+        $values[] = max(1, (int) ($limit ?? self::BEFORE_IMAGE_CAP));
+
+        // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- the format string is assembled only from the literal '%i IS NULL' / '%i = %s' fragments above; every identifier (%i) and value (%s) is bound via the $values array, which the sniff cannot count.
+        $sql = $wpdb->prepare('SELECT * FROM %i WHERE ' . implode(' AND ', $conditions) . ' LIMIT %d', $values);
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- before-image capture for the generic row tools: it must read the exact live rows the imminent write will touch, so a cache would break the recoverability promise. $sql is prepared on the line above (table and columns via %i, values via %s), which the sniffs cannot follow through the variable.
+        $rows = $wpdb->get_results($sql, ARRAY_A);
+
+        return is_array($rows) ? $rows : [];
+    }
+
+    /**
+     * The table's PRIMARY KEY column names in index order, or [] when the
+     * table declares no primary key. The PK is what makes a captured row
+     * re-identifiable at rollback time, so its absence is one of the cases
+     * where update-rows/delete-rows must stay honestly recoverable:false.
+     * SHOW KEYS output is filtered in PHP rather than with a WHERE clause so
+     * the query works identically across MySQL and MariaDB versions.
+     */
+    public static function primary_key(string $table): array
+    {
+        global $wpdb;
+
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- schema introspection (SHOW KEYS) for the rollback identity check; it must reflect the live table.
+        $rows = $wpdb->get_results($wpdb->prepare('SHOW KEYS FROM %i', $table), ARRAY_A);
+
+        $pk = [];
+        foreach ((array) $rows as $row) {
+            if ('PRIMARY' === ($row['Key_name'] ?? '')) {
+                $pk[ (int) $row['Seq_in_index'] ] = (string) $row['Column_name'];
+            }
+        }
+
+        ksort($pk);
+        return array_values($pk);
+    }
+
+    /**
+     * The table's live column names, for re-validating a db_rows snapshot
+     * against the CURRENT schema at rollback time (see
+     * Rollback_Service::apply_db_rows_snapshot()): a captured column that no
+     * longer exists means the exact restore that was promised is impossible,
+     * and a column name that never existed means the snapshot is forged.
+     */
+    public static function columns(string $table): array
+    {
+        global $wpdb;
+
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- schema introspection (SHOW COLUMNS) for snapshot re-validation at rollback time; it must reflect the live table.
+        $rows = $wpdb->get_results($wpdb->prepare('SHOW COLUMNS FROM %i', $table), ARRAY_A);
+
+        $columns = [];
+        foreach ((array) $rows as $row) {
+            $columns[] = (string) $row['Field'];
+        }
+        return $columns;
+    }
+
+    /**
+     * Decide whether an exact, snapshot-backed rollback can be PROMISED for
+     * the rows $where matches in $table, and capture the before-image either
+     * way. recoverable is true only when every condition for a faithful
+     * restore holds:
+     *  - the table has a PRIMARY KEY (rows are re-identifiable later);
+     *  - the WHERE matched no more rows than BEFORE_IMAGE_CAP (a truncated
+     *    before-image would silently restore only some of the rows);
+     *  - every captured value survives the JSON snapshot encoding losslessly
+     *    (non-UTF-8 binary bytes would be mangled by wp_json_encode, so a
+     *    "restore" would write corrupted data back).
+     * When any condition fails, 'reason' says which one, so the tool can
+     * report recoverable:false honestly instead of degrading silently.
+     *
+     * @param string $table A validated real table name.
+     * @param array  $where col => value (equality AND).
+     * @return array{recoverable:bool,reason:?string,primary_key:array,rows:array}
+     */
+    public static function recoverability_probe(string $table, array $where): array
+    {
+        $primary_key = self::primary_key($table);
+
+        // Fetch one row past the cap so truncation is detectable, then trim
+        // back to the cap so callers see the same before-image as before.
+        $rows      = self::before_image($table, $where, self::BEFORE_IMAGE_CAP + 1);
+        $truncated = count($rows) > self::BEFORE_IMAGE_CAP;
+        if ($truncated) {
+            $rows = array_slice($rows, 0, self::BEFORE_IMAGE_CAP);
+        }
+
+        $reason = null;
+        if ([] === $primary_key) {
+            $reason = 'the table has no primary key, so affected rows cannot be re-identified for rollback';
+        } elseif ($truncated) {
+            $reason = 'the WHERE matches more than ' . self::BEFORE_IMAGE_CAP
+                . ' rows (before-image cap), so a complete before-image cannot be captured';
+        } elseif (! self::rows_are_utf8($rows)) {
+            $reason = 'matched rows contain non-UTF-8 binary values that cannot be captured losslessly in a snapshot';
+        }
+
+        return [
+            'recoverable' => null === $reason,
+            'reason'      => $reason,
+            'primary_key' => $primary_key,
+            'rows'        => $rows,
+        ];
+    }
+
+    /**
+     * True when every string value in $rows is valid UTF-8. Snapshot blobs
+     * are JSON (see Snapshot::serialize()), and wp_json_encode() mangles or
+     * drops invalid-UTF-8 bytes rather than round-tripping them, so binary
+     * column content (BLOB etc.) cannot be promised back byte-for-byte.
+     */
+    public static function rows_are_utf8(array $rows): bool
+    {
+        foreach ($rows as $row) {
+            foreach ((array) $row as $value) {
+                if (is_string($value) && ! preg_match('//u', $value)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Append a structured write to the capped audit log. Every structured
+     * write lands here regardless of recoverability; for the honestly
+     * non-recoverable cases (no primary key, cap exceeded, binary values -
+     * see recoverability_probe()) the before-image captured here is the only
+     * trail a human has to manually reconstruct a change if needed.
+     *
+     * Payment gateway credentials in the before-image are masked as it is
+     * written (issue #550, PR #584 review): the log row sits in wp_options,
+     * where query can wrap option_value in CONCAT, REVERSE, TO_BASE64 or any
+     * other expression that no read-time mask can see through, and a
+     * rotated credential is no longer recognizable by value. Rollback never
+     * reads this log (it restores from the snapshot ledger, which keeps the
+     * exact copy), so masking here does not change what an undo restores.
+     */
+    public static function audit(string $operation, string $table, int $affected, array $before = []): void
+    {
+        self::mask_internal_stores();
+
+        $log = get_option(self::AUDIT_OPTION, []);
+        if (! is_array($log)) {
+            $log = [];
+        }
+
+        $log[] = [
+            'op'       => $operation,
+            'table'    => $table,
+            'affected' => $affected,
+            'before'   => self::mask_gateway_secrets($before),
+            'user'     => get_current_user_id(),
+            'time'     => time(),
+        ];
+
+        if (count($log) > self::AUDIT_MAX) {
+            $log = array_slice($log, -self::AUDIT_MAX);
+        }
+
+        update_option(self::AUDIT_OPTION, $log, false);
+    }
+
+    /**
+     * One-time pass over WP MCP's internal logs written before their values
+     * were masked on write (issue #550, PR #584 review): mask the gateway
+     * credentials in every audit log before-image, and drop the captured
+     * arguments of request log rows. Runs before query reads anything and
+     * before the next audit write. The audit log pass needs WooCommerce to
+     * recognize the credentials, so until WooCommerce is loaded it is not
+     * marked done and runs again next time.
+     */
+    public static function mask_internal_stores(): void
+    {
+        if (class_exists(\WPMCP\MCP\Request_Log::class)) {
+            \WPMCP\MCP\Request_Log::drop_legacy_arguments();
+        }
+
+        if ('1' === (string) get_option(self::AUDIT_MASKED_OPTION, '')) {
+            return;
+        }
+        if (! function_exists('WC') || ! class_exists('WC_Payment_Gateway')) {
+            return;
+        }
+
+        $log = get_option(self::AUDIT_OPTION, []);
+        if (is_array($log) && [] !== $log) {
+            $changed = false;
+            foreach ($log as $index => $entry) {
+                if (! is_array($entry) || ! is_array($entry['before'] ?? null)) {
+                    continue;
+                }
+                $masked = self::mask_gateway_secrets($entry['before']);
+                if ($masked !== $entry['before']) {
+                    $log[ $index ]['before'] = $masked;
+                    $changed                 = true;
+                }
+            }
+            if ($changed) {
+                update_option(self::AUDIT_OPTION, $log, false);
+            }
+        }
+
+        update_option(self::AUDIT_MASKED_OPTION, '1', false);
+    }
+
+    /**
+     * Every string in $data with the payment gateway credentials stored now
+     * replaced by the mask, element by element (issue #550). For logs that
+     * keep caller input, such as the request log's captured arguments,
+     * recorded after the call ran, so a credential that call just stored is
+     * already among the stored values.
+     *
+     * @param array<mixed> $data
+     * @return array<mixed>
+     */
+    public static function scrub_gateway_secrets_in(array $data): array
+    {
+        if (! function_exists('WC') || ! class_exists('WC_Payment_Gateway')) {
+            return $data;
+        }
+        $secrets = self::gateway_secret_values([]);
+        if ([] === $secrets) {
+            return $data;
+        }
+        array_walk_recursive(
+            $data,
+            static function (&$item) use ($secrets): void {
+                if (is_string($item)) {
+                    $item = self::scrub_gateway_secrets($item, $secrets);
+                }
+            }
+        );
+        return $data;
+    }
+}

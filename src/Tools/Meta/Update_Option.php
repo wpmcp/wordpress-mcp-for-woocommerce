@@ -1,0 +1,97 @@
+<?php
+
+namespace WPMCP\Tools\Meta;
+
+use WPMCP\Safety\Safe_Mutation;
+
+if (! defined('ABSPATH')) {
+    exit;
+}
+
+/**
+ * Update a single wp_options value by name. Refuses the same Option_Guard
+ * denylist as Get_Option (sensitive/core option names), and is disabled by
+ * default: unlike the allowlisted Update_Settings tool, this writes to any
+ * option name, so a site must explicitly opt in with
+ * add_filter('wpmcp_enable_option_write', '__return_true') before any write
+ * is allowed at all, matching the disabled-by-default pattern used for
+ * other broad/destructive tools (delete-post force-delete, raw DB writes).
+ *
+ * The write routes through Safe_Mutation with object_type 'option', reusing
+ * the existing option snapshot/rollback path (Update_Settings already
+ * exercises this same object_type), so it is undoable via
+ * rollback-operation regardless of whether the option previously existed.
+ */
+class Update_Option
+{
+    public static function is_enabled(): bool
+    {
+        return (bool) apply_filters('wpmcp_enable_option_write', false);
+    }
+
+    public function handle(array $args): array
+    {
+        $name = isset($args['name']) ? (string) $args['name'] : '';
+        if ('' === $name) {
+            throw new \InvalidArgumentException('An option name is required.');
+        }
+
+        if (! Option_Guard::is_plain_name($name)) {
+            throw new \RuntimeException('Refusing to write an option whose name contains non-ASCII, control or invisible characters: it can match a different row than it appears to.');
+        }
+
+        if (Option_Guard::is_denylisted($name)) {
+            throw new \RuntimeException(sprintf('Refusing to write sensitive option "%s".', esc_html($name)));
+        }
+
+        if (! self::is_enabled()) {
+            throw new \WPMCP\MCP\Opt_In_Required('Option writes are disabled.', 'wpmcp_enable_option_write');
+        }
+
+        // get-option masks credentials (a payment gateway's, the secret
+        // registry's, secret-looking keys: issues #507, #865), so a value
+        // written back from that read keeps each masked one as stored
+        // instead of saving the mask over it.
+        $value = Secret_Options::unmask_option($name, $args['value'] ?? '');
+
+        // An option that holds structured data (an array or object) keeps
+        // that type unless the caller asks to change it (issue #729): a
+        // settings array silently replaced by text breaks the plugin that
+        // reads it.
+        $missing = new \stdClass();
+        $current = get_option($name, $missing);
+        if (
+            $missing !== $current
+            && (is_array($current) || is_object($current))
+            && ! (is_array($value) || is_object($value))
+            && true !== filter_var($args['allow_type_change'] ?? false, FILTER_VALIDATE_BOOLEAN)
+        ) {
+            throw new \RuntimeException(sprintf(
+                'Refusing to replace option "%1$s": it holds structured data (%2$s), and the new value (type %3$s) would change its type. Send the value as an object or array, or pass allow_type_change: true to replace it on purpose.',
+                esc_html($name),
+                is_array($current) ? 'an array' : 'an object',
+                esc_html(gettype($value))
+            ));
+        }
+
+        $out = Safe_Mutation::run(
+            [
+                'object_type' => 'option',
+                'object_id'   => $name,
+                'session_id'  => (string) ($args['session_id'] ?? 'default'),
+                'tool_name'   => 'update-option',
+                'args'        => $args,
+            ],
+            function () use ($name, $value): void {
+                update_option($name, $value);
+            }
+        );
+
+        return [
+            'name'         => $name,
+            'value'        => Secret_Options::mask_option($name, get_option($name)),
+            'operation_id' => $out['operation_id'],
+            'recoverable'  => true,
+        ];
+    }
+}

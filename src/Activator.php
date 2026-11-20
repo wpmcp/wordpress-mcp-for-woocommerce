@@ -1,0 +1,44 @@
+<?php
+
+// phpcs:disable PSR1.Files.SideEffects.FoundWithSymbols -- ABSPATH guard is an intentional side effect.
+
+namespace WPMCP;
+
+use WPMCP\Auth\OAuth_Config;
+use WPMCP\Auth\Oauth_Gc;
+use WPMCP\Tools\Backup\Backup_Schedule;
+
+if (! defined('ABSPATH')) {
+    exit;
+}
+
+class Activator
+{
+    /** @param bool $network_wide Passed by core for a network activation. */
+    public static function activate($network_wide = false): void
+    {
+        // Every per-site table (snapshots, redirects, search index), on every
+        // site of the network for a network activation (issue #527): each
+        // table uses the site's prefix, so the main site's copy serves no
+        // other site. Site_Tables also covers sites created later and sites
+        // still missing them.
+        Site_Tables::install_all((bool) $network_wide);
+
+        // Daily OAuth store sweep (issue #133). Only scheduled when the
+        // OAuth subsystem is actually on; boot() re-ensures it if OAuth is
+        // enabled later, and unschedules it if it is turned back off.
+        //
+        // Deactivation clears every plugin cron event (issue #468), so this
+        // is also where the recurring ones come back: the OAuth sweep while
+        // OAuth is on, and each backup schedule still in its option, at its
+        // configured time. Background jobs were canceled, so none returns.
+        Cron_Registry::for_each_site((bool) $network_wide, static function (): void {
+            if (OAuth_Config::is_enabled()) {
+                Oauth_Gc::ensure_scheduled();
+            }
+            if (class_exists(Backup_Schedule::class)) {
+                Backup_Schedule::restore();
+            }
+        });
+    }
+}

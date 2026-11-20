@@ -1,0 +1,74 @@
+<?php
+
+namespace WPMCP\MCP;
+
+if (! defined('ABSPATH')) {
+    exit;
+}
+
+/**
+ * The refusal a confirm gate throws when a call lacks confirm:true
+ * (issue #387).
+ *
+ * It is still an InvalidArgumentException, so every caller that caught the
+ * old refusal behaves exactly as before. The type is what lets a transport
+ * tell "this needs the user's confirmation" apart from every other refusal
+ * and, on a client that supports elicitation, ask the user instead of
+ * failing the call (see Elicitation).
+ */
+class Confirmation_Required extends \InvalidArgumentException
+{
+    /** The refusal most recently seen leaving an ability, until taken. */
+    private static ?self $observed = null;
+
+    /** Whether a client's elicitation answer may stand in for confirm:true. */
+    private bool $elicitable = true;
+
+    /**
+     * A refusal for an action that cannot be undone (issue #886): only
+     * confirm:true in the call's own arguments satisfies it. A client set to
+     * skip permission prompts can answer an elicitation by itself, so the
+     * transport reports this refusal instead of turning it into a question.
+     */
+    public static function in_arguments(string $message): self
+    {
+        $refusal             = new self($message . ' ' . self::IN_ARGUMENTS_NOTE);
+        $refusal->elicitable = false;
+
+        return $refusal;
+    }
+
+    /** What an in_arguments() refusal adds to its own message. */
+    public const IN_ARGUMENTS_NOTE = 'This cannot be undone, so confirm:true must be in the call\'s own arguments; a confirmation answered through the client does not count.';
+
+    /** Whether the transport may ask the person instead of refusing. */
+    public function elicitable(): bool
+    {
+        return $this->elicitable;
+    }
+
+    /**
+     * Records a refusal as it leaves an ability's callback.
+     *
+     * Anything an ability callback throws comes back as a generic
+     * ability_callback_exception WP_Error, which drops the type (core does
+     * it on WordPress 7.1, Registrar::throttled() on every version, issue
+     * #612). Registrar::throttled() is the last place every ability's
+     * exception is still typed, so it reports the refusal here before
+     * turning it into that WP_Error, and the transport reads it back with
+     * take() after the call.
+     */
+    public static function observe(self $refusal): void
+    {
+        self::$observed = $refusal;
+    }
+
+    /** The observed refusal, if any, clearing it. */
+    public static function take(): ?self
+    {
+        $refusal        = self::$observed;
+        self::$observed = null;
+
+        return $refusal;
+    }
+}

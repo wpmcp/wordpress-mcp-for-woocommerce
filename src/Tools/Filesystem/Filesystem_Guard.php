@@ -1,0 +1,440 @@
+<?php
+
+namespace WPMCP\Tools\Filesystem;
+
+if (! defined('ABSPATH')) {
+    exit;
+}
+
+/**
+ * Security core for the filesystem tools: confines every path to the
+ * WordPress install root (ABSPATH in production; a temp fixture root in
+ * tests), refuses protected files, and backs up before destructive writes.
+ *
+ * resolve_path() is the one chokepoint that makes "inside the WordPress
+ * install only" true, so every rejection case is exercised exhaustively by
+ * FilesystemGuardTest, including a real symlink escaping the root.
+ */
+class Filesystem_Guard
+{
+    public const AUDIT_OPTION = 'wpmcp_fs_write_audit_log';
+    public const AUDIT_MAX    = 100;
+    public const BACKUP_DIR   = 'wpmcp-fs-backups';
+
+    /**
+     * Confine a path to $root (defaults to ABSPATH). Returns the canonical
+     * absolute path, or a WP_Error when the path is invalid or escapes root.
+     *
+     * @return string|\WP_Error
+     */
+    public static function resolve_path(string $path, ?string $root = null)
+    {
+        $root = $root ?? ABSPATH;
+
+        if ('' === $path || false !== strpos($path, "\0")) {
+            return new \WP_Error('invalid_path', 'Invalid file path.');
+        }
+
+        $is_absolute = ('' !== $path) && (
+            '/' === $path[0]
+            || '\\' === $path[0]
+            || 1 === preg_match('#^[A-Za-z]:[\\\\/]#', $path)
+        );
+        $candidate = $is_absolute
+            ? $path
+            : rtrim($root, '/\\') . DIRECTORY_SEPARATOR . ltrim($path, '/\\');
+
+        $real = realpath($candidate);
+        if (false === $real) {
+            // is_link() (not file_exists()) so a dangling symlink leaf -
+            // one whose target does not exist - is still caught here;
+            // file_exists() follows the link and returns false for those,
+            // which would let the check below be skipped entirely.
+            if (is_link($candidate)) {
+                return new \WP_Error('outside_root', 'Path is outside the WordPress installation.');
+            }
+            $parent = realpath(dirname($candidate));
+            if (false === $parent) {
+                return new \WP_Error('parent_missing', 'The target directory does not exist.');
+            }
+            $real = rtrim($parent, '/\\') . DIRECTORY_SEPARATOR . basename($candidate);
+        }
+
+        $root_real = realpath($root);
+        if (false === $root_real) {
+            $root_real = $root;
+        }
+
+        $real_n = rtrim($real, '/\\');
+        $root_n = rtrim($root_real, '/\\');
+        if ($real_n !== $root_n && 0 !== strpos($real_n, $root_n . DIRECTORY_SEPARATOR)) {
+            return new \WP_Error('outside_root', 'Path is outside the WordPress installation.');
+        }
+
+        return $real;
+    }
+
+    /**
+     * Constants whose literal value in a PHP file is a site secret: the
+     * database password and the eight authentication keys and salts.
+     */
+    public const SECRET_CONSTANTS = [
+        'DB_PASSWORD', 'AUTH_KEY', 'SECURE_AUTH_KEY', 'LOGGED_IN_KEY', 'NONCE_KEY',
+        'AUTH_SALT', 'SECURE_AUTH_SALT', 'LOGGED_IN_SALT', 'NONCE_SALT',
+    ];
+
+    /** The values wp-config-sample.php ships with, which are not secrets. */
+    private const SECRET_PLACEHOLDERS = ['password_here', 'put your unique phrase here'];
+
+    /**
+     * Whether a path is protected from every file tool (read, search, list,
+     * write, edit, delete), matched case-insensitively on the basename.
+     *
+     * wp-config.php and .htaccess, plus (issue #606) every other name that
+     * starts with wp-config: the copies people, editors and migration tools
+     * leave behind (wp-config.php.bak, wp-config.old, wp-config-backup.php,
+     * wp-config.php~ ...) hold the same password and salts. Only core's
+     * wp-config-sample.php is left open. The wp-config rule is not
+     * filterable; wpmcp_fs_protected_paths can only add exact names.
+     * A copy under any other name is caught by holds_wp_secrets(). Every
+     * site backup folder is protected too (in_site_backup_dir()).
+     */
+    public static function is_protected(string $abs): bool
+    {
+        // Every site backup folder (issue #550).
+        if (self::in_site_backup_dir($abs)) {
+            return true;
+        }
+
+        // Every wp-config copy except core's sample (issue #606).
+        $base = strtolower(basename($abs));
+        if (0 === strpos($base, 'wp-config') && 'wp-config-sample.php' !== $base) {
+            return true;
+        }
+        $protected = ['wp-config.php', '.htaccess'];
+        /** Filter the write/delete-protected basenames. */
+        $protected = (array) apply_filters('wpmcp_fs_protected_paths', $protected, $abs);
+        return in_array($base, array_map('strtolower', $protected), true);
+    }
+
+    /** The site backup directory under uploads (Site_Backup_Dir::DIR_NAME). */
+    private const SITE_BACKUP_DIR = 'wpmcp-site-backups';
+
+    /**
+     * Whether $abs is a site backup directory or inside one (issue #550).
+     * It holds full database dumps (the archives, and while a backup or
+     * restore runs, or after one dies, the plaintext .sql they are built
+     * from or extracted to): every option and row, payment gateway
+     * credentials and password hashes included. The generic file tools
+     * never read, list, search, write or delete it, whatever the
+     * wpmcp_fs_protected_paths filter says; the backup tools are the way in.
+     *
+     * Any path with a segment named wpmcp-site-backups (case-insensitive)
+     * counts, not only the current site's folder (PR #584 review): on a
+     * network the file tools are gated at site-level manage_options and
+     * confined to ABSPATH, so a sub-site admin could otherwise reach the
+     * main site's folder, which holds the whole network's dump, or another
+     * site's. Over-matching a look-alike folder only refuses more.
+     */
+    public static function in_site_backup_dir(string $abs): bool
+    {
+        $segments = explode('/', strtolower(str_replace('\\', '/', $abs)));
+        if (in_array(self::SITE_BACKUP_DIR, $segments, true)) {
+            return true;
+        }
+
+        // The canonical form too, in case a symlinked parent hides the name.
+        $real = realpath($abs);
+        if (false !== $real && $real !== $abs) {
+            $segments = explode('/', strtolower(str_replace('\\', '/', $real)));
+            return in_array(self::SITE_BACKUP_DIR, $segments, true);
+        }
+        return false;
+    }
+
+    /**
+     * Pure (issue #606): does this file content define DB_PASSWORD or one of
+     * the keys and salts as a real literal, the way wp-config.php does?
+     *
+     * Read on PHP tokens, so a constant named only in a comment or a string
+     * (pluggable.php's docblock example salts) does not count, nor does a
+     * value read from the environment or a variable (setup-config.php), nor
+     * wp-config-sample.php's placeholders or an empty value. Text without an
+     * open tag is read as PHP too, so a wp-config.txt copy is caught.
+     * Cheap for ordinary files: nothing is tokenized unless one of the
+     * constant names appears in the text.
+     */
+    public static function holds_wp_secrets(string $content): bool
+    {
+        $named = false;
+        foreach (self::SECRET_CONSTANTS as $constant) {
+            if (false !== stripos($content, $constant)) {
+                $named = true;
+                break;
+            }
+        }
+        if (! $named) {
+            return false;
+        }
+
+        if (false === stripos($content, '<?php') && false === strpos($content, '<?=')) {
+            $content = '<?php ' . $content;
+        }
+
+        $tokens = [];
+        foreach (token_get_all($content) as $token) {
+            if (is_array($token) && in_array($token[0], [T_WHITESPACE, T_COMMENT, T_DOC_COMMENT], true)) {
+                continue;
+            }
+            $tokens[] = $token;
+        }
+
+        $secret_names = array_map('strtolower', self::SECRET_CONSTANTS);
+        $is_name      = static function ($token, string $text): bool {
+            return is_array($token) && in_array($token[0], [T_STRING, T_NAME_FULLY_QUALIFIED], true)
+                && strtolower(ltrim($token[1], '\\')) === $text;
+        };
+        $literal      = static function ($token): ?string {
+            if (is_array($token) && T_CONSTANT_ENCAPSED_STRING === $token[0]) {
+                return substr($token[1], 1, -1);
+            }
+            return null;
+        };
+        $is_secret_value = static function ($token): bool {
+            if (is_array($token) && T_START_HEREDOC === $token[0]) {
+                return true;
+            }
+            $value = null;
+            if (is_array($token) && T_CONSTANT_ENCAPSED_STRING === $token[0]) {
+                $value = substr($token[1], 1, -1);
+            }
+            return null !== $value && '' !== trim($value)
+                && ! in_array(strtolower(trim($value)), self::SECRET_PLACEHOLDERS, true);
+        };
+
+        $count = count($tokens);
+        for ($i = 0; $i < $count; $i++) {
+            // define( 'NAME', 'value' ... )
+            if ($is_name($tokens[$i], 'define') && '(' === ($tokens[$i + 1] ?? null)) {
+                $name      = $literal($tokens[$i + 2] ?? null);
+                $is_secret = null !== $name && in_array(strtolower($name), $secret_names, true);
+                if ($is_secret && ',' === ($tokens[$i + 3] ?? null) && $is_secret_value($tokens[$i + 4] ?? null)) {
+                    return true;
+                }
+            }
+            // const NAME = 'value';
+            if (is_array($tokens[$i]) && T_CONST === $tokens[$i][0]) {
+                $name_token = $tokens[$i + 1] ?? null;
+                $is_secret  = is_array($name_token) && in_array(strtolower($name_token[1]), $secret_names, true);
+                if ($is_secret && '=' === ($tokens[$i + 2] ?? null) && $is_secret_value($tokens[$i + 3] ?? null)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Pure: a sanitized, timestamped backup filename for a relative path.
+     */
+    public static function backup_name(string $rel, string $timestamp): string
+    {
+        $flat = str_replace(['/', '\\'], '-', ltrim($rel, '/\\'));
+        $flat = preg_replace('/[^A-Za-z0-9._-]/', '-', $flat);
+        return $timestamp . '-' . $flat;
+    }
+
+    /**
+     * Pure: is $content valid UTF-8 text (vs binary)?
+     */
+    public static function is_utf8(string $content): bool
+    {
+        if ('' === $content) {
+            return true;
+        }
+        if (false !== strpos($content, "\0")) {
+            return false;
+        }
+        return (bool) preg_match('//u', $content);
+    }
+
+    /**
+     * The capability the read tools (read-file, list-directory,
+     * search-files) are registered with (issue #559). On multisite ABSPATH
+     * holds every site's files (other sites' uploads, private exports,
+     * backups, debug.log) and core gives a sub-site administrator no file
+     * access, so reads take manage_network_options there, like the write
+     * tools whose edit_files is super-admin only on multisite.
+     * manage_network_options rather than edit_files so DISALLOW_FILE_EDIT
+     * keeps blocking writes without also blocking a super admin's reads.
+     */
+    public static function read_capability(): string
+    {
+        return is_multisite() ? 'manage_network_options' : 'manage_options';
+    }
+
+    /**
+     * Repeat the read gate inside the handlers, so a path that reaches them
+     * without the ability permission check is refused too. Single site is
+     * unchanged, and a request with no signed-in user is let through as in
+     * Network_Scope: no ability can reach a handler without the gate.
+     *
+     * @throws \RuntimeException When a signed-in user on multisite lacks the network capability.
+     */
+    public static function assert_reads_allowed(): void
+    {
+        if (! is_multisite() || 0 === get_current_user_id() || current_user_can('manage_network_options')) {
+            return;
+        }
+
+        throw new \RuntimeException('On a multisite network the files belong to every site, so reading them needs a network administrator (manage_network_options).');
+    }
+
+    /**
+     * Pure: gate write/edit/delete on the edit_files capability and honor
+     * DISALLOW_FILE_EDIT.
+     *
+     * @return true|\WP_Error
+     */
+    public static function check_writes(bool $can_edit_files, bool $disallow_file_edit)
+    {
+        if ($disallow_file_edit) {
+            return new \WP_Error('file_edit_disabled', 'File editing is disabled on this site (DISALLOW_FILE_EDIT).');
+        }
+        if (! $can_edit_files) {
+            return new \WP_Error('file_edit_disabled', 'You do not have permission to edit files.');
+        }
+        return true;
+    }
+
+    /**
+     * Live wrapper: gate writes from the current request context.
+     *
+     * @return true|\WP_Error
+     */
+    public static function writes_allowed()
+    {
+        return self::check_writes(
+            current_user_can('edit_files'),
+            defined('DISALLOW_FILE_EDIT') && DISALLOW_FILE_EDIT
+        );
+    }
+
+    /**
+     * Path relative to $root (defaults to ABSPATH), for display/log/output.
+     * $root is a parameter only so tests can point it at a fixture root.
+     *
+     * Tries the raw (un-canonicalized) root first, then falls back to its
+     * realpath() form. Paths built from WP_CONTENT_DIR/wp_upload_dir() are
+     * derived from the raw ABSPATH constant, not its realpath(); when
+     * ABSPATH's directory is itself reached via a symlink (e.g. macOS'
+     * /tmp -> /private/tmp), realpath(ABSPATH) resolves through the
+     * symlink while $abs typically does not, so comparing only the
+     * canonical form would fail to strip a prefix that is, in fact, the
+     * same install root.
+     */
+    public static function to_relative(string $abs, ?string $root = null): string
+    {
+        $root  = $root ?? ABSPATH;
+        $abs_n = $abs;
+
+        foreach ([rtrim($root, '/\\'), rtrim((string) realpath($root), '/\\')] as $candidate) {
+            if ('' !== $candidate && 0 === strpos($abs_n, $candidate)) {
+                $abs_n = ltrim(substr($abs_n, strlen($candidate)), '/\\');
+                break;
+            }
+        }
+
+        return str_replace('\\', '/', $abs_n);
+    }
+
+    /**
+     * Copy $abs to a timestamped backup file inside $backup_dir. Returns the
+     * backup's absolute path, or '' if $abs does not exist yet (a create,
+     * not an overwrite, has nothing to back up). $root is used only to
+     * compute the relative name via backup_name()/to_relative().
+     *
+     * @return string|\WP_Error
+     */
+    public static function backup_to_dir(string $abs, string $backup_dir, string $root, string $timestamp)
+    {
+        if (! is_file($abs)) {
+            return '';
+        }
+        $rel  = self::to_relative($abs, $root);
+        $name = self::backup_name($rel, $timestamp);
+        $dest = rtrim($backup_dir, '/\\') . DIRECTORY_SEPARATOR . $name;
+        if (! copy($abs, $dest)) {
+            return new \WP_Error('backup_failed', 'Could not back up the file before writing.');
+        }
+        return $dest;
+    }
+
+    /**
+     * Restore a backup over its original target, making a write/edit/delete
+     * recoverable. Returns whether the copy succeeded.
+     */
+    public static function restore(string $backup_abs, string $target_abs): bool
+    {
+        if (! is_file($backup_abs)) {
+            // Renamed to a non-executable name by the upgrade (issue #622).
+            $renamed = Legacy_Backup_Migration::renamed_path($backup_abs);
+            if (null === $renamed) {
+                return false;
+            }
+            $backup_abs = $renamed;
+        }
+        return copy($backup_abs, $target_abs);
+    }
+
+    /**
+     * Live wrapper: back up $abs (an already resolve_path()'d absolute path)
+     * to a timestamped file under wp-content/uploads/wpmcp-fs-backups/,
+     * creating that directory (and blocking direct web access to it) on
+     * first use. Returns the backup path, '' if $abs does not exist yet, or
+     * a WP_Error if the uploads directory or the copy itself is unavailable.
+     *
+     * @return string|\WP_Error
+     */
+    public static function backup(string $abs)
+    {
+        if (! is_file($abs)) {
+            return '';
+        }
+        $uploads = wp_upload_dir();
+        if (! empty($uploads['error'])) {
+            return new \WP_Error('no_uploads', 'Uploads directory is unavailable for backups.');
+        }
+        $dir = trailingslashit($uploads['basedir']) . self::BACKUP_DIR;
+        if (! wp_mkdir_p($dir)) {
+            return new \WP_Error('backup_dir', 'Could not create the backup directory.');
+        }
+        if (! is_file($dir . '/.htaccess')) {
+            @file_put_contents($dir . '/.htaccess', "Require all denied\n");
+            @file_put_contents($dir . '/index.html', '');
+        }
+        return self::backup_to_dir($abs, $dir, ABSPATH, gmdate('Ymd-His'));
+    }
+
+    /**
+     * Append a write/edit/delete to the capped audit log option.
+     */
+    public static function log(string $op, string $rel_path): void
+    {
+        $log = get_option(self::AUDIT_OPTION, []);
+        if (! is_array($log)) {
+            $log = [];
+        }
+        $log[] = [
+            'op'   => $op,
+            'path' => $rel_path,
+            'user' => get_current_user_id(),
+            'time' => time(),
+        ];
+        if (count($log) > self::AUDIT_MAX) {
+            $log = array_slice($log, -self::AUDIT_MAX);
+        }
+        update_option(self::AUDIT_OPTION, $log, false);
+    }
+}

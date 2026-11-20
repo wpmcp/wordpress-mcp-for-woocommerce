@@ -1,0 +1,67 @@
+<?php
+
+namespace WPMCP\Tools\Packages;
+
+use WPMCP\Safety\Safe_Mutation;
+
+if (! defined('ABSPATH')) {
+    exit;
+}
+
+/**
+ * Deactivate a plugin.
+ *
+ * This only ever changes the 'active_plugins' option, so it is routed
+ * through Safe_Mutation with object_type 'option': the prior active_plugins
+ * list is snapshotted before the write, and rollback-operation can restore
+ * it exactly (undoing the deactivation) with a single call.
+ *
+ * Protected packages (wpmcp itself, Elementor free/pro) refuse outright:
+ * see Package_Guard.
+ *
+ * On a multisite network a plugin active for the network is only
+ * deactivated network-wide, by a network admin passing network_wide: true;
+ * see Plugin_Network_Scope.
+ */
+class Deactivate_Plugin
+{
+    public function handle(array $args): array
+    {
+        $plugin = isset($args['plugin']) ? (string) $args['plugin'] : '';
+        if ('' === $plugin) {
+            throw new \InvalidArgumentException('A plugin file is required.');
+        }
+
+        if (Package_Guard::is_protected_plugin($plugin)) {
+            throw new \RuntimeException(esc_html(Package_Guard::protected_plugin_refusal('deactivate', $plugin)));
+        }
+
+        if (! function_exists('deactivate_plugins')) {
+            require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        }
+
+        $network_wide = Plugin_Network_Scope::for_deactivation($plugin, $args);
+
+        // Serialised with activations and given a state probe for the same
+        // reason as activate-plugin (issue #728).
+        $out = Plugin_State::locked(static function () use ($plugin, $network_wide, $args) {
+            return Safe_Mutation::run(
+                [
+                    'object_type'         => 'option',
+                    'object_id'           => 'active_plugins',
+                    'object_ref'          => $plugin,
+                    'state_probe'         => [ Plugin_State::class, 'probe' ],
+                    'session_id'          => (string) ($args['session_id'] ?? 'default'),
+                    'tool_name'           => 'deactivate-plugin',
+                    'args'                => $args,
+                    'extra_snapshot_data' => [ 'restore_capability' => 'activate_plugins' ] + Plugin_Network_Scope::snapshot_data($network_wide),
+                ],
+                function () use ($plugin, $network_wide): void {
+                    deactivate_plugins([$plugin], false, $network_wide);
+                }
+            );
+        });
+
+        return ['operation_id' => $out['operation_id'], 'plugin' => $plugin, 'deactivated' => true, 'network_wide' => $network_wide];
+    }
+}

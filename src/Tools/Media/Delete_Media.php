@@ -1,0 +1,111 @@
+<?php
+
+namespace WPMCP\Tools\Media;
+
+use WPMCP\Safety\{File_Backup, Safe_Mutation};
+
+if (! defined('ABSPATH')) {
+    exit;
+}
+
+class Delete_Media
+{
+    /**
+     * Destructive and disabled by default: sites must opt in with
+     * add_filter('wpmcp_enable_delete_media', '__return_true') before this
+     * tool will run at all, in addition to the caller passing confirm:true.
+     */
+    public static function is_enabled(): bool
+    {
+        return (bool) apply_filters('wpmcp_enable_delete_media', false);
+    }
+
+    public function handle(array $args): array
+    {
+        if (! self::is_enabled()) {
+            throw new \WPMCP\MCP\Opt_In_Required('The delete-media tool is disabled.', 'wpmcp_enable_delete_media');
+        }
+
+        $media_id = (int) ($args['media_id'] ?? 0);
+        $post     = $media_id ? get_post($media_id) : null;
+        if (! $post) {
+            throw new \InvalidArgumentException('Media not found');
+        }
+        if ('attachment' !== $post->post_type) {
+            throw new \InvalidArgumentException('That ID is not a media attachment.');
+        }
+        if (true !== ($args['confirm'] ?? null)) {
+            throw new \WPMCP\MCP\Confirmation_Required('Deleting media is permanent. Pass confirm:true to proceed.');
+        }
+
+        $force = ! empty($args['force']);
+
+        // WordPress only trashes attachments (reversible via its own trash,
+        // like Delete_Post's default path) when MEDIA_TRASH is defined
+        // truthy AND force wasn't requested. Most sites never define that
+        // constant, so without it this "default" delete is a real permanent
+        // delete, not a reversible trash. Snapshot it via Safe_Mutation
+        // whenever it isn't genuinely covered by WordPress's own trash;
+        // only skip the snapshot when native trash already makes it
+        // reversible for free.
+        $covered_by_native_trash = ! $force && defined('MEDIA_TRASH') && MEDIA_TRASH;
+
+        if ($covered_by_native_trash) {
+            wp_delete_attachment($media_id, false);
+            return ['media_id' => $media_id, 'deleted' => 'trashed', 'files_recoverable' => true];
+        }
+
+        // Back up the physical files (main file + every intermediate size)
+        // BEFORE the mutation unlinks them, so the resulting manifest can
+        // be attached to the snapshot Safe_Mutation is about to persist.
+        // The operation_id is generated here, rather than inside
+        // Safe_Mutation::run(), because the backup directory is keyed by
+        // it and must exist before the mutation runs.
+        $operation_id = wp_generate_uuid4();
+        $files        = File_Backup::collect_attachment_files($media_id);
+        $manifest     = File_Backup::backup($operation_id, $files);
+
+        // Any file the backup could not copy is gone for good once the
+        // delete runs, so rollback would bring back a record pointing at a
+        // missing file. Refuse unless the caller accepts that explicitly,
+        // and never report such a delete as recoverable.
+        $unrecoverable = array_values(array_map('wp_basename', array_diff($files, array_keys($manifest))));
+        if ($unrecoverable && true !== ($args['allow_unrecoverable_files'] ?? null)) {
+            File_Backup::delete_backup_dir($operation_id);
+            throw new \RuntimeException(sprintf(
+                'Nothing was deleted: these files could not be backed up, so rollback could not restore them: %s. Pass allow_unrecoverable_files:true to delete anyway.',
+                esc_html(implode(', ', $unrecoverable))
+            ));
+        }
+
+        $out = Safe_Mutation::run(
+            [
+                'object_type'         => 'post',
+                'object_id'           => $media_id,
+                'session_id'          => (string) ($args['session_id'] ?? 'default'),
+                'tool_name'           => 'delete-media',
+                'args'                => $args,
+                'operation_id'        => $operation_id,
+                'extra_snapshot_data' => $manifest ? ['files' => ['operation_id' => $operation_id, 'manifest' => $manifest]] : [],
+            ],
+            function () use ($media_id, $force) {
+                wp_delete_attachment($media_id, $force);
+                return true;
+            }
+        );
+
+        // The physical file(s) are backed up above, so rollback restores
+        // both the DB record and the bytes on disk. See issue #24.
+        $result = [
+            'operation_id'      => $out['operation_id'],
+            'media_id'          => $media_id,
+            'deleted'           => 'deleted',
+            'files_recoverable' => ! $unrecoverable,
+        ];
+        if ($unrecoverable) {
+            $result['unrecoverable_files'] = $unrecoverable;
+            $result['warning']             = 'Rollback restores the attachment record, but not the files listed in unrecoverable_files.';
+        }
+        return $result;
+    }
+}
