@@ -51,11 +51,11 @@ Snapshots are per-operation undo, not full-site backups. Keep your backup plugin
 - PHP 8.1 or later
 - WooCommerce active
 
-## Want Elementor, Bricks, Divi and more?
+## Want Elementor, Bricks, Divi and unlimited undo history?
 
-The full WP MCP plugin adds page-builder depth (Elementor, Bricks, Divi), more integrations, and custom widget and block building. It replaces this plugin in place.
+The full WP MCP plugin adds page-builder depth (Elementor, Bricks, Divi), more integrations, and custom widget and block building. With a Pro licence it keeps unlimited undo history (this plugin keeps your last 20 undo points). It replaces this plugin in place.
 
-**[See WP MCP Pro plans](https://wpmcp-pro.com/pricing)** | [Full plugin repo: wpmcp/wordpress-mcp](https://github.com/wpmcp/wordpress-mcp)
+**[See WP MCP Pro plans](https://wpmcp-pro.com/pricing?coupon=WPMCPGIT&utm_source=github&utm_medium=readme&utm_content=woocommerce)** (code `WPMCPGIT` takes 10% off) | [Full plugin repo: wpmcp/wordpress-mcp](https://github.com/wpmcp/wordpress-mcp)
 
 ## Privacy
 
