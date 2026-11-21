@@ -793,13 +793,17 @@ final class Plugin
         // pending-proposal bubble, and the bubble must appear once. Passing
         // the parent's own slug suppresses the auto-copy (see add_submenu_page)
         // and keeps this entry's label exactly what it has always rendered as.
+        // No callback here: this entry shares the parent's slug, so both
+        // resolve to the toplevel_page_wpmcp hook, and add_menu_page above
+        // already attached History_Page::render to it. A second callback
+        // printed the screen twice, and with it the Restore script, so one
+        // click sent two restore requests.
         add_submenu_page(
             'wpmcp',
             self::BRAND,
             self::BRAND,
             Management_Access::CAPABILITY,
-            'wpmcp',
-            [new History_Page(), 'render']
+            'safe-mcp-for-woocommerce'
         );
 
         // Same management gate as the top-level page and Restore_Controller's
