@@ -2,6 +2,7 @@
 
 namespace WPMCP\Tools;
 
+use WPMCP\Safety\Kses_Safety;
 use WPMCP\Safety\Safe_Mutation;
 use WPMCP\Safety\Save_Filters;
 
@@ -11,6 +12,10 @@ if (! defined('ABSPATH')) {
 
 class Update_Blocks
 {
+    public function __construct(private readonly Kses_Safety $kses = new Kses_Safety())
+    {
+    }
+
     public function handle(array $args): array
     {
         $id     = (int) ($args['id'] ?? 0);
@@ -18,6 +23,8 @@ class Update_Blocks
         if (! $id || ! get_post($id)) {
             throw new \InvalidArgumentException('Page not found');
         }
+        // What kses will remove for this user is reported (#1243).
+        $sanitized = $this->kses->sanitization($id, $blocks);
         $out = Safe_Mutation::run(
             [
                 'object_type' => 'post',
@@ -48,6 +55,6 @@ class Update_Blocks
                 return true;
             }
         );
-        return ['operation_id' => $out['operation_id'], 'id' => $id];
+        return ['operation_id' => $out['operation_id'], 'id' => $id] + $sanitized;
     }
 }

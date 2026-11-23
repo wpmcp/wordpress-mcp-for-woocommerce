@@ -2,6 +2,7 @@
 
 namespace WPMCP\Tools\SiteEditor;
 
+use WPMCP\Safety\Kses_Safety;
 use WPMCP\Safety\Safe_Mutation;
 use WPMCP\Safety\Save_Filters;
 use WPMCP\Safety\Site_Template_Snapshot;
@@ -44,6 +45,10 @@ if (! defined('ABSPATH')) {
  */
 class Site_Templates_Write
 {
+    public function __construct(private readonly Kses_Safety $kses = new Kses_Safety())
+    {
+    }
+
     private const TOOL = 'site-templates-write';
 
     private const PATH_ACTIONS = ['add_block', 'update_block', 'remove_block'];
@@ -100,6 +105,8 @@ class Site_Templates_Write
         $new     = 'save' === $action ? $this->save_markup($args) : serialize_blocks($blocks);
 
         $wp_id = $stored ? (int) $template->wp_id : 0;
+        // Refused before the snapshot when kses would rewrite it (#1243).
+        $this->kses->assert_content($wp_id, $new, 'template');
         $post  = $this->insert_fields($resolved, $template, $args);
         $area  = $post['area'] ?? null;
         unset($post['area']);

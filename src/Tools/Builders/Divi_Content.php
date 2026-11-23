@@ -2,6 +2,7 @@
 
 namespace WPMCP\Tools\Builders;
 
+use WPMCP\Safety\Kses_Safety;
 use WPMCP\Safety\Save_Filters;
 
 if (! defined('ABSPATH')) {
@@ -47,6 +48,8 @@ class Divi_Content
             self::save5($post_id, $content);
             return;
         }
+        // Nothing is written when kses would rewrite the layout (#1243).
+        (new Kses_Safety())->assert_content($post_id, $content, 'Divi page');
         Save_Filters::update_post([
             'ID'           => $post_id,
             'post_content' => wp_slash($content),
@@ -146,6 +149,7 @@ class Divi_Content
     /** Write a Divi 5 layout and set both flags Divi 5's own save sets. */
     public static function save5(int $post_id, string $content): void
     {
+        (new Kses_Safety())->assert_content($post_id, $content, 'Divi page');
         Save_Filters::update_post([
             'ID'           => $post_id,
             'post_content' => wp_slash($content),

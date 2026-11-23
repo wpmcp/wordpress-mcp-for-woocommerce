@@ -2,6 +2,7 @@
 
 namespace WPMCP\Tools\Content;
 
+use WPMCP\Safety\Kses_Safety;
 use WPMCP\Safety\Post_Creation_Snapshot;
 
 if (! defined('ABSPATH')) {
@@ -11,6 +12,10 @@ if (! defined('ABSPATH')) {
 class Create_Post
 {
     private const VALID_STATUSES = ['draft', 'publish', 'pending', 'private', 'future'];
+
+    public function __construct(private readonly Kses_Safety $kses = new Kses_Safety())
+    {
+    }
 
     /**
      * NOT routed through Safe_Mutation, which captures an object's state
@@ -65,6 +70,9 @@ class Create_Post
         }
 
         // wp_insert_post() and update_post_meta() unslash; slash so backslashes survive.
+        // What kses will remove for this user is reported (#1243).
+        $sanitized = $this->kses->sanitization(0, $postarr['post_content']);
+
         $post_id = wp_insert_post(wp_slash($postarr), true);
         if (is_wp_error($post_id)) {
             throw new \InvalidArgumentException(esc_html($post_id->get_error_message()));
@@ -89,6 +97,6 @@ class Create_Post
             'status'       => $status,
             'permalink'    => (string) get_permalink($post_id),
             'operation_id' => $operation_id,
-        ];
+        ] + $sanitized;
     }
 }

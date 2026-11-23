@@ -2,6 +2,7 @@
 
 namespace WPMCP\Tools\Blocks;
 
+use WPMCP\Safety\Kses_Safety;
 use WPMCP\Safety\Safe_Mutation;
 use WPMCP\Safety\Save_Filters;
 
@@ -84,6 +85,9 @@ class Block_Tree
     public static function write(int $id, array $blocks, string $tool_name, array $args): array
     {
         $new = serialize_blocks($blocks);
+        $kses = new Kses_Safety();
+        // Refused before the snapshot when kses would rewrite the page (#1243).
+        $kses->assert_content($id, $new, $kses->subject((string) get_post_type($id)));
         $out = Safe_Mutation::run(
             [
                 'object_type' => 'post',

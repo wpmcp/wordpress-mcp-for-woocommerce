@@ -163,6 +163,8 @@ class ComposerStaticInit3231cbe8198e0af79b519b6c2be1b9b8
         'WPMCP\\Safety\\File_Write_Snapshot' => __DIR__ . '/../..' . '/src/Safety/File_Write_Snapshot.php',
         'WPMCP\\Safety\\FunnelKit_Funnel_Snapshot' => __DIR__ . '/../..' . '/src/Safety/FunnelKit_Funnel_Snapshot.php',
         'WPMCP\\Safety\\Helpdesk_Ticket_Snapshot' => __DIR__ . '/../..' . '/src/Safety/Helpdesk_Ticket_Snapshot.php',
+        'WPMCP\\Safety\\Kses_Safety' => __DIR__ . '/../..' . '/src/Safety/Kses_Safety.php',
+        'WPMCP\\Safety\\Markup_Equivalence' => __DIR__ . '/../..' . '/src/Safety/Markup_Equivalence.php',
         'WPMCP\\Safety\\Menu_Creation_Snapshot' => __DIR__ . '/../..' . '/src/Safety/Menu_Creation_Snapshot.php',
         'WPMCP\\Safety\\Mutation_Failed' => __DIR__ . '/../..' . '/src/Safety/Mutation_Failed.php',
         'WPMCP\\Safety\\Operation_Context' => __DIR__ . '/../..' . '/src/Safety/Operation_Context.php',

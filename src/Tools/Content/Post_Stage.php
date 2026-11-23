@@ -3,6 +3,7 @@
 namespace WPMCP\Tools\Content;
 
 use WPMCP\Safety\Edit_Lock;
+use WPMCP\Safety\Kses_Safety;
 use WPMCP\Safety\Safe_Mutation;
 use WPMCP\Safety\Save_Filters;
 use WPMCP\Tools\Builders\Elementor_Cache;
@@ -190,6 +191,12 @@ class Post_Stage
         // another user is editing it (the original is checked by
         // Safe_Mutation), so the publish never stops halfway (issue #452).
         Edit_Lock::assert_writable((int) $stage->ID);
+        // The stage's content is filtered on its way onto the original when
+        // it changed; what kses removes is reported (#1243).
+        $sanitized = [];
+        if ($original instanceof \WP_Post && $stage->post_content !== $original->post_content) {
+            $sanitized = (new Kses_Safety())->sanitization($original->ID, $stage->post_content);
+        }
 
         $out = Safe_Mutation::run(
             [
@@ -216,7 +223,7 @@ class Post_Stage
         if ([] !== $changed) {
             $result['overwrote_changes'] = $changed;
         }
-        return $result;
+        return $result + $sanitized;
     }
 
     /** @return array<string, mixed> */

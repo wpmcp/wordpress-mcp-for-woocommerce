@@ -2,6 +2,7 @@
 
 namespace WPMCP\Tools\Builders;
 
+use WPMCP\Safety\Kses_Safety;
 use WPMCP\Safety\Save_Filters;
 
 if (! defined('ABSPATH')) {
@@ -66,6 +67,8 @@ class WPBakery_Content
      */
     public static function save(int $post_id, string $content): void
     {
+        // Nothing is written when kses would rewrite the layout (#1243).
+        (new Kses_Safety())->assert_content($post_id, $content, 'WPBakery page');
         $before = WPBakery_Shortcodes::custom_css_rules(self::get_content($post_id));
         $after  = WPBakery_Shortcodes::custom_css_rules($content);
 

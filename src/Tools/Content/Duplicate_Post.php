@@ -2,6 +2,7 @@
 
 namespace WPMCP\Tools\Content;
 
+use WPMCP\Safety\Kses_Safety;
 use WPMCP\Safety\Post_Creation_Snapshot;
 use WPMCP\Tools\Builders\Elementor_Cache;
 
@@ -38,6 +39,10 @@ if (! defined('ABSPATH')) {
  */
 class Duplicate_Post
 {
+    public function __construct(private readonly Kses_Safety $kses = new Kses_Safety())
+    {
+    }
+
     /** Meta keys that describe the source post itself, not its content. */
     public const SKIPPED_META = [
         '_edit_lock',
@@ -133,6 +138,9 @@ class Duplicate_Post
             Code_Posts::assert_copy_allowed($original, $status);
         }
 
+        // The copy's content is sanitized for this user; report it (#1243).
+        $sanitized = $this->kses->sanitization(0, $source->post_content);
+
         $new_id = $this->copy($source, $title, $status, (int) $source->post_parent);
 
         $children = [];
@@ -157,7 +165,7 @@ class Duplicate_Post
             'status'       => $new instanceof \WP_Post ? (string) $new->post_status : $status,
             'edit_link'    => get_edit_post_link($new_id, 'raw'),
             'operation_id' => $operation_id,
-        ];
+        ] + $sanitized;
     }
 
     /**
@@ -180,7 +188,9 @@ class Duplicate_Post
 
         $stage_id     = Post_Stage::find($source);
         $operation_id = null;
+        $sanitized    = [];
         if (0 === $stage_id) {
+            $sanitized = $this->kses->sanitization(0, $source->post_content);
             $title    = (string) ($args['title'] ?? '');
             $stage_id = $this->copy($source, '' === $title ? (string) $source->post_title : $title, 'draft', (int) $source->post_parent);
             Post_Stage::link($stage_id, (int) $source->ID);
@@ -202,7 +212,7 @@ class Duplicate_Post
             'edit_link'    => get_edit_post_link($stage_id, 'raw'),
             'existing'     => null === $operation_id,
             'operation_id' => $operation_id,
-        ];
+        ] + $sanitized;
     }
 
     /** Copy one post row, its meta and its terms. Returns the new post id. */

@@ -2,6 +2,9 @@
 
 namespace WPMCP\Tools\Builders;
 
+use WPMCP\Safety\Kses_Safety;
+use WPMCP\Safety\Post_Write_Refused;
+
 if (! defined('ABSPATH')) {
     exit;
 }
@@ -202,15 +205,37 @@ class Oxygen_Classic_Content
     }
 
     /**
+     * The refusal for a tree holding a new value wp_kses_post would change,
+     * or null. Post meta skips kses, so a user without unfiltered_html could
+     * otherwise store a script on the page (the shortcode copy is generated
+     * from the tree, so the tree is what is checked). Values the stored tree
+     * holds, or $known holds, were stored by someone allowed to.
+     *
+     * @param mixed $known Decoded data whose strings count as already stored.
+     */
+    public static function kses_refusal(int $post_id, string $json, mixed $known = null): ?\WP_Error
+    {
+        return (new Kses_Safety())->values_refusal([json_decode(self::get_json($post_id), true), $known], json_decode($json, true), 'Oxygen page');
+    }
+
+    /**
      * Store a new tree, and its shortcode copy when there is one, the way
      * Oxygen's save does, then refresh the page's CSS. A write that changes
      * nothing touches nothing.
+     *
+     * @param mixed $known See kses_refusal().
+     * @throws Post_Write_Refused When a new value would not survive kses; nothing is written.
      */
-    public static function save(int $post_id, string $json, ?string $shortcodes): void
+    public static function save(int $post_id, string $json, ?string $shortcodes, mixed $known = null): void
     {
         $json_key = self::key($post_id, self::JSON_KEY);
         if (get_post_meta($post_id, $json_key, true) === $json) {
             return;
+        }
+        $refusal = self::kses_refusal($post_id, $json, $known);
+        if (null !== $refusal) {
+            // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Post_Write_Refused escapes the message it is given.
+            throw new Post_Write_Refused($refusal);
         }
         $shortcodes_key = self::key($post_id, self::SHORTCODES_KEY);
 

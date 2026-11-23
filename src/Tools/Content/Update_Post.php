@@ -2,6 +2,7 @@
 
 namespace WPMCP\Tools\Content;
 
+use WPMCP\Safety\Kses_Safety;
 use WPMCP\Safety\Safe_Mutation;
 use WPMCP\Safety\Save_Filters;
 use WPMCP\Tools\Redirects\Redirect_Store;
@@ -14,6 +15,10 @@ if (! defined('ABSPATH')) {
 class Update_Post
 {
     private const VALID_STATUSES = ['draft', 'publish', 'pending', 'private', 'future'];
+
+    public function __construct(private readonly Kses_Safety $kses = new Kses_Safety())
+    {
+    }
 
     /**
      * When this edit moved a PUBLISHED post to a new URL, queue (and return) a
@@ -83,6 +88,9 @@ class Update_Post
         if (array_key_exists('content', $args)) {
             // Refused before the snapshot, so nothing is left to undo (#893).
             Code_Posts::assert_content_writable($post_id, (string) $args['content']);
+            // What kses will remove for this user is reported (#1243).
+            $content   = $args['content'];
+            $sanitized = $this->kses->sanitization($post_id, is_scalar($content) ? (string) $content : '');
         }
         if (isset($args['status']) && ! in_array($args['status'], self::VALID_STATUSES, true)) {
             throw new \InvalidArgumentException('Invalid status.');
@@ -154,7 +162,7 @@ class Update_Post
             }
         );
 
-        $result     = ['operation_id' => $out['operation_id'], 'post_id' => $post_id];
+        $result     = ['operation_id' => $out['operation_id'], 'post_id' => $post_id] + ($sanitized ?? []);
         $suggestion = $this->suggest_redirect($post_id, $old_url, $old_status);
         if (null !== $suggestion) {
             $result['suggested_redirect'] = $suggestion;

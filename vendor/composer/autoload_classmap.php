@@ -130,6 +130,8 @@ return array(
     'WPMCP\\Safety\\File_Write_Snapshot' => $baseDir . '/src/Safety/File_Write_Snapshot.php',
     'WPMCP\\Safety\\FunnelKit_Funnel_Snapshot' => $baseDir . '/src/Safety/FunnelKit_Funnel_Snapshot.php',
     'WPMCP\\Safety\\Helpdesk_Ticket_Snapshot' => $baseDir . '/src/Safety/Helpdesk_Ticket_Snapshot.php',
+    'WPMCP\\Safety\\Kses_Safety' => $baseDir . '/src/Safety/Kses_Safety.php',
+    'WPMCP\\Safety\\Markup_Equivalence' => $baseDir . '/src/Safety/Markup_Equivalence.php',
     'WPMCP\\Safety\\Menu_Creation_Snapshot' => $baseDir . '/src/Safety/Menu_Creation_Snapshot.php',
     'WPMCP\\Safety\\Mutation_Failed' => $baseDir . '/src/Safety/Mutation_Failed.php',
     'WPMCP\\Safety\\Operation_Context' => $baseDir . '/src/Safety/Operation_Context.php',

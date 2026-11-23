@@ -2,6 +2,7 @@
 
 namespace WPMCP\Tools\Media;
 
+use WPMCP\Safety\Kses_Safety;
 use WPMCP\Safety\Safe_Mutation;
 use WPMCP\Safety\Save_Filters;
 
@@ -11,6 +12,10 @@ if (! defined('ABSPATH')) {
 
 class Update_Media
 {
+    public function __construct(private readonly Kses_Safety $kses = new Kses_Safety())
+    {
+    }
+
     /**
      * Attachments are posts of type 'attachment', so Safe_Mutation's generic
      * 'post' object_type snapshots and restores them the same way it does
@@ -26,6 +31,12 @@ class Update_Media
         }
         if ('attachment' !== $post->post_type) {
             throw new \InvalidArgumentException('That ID is not a media attachment.');
+        }
+        if (array_key_exists('description', $args)) {
+            // The description is the attachment's post_content: what kses
+            // removes from it is reported (#1243).
+            $description = $args['description'];
+            $sanitized   = $this->kses->sanitization($media_id, is_scalar($description) ? (string) $description : '');
         }
 
         $out = Safe_Mutation::run(
@@ -64,6 +75,6 @@ class Update_Media
             }
         );
 
-        return ['operation_id' => $out['operation_id'], 'media_id' => $media_id, 'updated' => $out['result']];
+        return ['operation_id' => $out['operation_id'], 'media_id' => $media_id, 'updated' => $out['result']] + ($sanitized ?? []);
     }
 }

@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Safe MCP for WooCommerce
  * Description: AI agents run your WooCommerce store over MCP, with a snapshot before every write and one-click rollback.
- * Version: 1.2.1
+ * Version: 1.2.2
  * Requires at least: 6.9
  * Requires PHP: 8.1
  * Requires Plugins: woocommerce
@@ -36,7 +36,7 @@ if ( wpmcp_flavor_should_defer( __FILE__, 'woocommerce', defined( 'WPMCP_VERSION
 	return;
 }
 
-define( 'WPMCP_VERSION', '1.2.1' );
+define( 'WPMCP_VERSION', '1.2.2' );
 define( 'WPMCP_FLAVOR', 'woocommerce' );
 // Must match the Text Domain header above. The build rewrites every string
 // in src/ to this domain, so the loader has to load into it too (issue #184).

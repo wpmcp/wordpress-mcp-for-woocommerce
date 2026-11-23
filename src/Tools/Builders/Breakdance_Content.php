@@ -2,6 +2,9 @@
 
 namespace WPMCP\Tools\Builders;
 
+use WPMCP\Safety\Kses_Safety;
+use WPMCP\Safety\Post_Write_Refused;
+
 if (! defined('ABSPATH')) {
     exit;
 }
@@ -77,13 +80,38 @@ class Breakdance_Content
     }
 
     /**
+     * The refusal for a document holding a new value wp_kses_post would
+     * change, or null. Post meta skips kses, so a user without
+     * unfiltered_html could otherwise store a script on the page. Values the
+     * stored document holds, or $known holds (the stored source a copy, an
+     * insert or a restore takes them from), were stored by someone allowed to.
+     *
+     * @param mixed $known Decoded data whose strings count as already stored.
+     */
+    public static function kses_refusal(int $post_id, object $doc, string $builder = 'breakdance', mixed $known = null): ?\WP_Error
+    {
+        $subject = 'oxygen' === $builder ? 'Oxygen page' : 'Breakdance page';
+
+        return (new Kses_Safety())->values_refusal([self::get_document($post_id, $builder), $known], $doc, $subject);
+    }
+
+    /**
      * Store a document and refresh the generated cache: the stale cache rows
      * are dropped (the builder rebuilds missing rows on the next page view)
      * and, when the plugin is loaded, rebuilt right away. A write that
      * changes nothing touches nothing.
+     *
+     * @param mixed $known See kses_refusal().
+     * @throws Post_Write_Refused When a new value would not survive kses; nothing is written.
      */
-    public static function save(int $post_id, object $doc, string $builder = 'breakdance'): void
+    public static function save(int $post_id, object $doc, string $builder = 'breakdance', mixed $known = null): void
     {
+        $refusal = self::kses_refusal($post_id, $doc, $builder, $known);
+        if (null !== $refusal) {
+            // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Post_Write_Refused escapes the message it is given.
+            throw new Post_Write_Refused($refusal);
+        }
+
         $key   = self::data_key($builder, $post_id);
         $value = (string) wp_json_encode(['tree_json_string' => Breakdance_Tree::encode($doc)]);
 

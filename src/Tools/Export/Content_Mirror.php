@@ -2,6 +2,7 @@
 
 namespace WPMCP\Tools\Export;
 
+use WPMCP\Safety\Kses_Safety;
 use WPMCP\Safety\Safe_Mutation;
 use WPMCP\Safety\Save_Filters;
 use WPMCP\Tools\Builders\{Avada_Content, Beaver_Builder_Content, Beaver_Builder_Nodes, Breakdance_Content, Breakdance_Tree, Bricks_Content, Builder_Detector, Divi_Content, Oxygen_Classic_Content, Oxygen_Classic_Json, Thrive_Content, Thrive_Html, WPBakery_Content};
@@ -159,6 +160,10 @@ class Content_Mirror
         }
 
         $write = self::writer($post_id, $builder, $doc->data, $arr['data']);
+        // Block and classic content is sanitized as the editor would; what
+        // kses removes is reported (#1243).
+        $lines     = is_array($arr) ? ($arr['data'] ?? null) : null;
+        $sanitized = 'gutenberg' === $builder && is_array($lines) ? (new Kses_Safety())->sanitization($post_id, implode("\n", array_filter($lines, 'is_string'))) : [];
 
         $out = Safe_Mutation::run(
             [
@@ -176,7 +181,7 @@ class Content_Mirror
             'post_id'      => $post_id,
             'builder'      => $builder,
             'file'         => self::file_for($post_id),
-        ];
+        ] + $sanitized;
     }
 
     /**
@@ -194,6 +199,10 @@ class Content_Mirror
                 throw new \RuntimeException(esc_html("The mirror file for post {$post_id} must hold its content as an array of lines."));
             }
             $content = implode("\n", $assoc);
+            if ('gutenberg' !== $builder) {
+                // A builder layout kses would rewrite is refused (#1243).
+                (new Kses_Safety())->assert_content($post_id, $content, ucfirst($builder) . ' page');
+            }
 
             if ('divi' === $builder) {
                 return static function () use ($post_id, $content) {

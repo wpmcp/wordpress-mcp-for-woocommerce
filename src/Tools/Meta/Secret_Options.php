@@ -226,7 +226,9 @@ final class Secret_Options
             'updraft_remotesites'               => [ 'key' ],
 
             // BackWPup: every job's settings live in one option; the global settings are one option each.
-            'backwpup_jobs'                     => [ 'dbpassword', 'ftppass', 'ftpsshprivkey', 's3secretkey', 'rscapikey', 'glaciersecretkey', 'mailpass', 'dropboxtoken', 'dropboxsecret', 'msazurekey', 'sugarpass', 'sugarrefreshtoken', 'hidrivetoken', 'dropetoken', 'dropesecret', 'dropepass' ],
+            // BackWPup 5 saves the email destination's SMTP password as "emailpass"
+            // (inc/class-destination-email.php); "mailpass" is the older name (issue #1162).
+            'backwpup_jobs'                     => [ 'dbpassword', 'ftppass', 'ftpsshprivkey', 's3secretkey', 'rscapikey', 'glaciersecretkey', 'mailpass', 'emailpass', 'dropboxtoken', 'dropboxsecret', 'msazurekey', 'sugarpass', 'sugarrefreshtoken', 'hidrivetoken', 'dropetoken', 'dropesecret', 'dropepass' ],
             'backwpup_cfg_dropboxappsecret'     => true,
             'backwpup_cfg_dropboxsandboxappsecret' => true,
             'backwpup_cfg_easycronapikey'       => true,

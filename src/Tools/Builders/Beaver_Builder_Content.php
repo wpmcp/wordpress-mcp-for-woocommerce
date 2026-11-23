@@ -2,6 +2,9 @@
 
 namespace WPMCP\Tools\Builders;
 
+use WPMCP\Safety\Kses_Safety;
+use WPMCP\Safety\Post_Write_Refused;
+
 if (! defined('ABSPATH')) {
     exit;
 }
@@ -36,6 +39,8 @@ class Beaver_Builder_Content
     public const DATA_META_KEY    = '_fl_builder_data';
     public const DRAFT_META_KEY   = '_fl_builder_draft';
     public const ENABLED_META_KEY = '_fl_builder_enabled';
+
+    public const KSES_SUBJECT = 'Beaver Builder page';
 
     /**
      * The stored node map for a status, or [] when absent or unreadable.
@@ -76,13 +81,35 @@ class Beaver_Builder_Content
     }
 
     /**
+     * The refusal for nodes holding a new value wp_kses_post would change, or
+     * null. Post meta skips kses, so a user without unfiltered_html could
+     * otherwise store a script on the page. Values in the page's published
+     * and draft rows, or in $known, were stored by someone allowed to.
+     *
+     * @param mixed $value Nodes.
+     * @param mixed $known Decoded data whose strings count as already stored.
+     */
+    public static function kses_refusal(int $post_id, mixed $value, mixed $known = null): ?\WP_Error
+    {
+        $stored = [$known, self::get_nodes($post_id), self::get_nodes($post_id, self::DRAFT_META_KEY)];
+
+        return (new Kses_Safety())->values_refusal($stored, $value, self::KSES_SUBJECT);
+    }
+
+    /**
      * Store a node map as the published layout (and the draft, when one
      * exists), enable the builder, and clear the layout asset cache.
      *
      * @param array<string,object> $nodes
      */
-    public static function save(int $post_id, array $nodes): void
+    public static function save(int $post_id, array $nodes, mixed $known = null): void
     {
+        $refusal = self::kses_refusal($post_id, $nodes, $known);
+        if (null !== $refusal) {
+            // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Post_Write_Refused escapes the message it is given.
+            throw new Post_Write_Refused($refusal);
+        }
+
         update_post_meta($post_id, self::DATA_META_KEY, self::slash($nodes));
 
         if (metadata_exists('post', $post_id, self::DRAFT_META_KEY)) {

@@ -2,6 +2,7 @@
 
 namespace WPMCP\Tools\Builders;
 
+use WPMCP\Safety\Kses_Safety;
 use WPMCP\Safety\Save_Filters;
 
 if (! defined('ABSPATH')) {
@@ -87,6 +88,8 @@ class Avada_Content
      */
     public static function save(int $post_id, string $content): void
     {
+        // Nothing is written when kses would rewrite the layout (#1243).
+        (new Kses_Safety())->assert_content($post_id, $content, 'Avada page');
         Save_Filters::update_post([
             'ID'           => $post_id,
             'post_content' => wp_slash($content),

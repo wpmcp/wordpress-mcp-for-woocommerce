@@ -264,7 +264,8 @@ final class Oxygen_Page
             return $id;
         }
         $id = (int) $id;
-        Breakdance_Content::save($id, $doc, 'oxygen');
+        // The Component copies the page's stored values.
+        Breakdance_Content::save($id, $doc, 'oxygen', $page);
 
         $operation_id = Post_Creation_Snapshot::record('update-builder-content', [$id], $args, (string) ($args['session_id'] ?? 'default'));
 

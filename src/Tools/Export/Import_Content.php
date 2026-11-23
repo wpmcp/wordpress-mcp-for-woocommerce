@@ -2,6 +2,7 @@
 
 namespace WPMCP\Tools\Export;
 
+use WPMCP\Safety\Kses_Safety;
 use WPMCP\Tools\Content\Content_Guard;
 use WPMCP\Tools\Filesystem\Filesystem_Guard;
 
@@ -38,6 +39,10 @@ class Import_Content
 
     private const VALID_STATUSES = ['draft', 'publish', 'pending', 'private', 'future'];
 
+    public function __construct(private readonly Kses_Safety $kses = new Kses_Safety())
+    {
+    }
+
     /**
      * Disabled by default: sites must opt in with
      * add_filter('wpmcp_enable_import', '__return_true') before this tool
@@ -67,6 +72,13 @@ class Import_Content
         $file = self::resolve_import_file((string) ($args['file'] ?? ''));
 
         $items = $this->parse_items($file);
+
+        // What kses will remove from each item is reported (#1243).
+        $removed = [];
+        foreach ($items as $item) {
+            $removed = array_merge($removed, $this->kses->sanitization(0, $item['content'])['removed'] ?? []);
+        }
+        $sanitized = [] === $removed ? [] : ['sanitized' => true, 'removed' => array_values(array_unique($removed))];
 
         $created_post_ids = [];
         foreach ($items as $item) {
@@ -99,7 +111,7 @@ class Import_Content
             'created_post_ids'  => $created_post_ids,
             'recoverable'       => false,
             'note'              => 'Content creation is not automatically reversible. Use delete-post with each id in created_post_ids to undo.',
-        ];
+        ] + $sanitized;
     }
 
     /**
