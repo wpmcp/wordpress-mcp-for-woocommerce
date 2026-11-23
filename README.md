@@ -1,6 +1,6 @@
 # WooCommerce MCP Server (Safe MCP for WooCommerce)
 
-A free WooCommerce MCP plugin that lets Claude, ChatGPT and Cursor manage products, orders and coupons on your store, with a snapshot before every write and one-click undo.
+A free WooCommerce MCP plugin that lets Claude, ChatGPT and Cursor manage products, orders and coupons on your store, with a snapshot before each supported write and one-click undo.
 
 **[Download the plugin (safe-mcp-for-woocommerce.zip)](https://github.com/wpmcp/wordpress-mcp-for-woocommerce/releases/latest/download/safe-mcp-for-woocommerce.zip)**
 
@@ -32,8 +32,8 @@ Every mutating operation takes a snapshot first. A wrong bulk price update, a ba
 
 ### Safety model
 
-- Automatic snapshot before every write, with browsable history and one-click restore
-- Session rollback: undo everything an agent did in one conversation
+- Automatic snapshot before each supported write, with browsable history and one-click restore
+- Session rollback: undo an agent's supported writes from one conversation in one step
 - Layered governance where permissions can only be narrowed, never widened
 - Full audit log of every tool call
 - No remote code execution tools of any kind
@@ -53,9 +53,9 @@ Snapshots are per-operation undo, not full-site backups. Keep your backup plugin
 
 ## Want Elementor, Bricks, Divi and unlimited undo history?
 
-The full WP MCP plugin adds page-builder depth (Elementor, Bricks, Divi), more integrations, and custom widget and block building. With a Pro licence it keeps unlimited undo history (this plugin keeps your last 20 undo points). It replaces this plugin in place.
+The full WP MCP plugin adds page-builder depth (Elementor, Bricks, Divi), more integrations, and custom widget and block building. With a Pro licence it keeps unlimited undo history (this plugin keeps your last 20 undo points). Pro comes from the Freemius checkout on the pricing page, not from GitHub releases.
 
-**[See WP MCP Pro plans](https://wpmcp-pro.com/pricing?coupon=WPMCPGIT&utm_source=github&utm_medium=readme&utm_content=woocommerce)** (code `WPMCPGIT` takes 10% off) | [Full plugin repo: wpmcp/wordpress-mcp](https://github.com/wpmcp/wordpress-mcp)
+**[See WP MCP Pro plans](https://wpmcp-pro.com/pricing?coupon=WPMCPGIT&utm_source=github&utm_medium=referral&utm_content=woocommerce_readme)** (code `WPMCPGIT` takes 10% off) | [Full plugin repo: wpmcp/wordpress-mcp](https://github.com/wpmcp/wordpress-mcp)
 
 ## Privacy
 
