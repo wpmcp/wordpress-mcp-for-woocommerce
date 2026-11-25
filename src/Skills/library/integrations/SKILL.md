@@ -42,7 +42,9 @@ holds them.
 
 1. Find the operation. `list-operations` on the read half returns every
    operation with its input schema, whether it is enabled, whether it needs
-   confirm, and `dependency_met` (is its plugin active).
+   confirm, and `dependency_met` (is its plugin active). An operation whose
+   plugin is not active comes without its schema; pass
+   `args: {"include_schemas": true}` if you need it anyway.
 2. Read before you write. Every area has a list and a get operation; use
    them to find ids instead of guessing.
 3. Write on the write half. Send only the fields you are changing.

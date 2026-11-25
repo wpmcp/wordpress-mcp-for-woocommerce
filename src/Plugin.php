@@ -458,14 +458,14 @@ final class Plugin
     {
         foreach ($refreshers ?? self::ROLLBACK_REFRESHERS as $refresher) {
             [$class, $method] = $refresher;
-            if (class_exists($class)) {
+            if (\WPMCP\Kernel\Kernel_Boot::ships($class)) { // a check that does not load the class: WordPress keeps [Class, method] as strings until the rollback fires
                 add_action($refresher[2] ?? 'wpmcp_rollback_options_restored', [$class, $method], 10, 2);
             }
         }
         // Then the refreshers modules declare with #[On_Rollback]; a test
         // that passes its own list gets exactly that list.
         if (null === $refreshers) {
-            self::instance()->kernel()->attach_rollback_hooks(); // central-list-ok: D11 seam, the compiled #[On_Rollback] rows
+            self::instance()->kernel()->attach_rollback_hooks_on_first_rollback(); // central-list-ok: D11 seam, the compiled #[On_Rollback] rows
         }
     }
 
@@ -780,8 +780,11 @@ final class Plugin
             // WPMCP\MCP\Discovery_Documents for what is never advertised.
             \WPMCP\MCP\Discovery_Endpoints::register();
             // Stdio MCP transport for WP-CLI-only and local workflows
-            // (issue #77): `wp mcp-stdio serve`. No-op outside WP-CLI.
-            Stdio_Transport::register();
+            // (issue #77): `wp mcp-stdio serve`. Only under WP-CLI, so no
+            // other request loads the transport class.
+            if (defined('WP_CLI') && WP_CLI) {
+                Stdio_Transport::register();
+            }
             // structuredContent must serialize as a JSON object. Normalized
             // at the wire boundary only, so tool contracts are unchanged.
             (new Structured_Result())->register();

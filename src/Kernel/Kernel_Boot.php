@@ -90,6 +90,84 @@ final class Kernel_Boot
         return (new Hook_Loader($this->container(), new Request_Context(), $adder))->attach($rows, $active);
     }
 
+    /**
+     * attach_rollback_hooks(), but only once a rollback runs. Every
+     * #[On_Rollback] row today names a wpmcp_rollback_* hook, which only
+     * Rollback_Service fires, so a page load that rolls nothing back never
+     * loads Hook_Loader, the container, Presence or Request_Context. A
+     * stand-in on each of those hooks at PHP_INT_MIN attaches the rows the
+     * first time one fires, ahead of their own priority, so they still run
+     * in that same firing. A row on any other hook attaches them at once,
+     * as before.
+     */
+    public function attach_rollback_hooks_on_first_rollback(): void
+    {
+        $hooks = [];
+        foreach ($this->registry()->hooks() as $row) {
+            if ('rollback' !== ($row['kind'] ?? null)) {
+                continue;
+            }
+            $hook = is_string($row['hook'] ?? null) ? $row['hook'] : '';
+            // A row at PHP_INT_MIN would share the stand-in's priority, which
+            // WordPress does not re-read while it runs it.
+            if (! str_starts_with($hook, 'wpmcp_rollback_') || PHP_INT_MIN === ($row['priority'] ?? 10)) {
+                $this->attach_rollback_hooks();
+                return;
+            }
+            $hooks[ $hook ] = true;
+        }
+        if ([] === $hooks) {
+            return;
+        }
+        $names = array_keys($hooks);
+        $attach = null;
+        // Removes itself from every hook rather than remembering it ran, so
+        // the rows are attached once, and attached again only when the hooks
+        // were reset to a state from before (a test's hook backup). The rows
+        // go in first: removing the only callback of a running hook makes
+        // WordPress stop that run, before the rows it was about to add.
+        $attach = function (mixed $value = null) use (&$attach, $names): mixed {
+            $this->attach_rollback_hooks();
+            foreach ($names as $name) {
+                remove_filter($name, $attach, PHP_INT_MIN);
+            }
+            return $value; // the rollback filters (wpmcp_rollback_post_refusal) pass their value through
+        };
+        foreach ($names as $hook) {
+            add_filter($hook, $attach, PHP_INT_MIN, 1);
+        }
+    }
+
+    /**
+     * Whether this build ships $class, without loading it: the file the
+     * autoloader would read for it (src/ or pro/src/, src/Modules/ or
+     * pro/modules/) exists. Otherwise the answer of class_exists(), which
+     * autoloads, so a class a test defines elsewhere still counts. A guard
+     * such as Plugin::register_rollback_refreshers() can then hook a
+     * [Class, method] pair, which WordPress keeps as strings, without
+     * loading every integration class on every request.
+     */
+    public static function ships(string $class): bool
+    {
+        if (class_exists($class, false)) {
+            return true;
+        }
+        if (str_starts_with($class, 'WPMCP\\')) {
+            $root = defined('WPMCP_DIR') && is_string(WPMCP_DIR) ? WPMCP_DIR : dirname(__DIR__, 2) . '/';
+            $root = rtrim($root, '/') . '/';
+            $relative = str_replace('\\', '/', substr($class, strlen('WPMCP\\'))) . '.php';
+            $candidates = str_starts_with($relative, 'Modules/')
+                ? ['src/' . $relative, 'pro/modules/' . substr($relative, strlen('Modules/'))]
+                : ['src/' . $relative, 'pro/src/' . $relative];
+            foreach ($candidates as $candidate) {
+                if (is_file($root . $candidate)) {
+                    return true;
+                }
+            }
+        }
+        return class_exists($class);
+    }
+
     /** The container over the compiled factories and bindings, one per request. */
     private function container(): Container
     {

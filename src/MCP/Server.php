@@ -88,7 +88,13 @@ class Server
         if (! class_exists(McpAdapter::class)) {
             return;
         }
-        $scope = new Route_Scoped_Mount(Route_Scoped_Mount::enabled_by_constant());
+        // Route_Scoped_Mount::FLAG, read here so that while it is off (the
+        // default) no request loads the scoping classes at all.
+        if (! defined('WPMCP_ROUTE_SCOPED_MCP') || true !== (bool) constant('WPMCP_ROUTE_SCOPED_MCP')) {
+            McpAdapter::instance();
+            return;
+        }
+        $scope = new Route_Scoped_Mount(true);
         if ($scope->mounts(static fn (): Request_Context => Request_Context::from_globals())) {
             McpAdapter::instance();
         }
