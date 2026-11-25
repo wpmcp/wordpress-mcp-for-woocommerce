@@ -3,6 +3,7 @@
 namespace WPMCP\MCP;
 
 use WPMCP\Connect\Client_Config_Generator;
+use WPMCP\Kernel\Request_Context;
 use WP\MCP\Core\McpAdapter;
 use WP\MCP\Domain\Prompts\McpPrompt;
 use WP\MCP\Domain\Resources\McpResource;
@@ -84,7 +85,11 @@ class Server
 
     public static function boot(): void
     {
-        if (class_exists(McpAdapter::class)) {
+        if (! class_exists(McpAdapter::class)) {
+            return;
+        }
+        $scope = new Route_Scoped_Mount(Route_Scoped_Mount::enabled_by_constant());
+        if ($scope->mounts(static fn (): Request_Context => Request_Context::from_globals())) {
             McpAdapter::instance();
         }
     }
@@ -111,7 +116,7 @@ class Server
             self::NAMESPACE,
             self::SERVER_ID,
             self::SERVER_NAME,
-            __('AI builds and edits your WordPress site, and physically cannot wreck it.', 'safe-mcp-for-woocommerce'),
+            __('AI builds and edits your WordPress site, with a snapshot before each supported write.', 'safe-mcp-for-woocommerce'),
             defined('WPMCP_VERSION') ? WPMCP_VERSION : '0.0.0',
             [ HttpTransport::class ],
             ErrorLogMcpErrorHandler::class,

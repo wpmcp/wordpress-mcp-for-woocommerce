@@ -90,13 +90,16 @@ final class Builder_Design_Data
      */
     public const HOSTS = [
         'avada'      => 'the Avada theme with its Avada Core and Avada Builder plugins',
+        'beaver-builder' => 'the Beaver Builder plugin',
         'betheme'    => 'the BeTheme theme',
         'breakdance' => 'the Breakdance plugin',
         'bricks'     => 'the Bricks theme',
         'cornerstone' => 'Cornerstone (Themeco), or the X or Pro theme that bundles it',
         'divi'       => 'the Divi theme (Divi 5)',
         'oxygen'     => 'the Oxygen 6 plugin',
+        'siteorigin' => 'the SiteOrigin Page Builder plugin',
         'thrive'     => 'the Thrive Architect plugin',
+        'visual-composer' => 'the Visual Composer Website Builder plugin',
         'wpbakery'   => 'the WPBakery Page Builder plugin',
     ];
 

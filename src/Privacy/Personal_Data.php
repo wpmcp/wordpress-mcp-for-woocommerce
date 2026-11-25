@@ -18,7 +18,7 @@ if (! defined('ABSPATH')) {
 }
 
 /**
- * WP MCP's stores in WordPress's personal data export and erasure (issue
+ * WPMCP's stores in WordPress's personal data export and erasure (issue
  * #478): Tools > Export Personal Data and Erase Personal Data, and anything
  * that drives them, cover the undo snapshots, the activity logs (request
  * log and governance audit log), agent memory and the search index. The Pro
@@ -28,7 +28,7 @@ if (! defined('ABSPATH')) {
  * each one separately, and each page reads a bounded batch keyed on a row id
  * cursor (see cursor()). Everything registers at PRIORITY, after the
  * integrations' own erasers (WooCommerce, forms plugins), so their erasure
- * runs first and WP MCP's copies of their rows are redacted after it.
+ * runs first and WPMCP's copies of their rows are redacted after it.
  *
  * Every store is per site ($wpdb->prefix, per-site options and posts), so
  * on multisite a request run on one site covers that site's stores.
@@ -57,10 +57,10 @@ class Personal_Data
     private static function stores(): array
     {
         return [
-            'wpmcp-snapshots'     => __('WP MCP undo snapshots', 'safe-mcp-for-woocommerce'),
-            'wpmcp-activity-logs' => __('WP MCP activity logs', 'safe-mcp-for-woocommerce'),
-            'wpmcp-memory'        => __('WP MCP agent memory', 'safe-mcp-for-woocommerce'),
-            'wpmcp-search-index'  => __('WP MCP search index', 'safe-mcp-for-woocommerce'),
+            'wpmcp-snapshots'     => __('WPMCP undo snapshots', 'safe-mcp-for-woocommerce'),
+            'wpmcp-activity-logs' => __('WPMCP activity logs', 'safe-mcp-for-woocommerce'),
+            'wpmcp-memory'        => __('WPMCP agent memory', 'safe-mcp-for-woocommerce'),
+            'wpmcp-search-index'  => __('WPMCP search index', 'safe-mcp-for-woocommerce'),
         ];
     }
 
@@ -231,8 +231,8 @@ class Personal_Data
             }
             $items[] = self::item(
                 'wpmcp-snapshots',
-                __('WP MCP undo snapshots', 'safe-mcp-for-woocommerce'),
-                __('Copies of site data WP MCP saved before an AI agent changed it, so the change can be undone.', 'safe-mcp-for-woocommerce'),
+                __('WPMCP undo snapshots', 'safe-mcp-for-woocommerce'),
+                __('Copies of site data WPMCP saved before an AI agent changed it, so the change can be undone.', 'safe-mcp-for-woocommerce'),
                 'wpmcp-snapshot-' . $row['id'],
                 $fields
             );
@@ -280,13 +280,13 @@ class Personal_Data
                 $retained   = true;
                 $messages[] = sprintf(
                     /* translators: %d: number of undo snapshots. */
-                    __('WP MCP kept the account id recorded on %d undo snapshots this account made (no name, email or address): rollback uses it to decide who may undo those changes.', 'safe-mcp-for-woocommerce'),
+                    __('WPMCP kept the account id recorded on %d undo snapshots this account made (no name, email or address): rollback uses it to decide who may undo those changes.', 'safe-mcp-for-woocommerce'),
                     $made
                 );
             }
             if (self::has_site_backups()) {
                 $retained   = true;
-                $messages[] = __('WP MCP site backup archives are full copies of the database and were not changed. Delete any archive made before this request to remove the person from it.', 'safe-mcp-for-woocommerce');
+                $messages[] = __('WPMCP site backup archives are full copies of the database and were not changed. Delete any archive made before this request to remove the person from it.', 'safe-mcp-for-woocommerce');
             }
         }
         self::advance('erase-snapshots', $email, $last, $done);
@@ -347,8 +347,8 @@ class Personal_Data
         if ('' === $email) {
             return [ 'data' => [], 'done' => true ];
         }
-        $label       = __('WP MCP activity logs', 'safe-mcp-for-woocommerce');
-        $description = __('Records of AI agent requests and of the permission decisions WP MCP made about them.', 'safe-mcp-for-woocommerce');
+        $label       = __('WPMCP activity logs', 'safe-mcp-for-woocommerce');
+        $description = __('Records of AI agent requests and of the permission decisions WPMCP made about them.', 'safe-mcp-for-woocommerce');
 
         foreach ((array) get_option(Request_Log::OPTION, []) as $i => $row) {
             if (! is_array($row) || ! self::request_row_is_theirs($row, $email, $user_id)) {
@@ -501,7 +501,7 @@ class Personal_Data
             }
             $items[] = self::item(
                 'wpmcp-memory',
-                __('WP MCP agent memory', 'safe-mcp-for-woocommerce'),
+                __('WPMCP agent memory', 'safe-mcp-for-woocommerce'),
                 __('Notes and rules AI agents keep about this site.', 'safe-mcp-for-woocommerce'),
                 'wpmcp-memory-' . $id,
                 [
@@ -593,8 +593,8 @@ class Personal_Data
         foreach ($rows as $row) {
             $items[] = self::item(
                 'wpmcp-search-index',
-                __('WP MCP search index', 'safe-mcp-for-woocommerce'),
-                __('Text WP MCP copied from site content so AI agents can search it.', 'safe-mcp-for-woocommerce'),
+                __('WPMCP search index', 'safe-mcp-for-woocommerce'),
+                __('Text WPMCP copied from site content so AI agents can search it.', 'safe-mcp-for-woocommerce'),
                 'wpmcp-search-index-' . $row['id'],
                 [
                     __('Indexed object', 'safe-mcp-for-woocommerce') => $row['object_type'] . ' #' . $row['object_id'],
@@ -624,7 +624,7 @@ class Personal_Data
         return [
             'items_removed'  => [] !== $ids,
             'items_retained' => false,
-            'messages'       => [] !== $ids && $done ? [ __('WP MCP removed search index rows that held the person\'s email; rebuilding the index copies the content again only if the site content still holds it.', 'safe-mcp-for-woocommerce') ] : [],
+            'messages'       => [] !== $ids && $done ? [ __('WPMCP removed search index rows that held the person\'s email; rebuilding the index copies the content again only if the site content still holds it.', 'safe-mcp-for-woocommerce') ] : [],
             'done'           => $done,
         ];
     }

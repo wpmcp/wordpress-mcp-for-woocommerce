@@ -19,13 +19,33 @@ class Package_Guard
     /** Plugin file paths (relative to the plugins dir) that may never be deactivated or deleted. */
     private const PROTECTED_PLUGINS = [
         'wpmcp/wpmcp.php',
+        // The licensed build installs to its own folder (the licensing SDK slug).
+        'wpmcp-pro/wpmcp.php',
         'elementor/elementor.php',
         'elementor-pro/elementor-pro.php',
     ];
 
     public static function is_protected_plugin(string $plugin_file): bool
     {
-        return in_array($plugin_file, self::PROTECTED_PLUGINS, true);
+        if (in_array($plugin_file, self::PROTECTED_PLUGINS, true)) {
+            return true;
+        }
+
+        // The running copy, whatever folder it was installed in.
+        $self = defined('WPMCP_FILE') ? constant('WPMCP_FILE') : null;
+        if (is_string($self) && plugin_basename($self) === $plugin_file) {
+            return true;
+        }
+
+        // Any other WPMCP copy, in whatever folder it sits: the licensing
+        // service installs the premium plugin in a folder of its own, and
+        // every build's main file declares a WPMCP Flavor header. Only a
+        // folder/file.php inside the plugins folder is read.
+        if (0 !== validate_file($plugin_file) || ! str_contains($plugin_file, '/') || ! function_exists('wpmcp_flavor_of')) {
+            return false;
+        }
+
+        return '' !== wpmcp_flavor_of(WP_PLUGIN_DIR . '/' . $plugin_file);
     }
 
     /**
@@ -40,10 +60,10 @@ class Package_Guard
     {
         $why = str_starts_with($plugin_file, 'elementor')
             ? 'Elementor is protected because it is the site\'s page builder: if it stops working, every page built with it stops rendering, and an agent could not put it back.'
-            : 'WP MCP is protected because it is the connection this agent works through: if it stops working, the agent loses access to the site and cannot undo the change.';
+            : 'WPMCP is protected because it is the connection this agent works through: if it stops working, the agent loses access to the site and cannot undo the change.';
 
         return sprintf(
-            'Refusing to %1$s protected plugin "%2$s". %3$s WP MCP never lets a tool %1$s it, and no setting changes that; to %1$s it anyway, a site administrator can do it from Plugins in wp-admin.',
+            'Refusing to %1$s protected plugin "%2$s". %3$s WPMCP never lets a tool %1$s it, and no setting changes that; to %1$s it anyway, a site administrator can do it from Plugins in wp-admin.',
             $action,
             $plugin_file,
             $why

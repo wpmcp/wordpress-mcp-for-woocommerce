@@ -113,11 +113,14 @@ class Install_Plugin
 
         $out = ['installed' => true, 'file' => $plugin_file, 'slug' => $slug, 'activated' => false];
         if ($activate) {
-            $out = array_merge($out, self::time_left_for_activation()
+            // Issue #1201: an activation that could outlast the request or
+            // the client's wait is left for its own activate-plugin call.
+            $deferred = Activation_Budget::deferral_reason($plugin_file);
+            $out      = array_merge($out, null === $deferred
                 ? $this->activate_installed($plugin_file, $args)
                 : [
                     'activation_skipped' => true,
-                    'error'              => 'The install used most of the PHP time limit, so the activation did not run.',
+                    'error'              => $deferred,
                 ]);
             if (empty($out['activated']) && empty($out['already_active'])) {
                 $out['next_step'] = sprintf('Installed, not activated: call activate-plugin with plugin "%s".', $plugin_file);

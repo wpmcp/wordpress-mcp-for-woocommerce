@@ -65,7 +65,7 @@ class Hardening_Audit
     {
         $wp_debug      = defined('WP_DEBUG') && WP_DEBUG;
         $debug_display = $wp_debug && (! defined('WP_DEBUG_DISPLAY') || (bool) WP_DEBUG_DISPLAY);
-        // WP MCP's own hide_php_errors hardening setting (issue #847) turns
+        // WPMCP's own hide_php_errors hardening setting (issue #847) turns
         // display_errors off on every request, whatever the constants say.
         $debug_display = $debug_display && ! Hardening_Settings::enabled('hide_php_errors');
         $environment   = function_exists('wp_get_environment_type') ? wp_get_environment_type() : 'production';
@@ -74,7 +74,7 @@ class Hardening_Audit
 
     /**
      * Whether the theme and plugin file editor is off: DISALLOW_FILE_EDIT, or
-     * WP MCP's own disable_file_editor hardening setting (issue #847).
+     * WPMCP's own disable_file_editor hardening setting (issue #847).
      */
     public static function file_edit_disallowed(): bool
     {

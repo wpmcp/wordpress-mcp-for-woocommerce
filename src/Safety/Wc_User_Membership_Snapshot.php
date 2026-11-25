@@ -219,7 +219,8 @@ final class Wc_User_Membership_Snapshot
         if ('' === $method || null === $membership || ! method_exists($membership, $method)) {
             return false;
         }
-        $membership->$method('Changed through WP MCP.');
+        // @phpstan-ignore method.dynamicName (one of the three membership methods mapped above, checked with method_exists().)
+        $membership->$method('Changed through WPMCP.');
         return true;
     }
 

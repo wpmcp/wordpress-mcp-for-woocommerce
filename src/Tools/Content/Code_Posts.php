@@ -243,7 +243,8 @@ final class Code_Posts
             }
             $guarded = array_merge((array) ($rule['code_meta'] ?? []), (array) ($rule['switch_meta'] ?? []));
             foreach ($keys as $key) {
-                if (in_array((string) $key, $guarded, true)) {
+                // The key as it may be stored, so no spelling reaches a guarded row.
+                if ([] !== array_intersect(Content_Guard::stored_keys($key), array_filter($guarded, 'is_string'))) {
                     // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Post_Write_Refused escapes the message it is given.
                     throw self::refused(sprintf('Meta key "%s" holds or switches on layout code. %s', esc_html((string) $key), self::note($rule)), $post_id);
                 }

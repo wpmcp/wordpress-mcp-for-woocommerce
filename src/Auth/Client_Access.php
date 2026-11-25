@@ -6,6 +6,7 @@ use WPMCP\Admin\Management_Access;
 use WPMCP\Gateway\Gateway_Guard;
 use WPMCP\Identity\Identity_Store;
 use WPMCP\MCP\Ability;
+use WPMCP\MCP\Unavailable;
 
 if (! defined('ABSPATH')) {
     exit;
@@ -181,7 +182,7 @@ class Client_Access
      * The row a site owner set on this client and user that the current
      * user may not widen by approving the client again (issue #505): one
      * written by someone other than $user_id, narrower than full access,
-     * while the current user cannot manage WP MCP. Null when there is no
+     * while the current user cannot manage WPMCP. Null when there is no
      * such restriction, so the consent choice applies as made.
      *
      * @return array{client_id: string, user_id: int, level: string, identity: string, set_by: int, set_at: int}|null
@@ -307,7 +308,11 @@ class Client_Access
             return null;
         }
 
-        return new \WP_Error(
+        // The unavailability contract (issues #627, #628), so the scope
+        // reason reaches the client with the code.
+        $unavailable = new Unavailable('scope_read_only', '', sprintf('Reconnect the MCP client and grant the "%s" scope.', self::SCOPE_FULL));
+
+        return $unavailable->attach(new \WP_Error(
             'insufficient_scope',
             sprintf(
                 /* translators: 1: ability name, 2: its operation (create, update or delete), 3: the OAuth scope it needs. */
@@ -317,7 +322,7 @@ class Client_Access
                 self::SCOPE_FULL
             ),
             ['status' => 403, 'scope' => self::SCOPE_FULL]
-        );
+        ));
     }
 
     /**

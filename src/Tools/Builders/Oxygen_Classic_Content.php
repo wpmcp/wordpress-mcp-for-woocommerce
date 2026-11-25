@@ -206,7 +206,8 @@ class Oxygen_Classic_Content
 
     /**
      * The refusal for a tree holding a new value wp_kses_post would change,
-     * or null. Post meta skips kses, so a user without unfiltered_html could
+     * or new code (see Oxygen_Classic_Code_Fields), or null. Post meta skips
+     * kses, so a user without unfiltered_html could
      * otherwise store a script on the page (the shortcode copy is generated
      * from the tree, so the tree is what is checked). Values the stored tree
      * holds, or $known holds, were stored by someone allowed to.
@@ -215,7 +216,7 @@ class Oxygen_Classic_Content
      */
     public static function kses_refusal(int $post_id, string $json, mixed $known = null): ?\WP_Error
     {
-        return (new Kses_Safety())->values_refusal([json_decode(self::get_json($post_id), true), $known], json_decode($json, true), 'Oxygen page');
+        return (new Kses_Safety())->values_refusal([json_decode(self::get_json($post_id), true), $known], json_decode($json, true), 'Oxygen page', new Oxygen_Classic_Code_Fields());
     }
 
     /**

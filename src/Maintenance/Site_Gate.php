@@ -11,7 +11,7 @@ if (! defined('ABSPATH')) {
  * The real state of the site's front door (issue #903): which mechanism, if
  * any, is turning visitors away, what they get, and who walks past it.
  *
- * A site can be gated by WP MCP's own maintenance option, by WordPress core's
+ * A site can be gated by WPMCP's own maintenance option, by WordPress core's
  * .maintenance upgrade flag, or by one of the coming soon and maintenance
  * plugins (SeedProd, WP Maintenance Mode, Under Construction, Maintenance,
  * CMP). Reading only the first, as get-maintenance-status did, answers "off"
@@ -165,7 +165,7 @@ final class Site_Gate
     }
 
     // ---------------------------------------------------------------
-    // WP MCP and WordPress core
+    // WPMCP and WordPress core
     // ---------------------------------------------------------------
 
     private static function wpmcp_gate(): array
@@ -179,7 +179,7 @@ final class Site_Gate
             'retry_after'  => $own ? (int) ($option['retry_after'] ?? 0) : null,
             'headline'     => $own ? (string) ($option['message'] ?? '') : null,
             'bypass'       => [ 'roles' => [], 'capability' => 'manage_options', 'logged_in_users' => 'only users with manage_options' ],
-            'visitors_see' => 'A 503 with a plain text message (WP MCP maintenance mode' . ($restore && ! $own ? ', a database restore is running' : '') . ').',
+            'visitors_see' => 'A 503 with a plain text message (WPMCP maintenance mode' . ($restore && ! $own ? ', a database restore is running' : '') . ').',
         ]);
     }
 

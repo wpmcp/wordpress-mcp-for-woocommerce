@@ -157,7 +157,7 @@ class Site_Backup_Dir
         if (! is_file($dir . '/README.txt')) {
             @file_put_contents(
                 $dir . '/README.txt',
-                "WP MCP site backups.\n\n"
+                "WPMCP site backups.\n\n"
                 . "Each archive holds a full database dump, including password hashes and\n"
                 . "secret keys. The .htaccess here denies direct web access on Apache. If\n"
                 . "this site runs nginx or another server that ignores .htaccess, block\n"

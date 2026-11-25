@@ -19,34 +19,48 @@ if (! defined('ABSPATH')) {
  * PKCE method (never 'plain'), and client_secret_post as the sole token
  * endpoint auth method for registered clients -- every client
  * Client_Store::create() registers is issued a secret and
- * Token_Grant::exchange() requires it. Client ID Metadata Document clients
- * (issue #388) are public, so while that support is on, 'none' is
- * advertised too, with client_id_metadata_document_supported.
+ * Token_Grant::exchange() requires it. While Client ID Metadata Document
+ * support (issue #388) is on, 'none' is advertised for public CIMD clients
+ * and 'private_key_jwt' for those that sign RFC 7523 client assertions
+ * (issue #1098, ChatGPT), with the signing algorithms Client_Assertion
+ * verifies and client_id_metadata_document_supported.
  */
 class Authorization_Server_Metadata
 {
     public static function build(string $issuer): array
     {
-        $base = rtrim($issuer, '/') . '/wp-json/wpmcp/v1/oauth';
+        $base = self::base($issuer);
         $cimd = Client_Metadata_Document::is_enabled();
 
         $doc = [
             'issuer'                                => $issuer,
             'authorization_endpoint'                 => $base . '/authorize',
-            'token_endpoint'                          => $base . '/token',
+            'token_endpoint'                          => self::token_endpoint($issuer),
             'registration_endpoint'                   => $base . '/register',
             'response_types_supported'                => ['code'],
             'grant_types_supported'                   => ['authorization_code', 'refresh_token'],
             'code_challenge_methods_supported'        => ['S256'],
-            'token_endpoint_auth_methods_supported'   => $cimd ? ['client_secret_post', 'none'] : ['client_secret_post'],
+            'token_endpoint_auth_methods_supported'   => $cimd ? ['client_secret_post', 'none', Client_Assertion::METHOD] : ['client_secret_post'],
             'scopes_supported'                        => Mcp_Resource::SCOPES_SUPPORTED,
         ];
 
         if ($cimd) {
-            $doc['client_id_metadata_document_supported'] = true;
+            $doc['token_endpoint_auth_signing_alg_values_supported'] = Client_Assertion::ALGORITHMS;
+            $doc['client_id_metadata_document_supported']            = true;
         }
 
         return $doc;
+    }
+
+    /** The token endpoint URL advertised for $issuer; also a valid client assertion aud. */
+    public static function token_endpoint(string $issuer): string
+    {
+        return self::base($issuer) . '/token';
+    }
+
+    private static function base(string $issuer): string
+    {
+        return rtrim($issuer, '/') . '/wp-json/wpmcp/v1/oauth';
     }
 
     /**

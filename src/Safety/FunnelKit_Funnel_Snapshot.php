@@ -173,6 +173,7 @@ final class FunnelKit_Funnel_Snapshot
         $removed  = array_map('intval', (array) ($effects['removed_steps'] ?? []));
         $captured = self::captured_posts($data);
         $current  = self::row($id);
+        $lists    = null === $current ? [] : FunnelKit_Offer_Lists::lists($current);
 
         if (null === $current && null !== $effects && empty($effects['funnel_removed'])) {
             return "FunnelKit funnel {$id} was deleted since this operation; it was not brought back.";
@@ -233,6 +234,9 @@ final class FunnelKit_Funnel_Snapshot
                 // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- raw meta row at its own meta_id.
                 $wpdb->insert(self::meta_table(), (array) $meta);
             }
+        }
+        if ([] !== $later || [] !== $gone) {
+            FunnelKit_Offer_Lists::reconcile($row, $lists, $later, $gone);
         }
         self::flush_caches($id);
 
@@ -376,7 +380,8 @@ final class FunnelKit_Funnel_Snapshot
     }
 
     /**
-     * The post ids a funnel row lists: each step, then its substeps.
+     * The post ids a funnel row lists: each step, then its substeps, then the
+     * offers its post-purchase offer steps list (FunnelKit_Offer_Lists, issue #1021).
      *
      * @return int[]
      */
@@ -395,6 +400,7 @@ final class FunnelKit_Funnel_Snapshot
                 }
             }
         }
+        $ids = array_merge($ids, FunnelKit_Offer_Lists::offer_ids($row));
         return array_values(array_unique(array_filter($ids, static fn (int $id): bool => $id > 0)));
     }
 

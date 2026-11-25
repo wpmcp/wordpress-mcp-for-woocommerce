@@ -9,7 +9,7 @@ if (! defined('ABSPATH')) {
 }
 
 /**
- * Every store WP MCP owns, in one place (issue #480), and the opt-in that
+ * Every store WPMCP owns, in one place (issue #480), and the opt-in that
  * deletes them all when the plugin is deleted.
  *
  * Uninstaller removes exactly what is listed here, so a new table, option,
@@ -23,7 +23,7 @@ if (! defined('ABSPATH')) {
  * the directory builds prune some of the owning classes. The guard test
  * pins each string to its owner's constant.
  *
- * Not listed, on purpose: posts of WP MCP's own post types (blocks,
+ * Not listed, on purpose: posts of WPMCP's own post types (blocks,
  * templates, widgets, memory entries, chat conversations) and their post
  * meta. They are site content the owner made, and pages may still use them.
  */
@@ -103,6 +103,9 @@ final class Data_Registry
     /** @var array{0: bool, 1: mixed}|null */
     private static ?array $constant_for_tests = null;
 
+    /** @var array<string, array<string, mixed>>|null Test seam: module data in place of build/registry/data.php. */
+    private static ?array $module_data_for_tests = null;
+
     /** Whether deleting the plugin should delete all of its data. */
     public static function delete_on_uninstall(): bool
     {
@@ -131,7 +134,93 @@ final class Data_Registry
 
     public static function owns_option(string $name): bool
     {
-        return self::starts_with_any($name, self::OPTION_PREFIXES);
+        return self::starts_with_any($name, self::OPTION_PREFIXES) || in_array($name, self::module_stores('options'), true);
+    }
+
+    /**
+     * TABLES, then the tables modules declare with #[Owns_Data] (compiled
+     * into build/registry/data.php). Read without an autoloader, so
+     * uninstall.php can call it.
+     *
+     * @return list<string>
+     */
+    public static function tables(): array
+    {
+        return self::merged(self::TABLES, self::module_stores('tables'), 'table');
+    }
+
+    /**
+     * Option names modules declare with #[Owns_Data], deleted on uninstall
+     * besides everything OPTION_PREFIXES matches.
+     *
+     * @return list<string>
+     */
+    public static function module_options(): array
+    {
+        return self::module_stores('options');
+    }
+
+    /**
+     * User meta keys modules declare with #[Owns_Data], deleted on uninstall
+     * besides everything USER_META_PREFIXES matches.
+     *
+     * @return list<string>
+     */
+    public static function module_user_meta(): array
+    {
+        return self::module_stores('user_meta');
+    }
+
+    /**
+     * Test seam: module data in place of build/registry/data.php (null reads the file again).
+     *
+     * @param array<string, array<string, mixed>>|null $data
+     */
+    public static function set_module_data_for_tests(?array $data): void
+    {
+        self::$module_data_for_tests = $data;
+    }
+
+    /**
+     * One kind of store ('tables', 'options', 'user_meta') across every
+     * module in build/registry/data.php, which the release builds ship.
+     *
+     * @return list<string>
+     */
+    private static function module_stores(string $kind): array
+    {
+        $data = self::$module_data_for_tests;
+        if (null === $data) {
+            $file = dirname(__DIR__) . '/build/registry/data.php';
+            $data = is_file($file) ? require $file : [];
+        }
+        $out = [];
+        foreach ((array) $data as $module) {
+            foreach ((array) (((array) $module)[ $kind ] ?? []) as $name) {
+                if (is_string($name) && '' !== $name) {
+                    $out[] = $name;
+                }
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * The literal list, then the modules' entries; one named in both is an
+     * error (declared by hand and by a module). Kept here rather than in
+     * Kernel\Registry_Rows because uninstall.php loads this file alone.
+     *
+     * @param list<string> $literal
+     * @param list<string> $declared
+     * @return list<string>
+     */
+    private static function merged(array $literal, array $declared, string $what): array
+    {
+        $duplicates = array_values(array_intersect($declared, $literal));
+        if ([] !== $duplicates) {
+            throw new \LogicException(sprintf('Data_Registry %s %s is declared both in a central list and by a module; keep the #[Owns_Data] declaration only.', $what, implode(', ', $duplicates))); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- a developer error, never echoed.
+        }
+        return array_values(array_unique(array_merge($literal, $declared)));
     }
 
     public static function owns_user_meta(string $key): bool
@@ -156,6 +245,7 @@ final class Data_Registry
     public static function reset_for_tests(): void
     {
         self::$constant_for_tests = null;
+        self::$module_data_for_tests = null;
     }
 
     /** @return array{0: bool, 1: mixed} */

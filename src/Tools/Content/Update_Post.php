@@ -3,8 +3,10 @@
 namespace WPMCP\Tools\Content;
 
 use WPMCP\Safety\Kses_Safety;
+use WPMCP\Safety\Post_Write_Refused;
 use WPMCP\Safety\Safe_Mutation;
 use WPMCP\Safety\Save_Filters;
+use WPMCP\Tools\Builders\Builder_Meta_Keys;
 use WPMCP\Tools\Redirects\Redirect_Store;
 use WPMCP\Tools\Redirects\Redirect_Suggestions;
 
@@ -16,8 +18,10 @@ class Update_Post
 {
     private const VALID_STATUSES = ['draft', 'publish', 'pending', 'private', 'future'];
 
-    public function __construct(private readonly Kses_Safety $kses = new Kses_Safety())
-    {
+    public function __construct(
+        private readonly Kses_Safety $kses = new Kses_Safety(),
+        private readonly Builder_Meta_Keys $builder_keys = new Builder_Meta_Keys()
+    ) {
     }
 
     /**
@@ -84,6 +88,16 @@ class Update_Post
         }
         if (isset($args['meta']) && is_array($args['meta'])) {
             Code_Posts::assert_meta_writable((string) $post->post_type, array_map('strval', array_keys($args['meta'])), $post_id);
+            $this->builder_keys->assert_writable(array_map('strval', array_keys($args['meta'])), $post_id);
+            foreach ($args['meta'] as $key => $value) {
+                // A string that is serialized data is unserialized when the row is read.
+                $stored  = get_post_meta($post_id, sanitize_key((string) $key), true);
+                $refusal = $this->kses->serialized_refusal([$stored, maybe_serialize($stored)], $value, 'meta value');
+                if (null !== $refusal) {
+                    // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Post_Write_Refused escapes the message it is given.
+                    throw new Post_Write_Refused($refusal);
+                }
+            }
         }
         if (array_key_exists('content', $args)) {
             // Refused before the snapshot, so nothing is left to undo (#893).

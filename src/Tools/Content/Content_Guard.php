@@ -92,7 +92,7 @@ class Content_Guard
     }
 
     /**
-     * Why the generic tools refuse a post type, when it is one of WP MCP's
+     * Why the generic tools refuse a post type, when it is one of WPMCP's
      * own stores with tools of its own; null otherwise. The memory message
      * names the memory tools so the agent knows the sanctioned path.
      */
@@ -626,15 +626,40 @@ class Content_Guard
         return ! in_array($post_type, self::INTERNAL_TYPES, true);
     }
 
-    /** Returns true if allowed, or a string error message if the meta map contains a protected key. */
+    /**
+     * Returns true if allowed, or a string error message if the meta map
+     * contains a protected key. A key is judged as it may be stored (see
+     * stored_keys()), so a protected key is refused in any spelling.
+     */
     public static function check_meta(array $meta)
     {
         foreach (array_keys($meta) as $key) {
             $key = (string) $key;
-            if ('_' === substr($key, 0, 1) || is_protected_meta($key, 'post')) {
-                return 'Refusing to write protected meta key "' . esc_html($key) . '".';
+            // MySQL compares meta keys by collation: case, end spaces and
+            // characters that sort like an underscore (a fullwidth one) or
+            // like nothing (a zero width space) still match a stored row, so
+            // only printable ASCII keys are written here.
+            if (1 !== preg_match('/^[\x21-\x7E]+$/', wp_unslash($key))) {
+                return 'Refusing to write meta key "' . esc_html($key) . '": meta keys written here are printable ASCII without spaces.';
+            }
+            foreach (self::stored_keys($key) as $stored) {
+                if ('_' === substr($stored, 0, 1) || is_protected_meta($stored, 'post')) {
+                    return 'Refusing to write protected meta key "' . esc_html($key) . '".';
+                }
             }
         }
         return true;
+    }
+
+    /**
+     * The keys a meta write may store for a key as given: the key itself,
+     * the key update_post_meta() stores (it unslashes keys), and the key
+     * create-post and update-post store (sanitize_key()).
+     *
+     * @return list<string>
+     */
+    public static function stored_keys(string $key): array
+    {
+        return array_values(array_unique(array_filter([$key, wp_unslash($key), sanitize_key($key)], static fn (string $form): bool => '' !== $form)));
     }
 }

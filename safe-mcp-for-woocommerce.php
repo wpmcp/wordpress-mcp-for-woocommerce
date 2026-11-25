@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Safe MCP for WooCommerce
- * Description: AI agents run your WooCommerce store over MCP, with a snapshot before every write and one-click rollback.
- * Version: 1.2.3
+ * Description: AI agents run your WooCommerce store over MCP, with a snapshot before each supported write and one-click rollback.
+ * Version: 2.0.0
  * Requires at least: 6.9
  * Requires PHP: 8.1
  * Requires Plugins: woocommerce
@@ -13,7 +13,7 @@
  */
 if ( ! defined( 'ABSPATH' ) ) { exit; }
 
-// The full WP MCP plugin already bundles everything this build ships, and the
+// The full WPMCP plugin already bundles everything this build ships, and the
 // two share the WPMCP_* constants, the \WPMCP\ namespace, every option, custom
 // table, cron hook and admin menu slug. Running both would double-register the
 // abilities and make class resolution depend on which vendor/ autoloader was
@@ -30,13 +30,13 @@ if ( wpmcp_flavor_should_defer( __FILE__, 'woocommerce', defined( 'WPMCP_VERSION
 	// slug's language packs just in time for the notice below.
 	add_action( 'admin_notices', function () {
 		echo '<div class="notice notice-warning"><p>';
-		echo esc_html__( 'Safe MCP for WooCommerce is inactive because another WP MCP build that already includes all of its tools is active on this site.', 'safe-mcp-for-woocommerce' );
+		echo esc_html__( 'Safe MCP for WooCommerce is inactive because another WPMCP build that already includes all of its tools is active on this site.', 'safe-mcp-for-woocommerce' );
 		echo '</p></div>';
 	} );
 	return;
 }
 
-define( 'WPMCP_VERSION', '1.2.3' );
+define( 'WPMCP_VERSION', '2.0.0' );
 define( 'WPMCP_FLAVOR', 'woocommerce' );
 // Must match the Text Domain header above. The build rewrites every string
 // in src/ to this domain, so the loader has to load into it too (issue #184).

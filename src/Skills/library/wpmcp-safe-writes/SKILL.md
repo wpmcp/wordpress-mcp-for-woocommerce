@@ -1,6 +1,6 @@
 ---
 name: Safe writes, snapshots and rollback
-description: How wpmcp snapshots every mutation before it runs, how to verify a write landed, and how to undo one operation or a whole session when it did not.
+description: How wpmcp takes a snapshot before each supported write, how to verify a write landed, and how to undo one operation or a whole session when it did not.
 version: 1.0.0
 tier: free
 tags: [safety, snapshots, rollback, core]

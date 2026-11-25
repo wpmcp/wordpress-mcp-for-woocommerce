@@ -56,7 +56,7 @@ class New_Tools_Notice
         $dismiss = wp_nonce_url(admin_url('admin-post.php?action=' . self::DISMISS_ACTION), self::NONCE_ACTION);
         $screen  = admin_url('admin.php?page=' . Ability_Grid_Page::SLUG);
 
-        echo '<div class="notice notice-info"><p>' . esc_html__('This WP MCP update added new tools:', 'safe-mcp-for-woocommerce') . '</p>';
+        echo '<div class="notice notice-info"><p>' . esc_html__('This WPMCP update added new tools:', 'safe-mcp-for-woocommerce') . '</p>';
         echo '<ul style="list-style: disc; padding-left: 2em;">';
         foreach ($added['tools'] as $name => $state) {
             printf(
@@ -78,7 +78,7 @@ class New_Tools_Notice
     public static function handle_dismiss(): void
     {
         if (! current_user_can(Management_Access::CAPABILITY)) {
-            wp_die(esc_html__('You are not allowed to change WP MCP settings.', 'safe-mcp-for-woocommerce'), '', ['response' => 403]);
+            wp_die(esc_html__('You are not allowed to change WPMCP settings.', 'safe-mcp-for-woocommerce'), '', ['response' => 403]);
         }
         check_admin_referer(self::NONCE_ACTION);
 

@@ -66,7 +66,7 @@ class Backup_Dir_Health
 
         return sprintf(
             /* translators: %s: the backup folder path. */
-            __('WP MCP backup archives in %s can be downloaded from the web: the server returned a test file placed there. Block that folder in the web server config, or define WPMCP_BACKUP_DIR in wp-config.php with a folder outside the web root.', 'safe-mcp-for-woocommerce'),
+            __('WPMCP backup archives in %s can be downloaded from the web: the server returned a test file placed there. Block that folder in the web server config, or define WPMCP_BACKUP_DIR in wp-config.php with a folder outside the web root.', 'safe-mcp-for-woocommerce'),
             (string) $last['path']
         );
     }

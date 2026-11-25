@@ -4,6 +4,8 @@ namespace WPMCP\Tools\Content;
 
 use WPMCP\Safety\Kses_Safety;
 use WPMCP\Safety\Post_Creation_Snapshot;
+use WPMCP\Safety\Post_Write_Refused;
+use WPMCP\Tools\Builders\Builder_Meta_Keys;
 
 if (! defined('ABSPATH')) {
     exit;
@@ -13,8 +15,10 @@ class Create_Post
 {
     private const VALID_STATUSES = ['draft', 'publish', 'pending', 'private', 'future'];
 
-    public function __construct(private readonly Kses_Safety $kses = new Kses_Safety())
-    {
+    public function __construct(
+        private readonly Kses_Safety $kses = new Kses_Safety(),
+        private readonly Builder_Meta_Keys $builder_keys = new Builder_Meta_Keys()
+    ) {
     }
 
     /**
@@ -51,6 +55,15 @@ class Create_Post
                 throw new \InvalidArgumentException($guard);
             }
             Code_Posts::assert_meta_writable($post_type, array_map('strval', array_keys($args['meta'])));
+            $this->builder_keys->assert_writable(array_map('strval', array_keys($args['meta'])));
+            foreach ($args['meta'] as $value) {
+                // A string that is serialized data is unserialized when the row is read.
+                $refusal = $this->kses->serialized_refusal(null, $value, 'meta value');
+                if (null !== $refusal) {
+                    // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Post_Write_Refused escapes the message it is given.
+                    throw new Post_Write_Refused($refusal);
+                }
+            }
         }
 
         Post_Status_Guard::assert($post_type, $status, true);

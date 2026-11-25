@@ -10,16 +10,29 @@
     "wp-phpunit/wp-phpunit": "^6.9",
     "squizlabs/php_codesniffer": "^3.9",
     "wp-coding-standards/wpcs": "^3.1",
-    "brianium/paratest": "^6.11"
+    "brianium/paratest": "^6.11",
+    "phpstan/phpstan": "^2.1",
+    "szepeviktor/phpstan-wordpress": "^2.0",
+    "slevomat/coding-standard": "^8.15"
   },
-  "autoload": { "psr-4": { "WPMCP\\": "src/" } },
+  "autoload": {
+    "psr-4": {
+      "WPMCP\\Modules\\": ["src/Modules/", "pro/modules/"],
+      "WPMCP\\": ["src/", "pro/src/"]
+    }
+  },
   "autoload-dev": {
     "psr-4": {
-      "WPMCP\\Tests\\Free\\": "tests/free/",
-      "WPMCP\\Tests\\Pro\\": "tests/pro/",
+      "WPMCP\\Tests\\Free\\": ["tests/free/", "pro/tests/free/"],
+      "WPMCP\\Tests\\Pro\\": ["tests/pro/", "pro/tests/pro/"],
       "WPMCP\\Compliance\\": "tools/compliance/src/",
-      "WPMCP\\Lint\\": "tools/lint/src/"
-    }
+      "WPMCP\\Lint\\": "tools/lint/src/",
+      "WPMCP\\Registry\\": "tools/registry/src/",
+      "WPMCP\\PHPStan\\": "tools/phpstan/src/",
+      "WPMCP\\Tests\\Kernel\\": "tests/kernel/",
+      "WPMCP\\Tests\\Modules\\": "tests/modules/"
+    },
+    "classmap": ["tests/kernel/Fixture/"]
   },
   "scripts": {
     "test": "phpunit",
@@ -37,7 +50,15 @@
     "compliance:wporg": "php tools/compliance/bin/compliance.php --profile=wporg-free --no-artifact",
     "check:flavors": "bash bin/check-flavors.sh",
     "build:wporg": "bash scripts/build-wporg-release.sh",
-    "build:woo": "bash scripts/build-woo-release.sh"
+    "build:woo": "bash scripts/build-woo-release.sh",
+    "registry:build": "@php bin/build-registry.php",
+    "registry:check": "@php bin/build-registry.php --check --all-flavors",
+    "standard": "bash bin/standard.sh",
+    "standard:diff": "bash bin/standard.sh --diff=origin/main",
+    "make:module": "@php bin/make-module.php",
+    "test:kernel": "phpunit -c phpunit-fast.xml.dist --testsuite kernel,modules",
+    "test:module": "@php bin/test-module.php",
+    "post-autoload-dump": "[ ! -f bin/build-registry.php ] || php bin/build-registry.php --auto --quiet"
   },
   "config": {
     "allow-plugins": { "*": true },

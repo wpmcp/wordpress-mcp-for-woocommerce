@@ -9,6 +9,7 @@ use WPMCP\MCP\Ability;
 use WPMCP\MCP\Registrar;
 use WPMCP\Plugin;
 use WPMCP\Safety\Safe_Mutation;
+use WPMCP\Safety\Session_Id;
 use WPMCP\Safety\Snapshot;
 
 if (! defined('ABSPATH')) {
@@ -146,7 +147,7 @@ class Update_Governance_Settings
             return new \WP_Error(
                 'wpmcp_governance_lockout',
                 sprintf(
-                    'Refusing to switch off %s: that would disable the tools an MCP client needs to read, change and undo governance, and no MCP client could switch them back on. Nothing was written. An administrator can change these toggles under WP MCP > Abilities in wp-admin.',
+                    'Refusing to switch off %s: that would disable the tools an MCP client needs to read, change and undo governance, and no MCP client could switch them back on. Nothing was written. An administrator can change these toggles under WPMCP > Abilities in wp-admin.',
                     implode('; ', $lockout)
                 ),
                 [ 'refused' => $lockout ]
@@ -197,7 +198,7 @@ class Update_Governance_Settings
                 'object_type' => 'option_set',
                 'object_id'   => Snapshot::option_set_id([ Governance::OPTION, Site_Wide_Governance::OPTION, New_Tools_Policy::OPTION ]),
                 'object_ref'  => 'governance settings',
-                'session_id'  => 'default',
+                'session_id'  => Session_Id::of($args),
                 'tool_name'   => 'update-governance-settings',
                 'args'        => $args,
             ],

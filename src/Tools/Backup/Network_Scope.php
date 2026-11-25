@@ -33,7 +33,7 @@ if (! defined('ABSPATH')) {
  * signed-in user (the WP-Cron run of a backup job already queued through
  * the gated trigger-backup) is let through: there is no caller to scope.
  * That rests on the job runner, not on the queue being unreachable: agents
- * cannot queue WP MCP's own cron hooks (Core_Hooks::is_internal(), issue
+ * cannot queue WPMCP's own cron hooks (Core_Hooks::is_internal(), issue
  * #563), Run_Backup_Job runs only a job that is still queued, and it
  * re-checks the capability of the user who queued it (or, for a scheduled
  * job, the schedule's creator).

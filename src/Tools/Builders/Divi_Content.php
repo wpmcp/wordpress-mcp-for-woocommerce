@@ -3,6 +3,7 @@
 namespace WPMCP\Tools\Builders;
 
 use WPMCP\Safety\Kses_Safety;
+use WPMCP\Safety\Post_Write_Refused;
 use WPMCP\Safety\Save_Filters;
 
 if (! defined('ABSPATH')) {
@@ -48,8 +49,11 @@ class Divi_Content
             self::save5($post_id, $content);
             return;
         }
-        // Nothing is written when kses would rewrite the layout (#1243).
-        (new Kses_Safety())->assert_content($post_id, $content, 'Divi page');
+        // Nothing is written when kses would rewrite the layout (#1243), or
+        // when it holds a new code module (see Divi_Code_Fields).
+        $kses = new Kses_Safety();
+        $kses->assert_values(self::get_content($post_id), $content, 'Divi page', new Divi_Code_Fields());
+        $kses->assert_content($post_id, $content, 'Divi page');
         Save_Filters::update_post([
             'ID'           => $post_id,
             'post_content' => wp_slash($content),
@@ -146,10 +150,35 @@ class Divi_Content
         return $out;
     }
 
-    /** Write a Divi 5 layout and set both flags Divi 5's own save sets. */
+    /**
+     * The refusal for a Divi 5 layout a user without unfiltered_html may not
+     * store, or null. The post_content filter cannot see into the block
+     * attribute JSON (Divi 5 keeps its text and markup there, with tags
+     * escaped), so the decoded values are judged like any builder's: a new
+     * value kses would change, or new code (see Divi_Code_Fields), is
+     * refused. Values the page already holds were stored by someone allowed
+     * to. Then the content as a whole, as the save will filter it.
+     */
+    public static function kses_refusal(int $post_id, string $content): ?\WP_Error
+    {
+        $kses = new Kses_Safety();
+
+        return $kses->values_refusal(parse_blocks(self::get_content($post_id)), parse_blocks($content), 'Divi page', new Divi_Code_Fields())
+            ?? $kses->content_refusal($post_id, $content, 'Divi page');
+    }
+
+    /**
+     * Write a Divi 5 layout and set both flags Divi 5's own save sets.
+     *
+     * @throws Post_Write_Refused When kses_refusal() refuses the layout; nothing is written.
+     */
     public static function save5(int $post_id, string $content): void
     {
-        (new Kses_Safety())->assert_content($post_id, $content, 'Divi page');
+        $refusal = self::kses_refusal($post_id, $content);
+        if (null !== $refusal) {
+            // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Post_Write_Refused escapes the message it is given.
+            throw new Post_Write_Refused($refusal);
+        }
         Save_Filters::update_post([
             'ID'           => $post_id,
             'post_content' => wp_slash($content),

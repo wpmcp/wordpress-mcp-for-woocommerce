@@ -101,7 +101,12 @@ class Skills_Settings_Page
                                 echo esc_html(sprintf(
                                     /* translators: %s: comma-separated ability names. */
                                     __('Hidden, requires: %s', 'safe-mcp-for-woocommerce'),
-                                    implode(', ', $skill['missing_abilities'])
+                                    implode(', ', $skill['missing_abilities'] ?? [])
+                                        . (isset($skill['missing_any']) ? ' ' . sprintf(
+                                            /* translators: %s: comma-separated ability or operation names. */
+                                            __('(one of: %s)', 'safe-mcp-for-woocommerce'),
+                                            implode(', ', $skill['missing_any'])
+                                        ) : '')
                                 ));
                             } else {
                                 echo esc_html__('Served', 'safe-mcp-for-woocommerce');

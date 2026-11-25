@@ -27,7 +27,10 @@ class List_Revisions
             $rows[] = [
                 'revision_id' => (int) $revision->ID,
                 'author_id'   => (int) $revision->post_author,
+                // Site-local time, kept for compatibility; date_gmt and
+                // date_iso give the same moment in UTC (issue #1199).
                 'date'        => (string) $revision->post_date,
+            ] + Revision_Time::fields($revision) + [
                 'excerpt'     => null === $code ? wp_trim_words((string) $revision->post_content, 20) : '',
             ];
         }

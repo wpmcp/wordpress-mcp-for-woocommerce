@@ -60,20 +60,18 @@ class Breakdance_Content
             'tree'          => Breakdance_Tree::nodes($doc),
         ];
 
-        // Oxygen 6 writes are pinned to the hash of the stored row (issue
-        // #635), and the read names the loaded version and the revisions
-        // restore can put back.
-        if ('oxygen' === $builder) {
-            $version = Oxygen_Page::plugin_version();
-            $out    += [
-                'plugin_version' => $version,
-                'hash'           => Oxygen_Page::hash($post_id),
-                'revisions'      => Oxygen_Page::revisions($post_id),
-            ];
-            $note = Oxygen_Page::version_note($version);
-            if (null !== $note) {
-                $out['version_note'] = $note;
-            }
+        // Writes on both products are pinned to the hash of the stored row
+        // (issues #634, #635), and the read names the loaded version and the
+        // revisions restore can put back.
+        $version = Breakdance_Page::plugin_version($builder);
+        $out    += [
+            'plugin_version' => $version,
+            'hash'           => Breakdance_Page::hash($post_id, $builder),
+            'revisions'      => Breakdance_Page::revisions($post_id, $builder),
+        ];
+        $note = Breakdance_Page::version_note($builder, $version);
+        if (null !== $note) {
+            $out['version_note'] = $note;
         }
 
         return $out;
@@ -81,7 +79,8 @@ class Breakdance_Content
 
     /**
      * The refusal for a document holding a new value wp_kses_post would
-     * change, or null. Post meta skips kses, so a user without
+     * change, or new code (see Breakdance_Code_Fields), or null. Post meta
+     * skips kses, so a user without
      * unfiltered_html could otherwise store a script on the page. Values the
      * stored document holds, or $known holds (the stored source a copy, an
      * insert or a restore takes them from), were stored by someone allowed to.
@@ -92,7 +91,7 @@ class Breakdance_Content
     {
         $subject = 'oxygen' === $builder ? 'Oxygen page' : 'Breakdance page';
 
-        return (new Kses_Safety())->values_refusal([self::get_document($post_id, $builder), $known], $doc, $subject);
+        return (new Kses_Safety())->values_refusal([self::get_document($post_id, $builder), $known], $doc, $subject, new Breakdance_Code_Fields($builder));
     }
 
     /**

@@ -38,6 +38,12 @@ class Registrar
      */
     private array $held_for_plugin = [];
 
+    /**
+     * The Pro tools this copy knows by name only (issue #628), read from the
+     * compiled registry on first use when none was given. See pro_catalog().
+     */
+    private ?Pro_Catalog $pro_catalog;
+
     /** @var array<string, true> abilities whose execute() has begun but not yet checked permission. */
     private static array $invoked = [];
 
@@ -69,6 +75,25 @@ class Registrar
     public static function current_call(): int
     {
         return self::$depth > 0 ? self::$call_id : 0;
+    }
+
+    /** @param Pro_Catalog|null $pro_catalog the Pro tool names this copy knows; null reads the build's list when first needed */
+    public function __construct(?Pro_Catalog $pro_catalog = null)
+    {
+        $this->pro_catalog = $pro_catalog;
+    }
+
+    /**
+     * The Pro tools this copy knows by name only: the build's list on a copy
+     * without the Pro code (the free zip), none where the Pro code is
+     * loaded, whose own abilities answer. Read once, when a refusal needs it.
+     */
+    private function pro_catalog(): Pro_Catalog
+    {
+        return $this->pro_catalog ??= Pro_Catalog::for_build(
+            defined('WPMCP_PRO_BUILD'),
+            \WPMCP\Plugin::instance()->kernel()->registry()->data_file(Pro_Catalog::DATA_FILE)
+        );
     }
 
     /**
@@ -195,7 +220,53 @@ class Registrar
 
         // An input naming an agent memory entry is told to use the memory
         // tools (issue #517) rather than handed a bare permission denial.
-        return Client_Access::denial($a) ?? self::plugin_missing($a) ?? Content_Guard::input_refusal($a, $input) ?? self::capability_refusal($a, $input) ?? false;
+        // A refusal names the rule that stopped the call (issue #627): an
+        // identity whose scope or address rule refused it, or a project
+        // memory block, instead of a bare "Permission denied".
+        return Client_Access::denial($a)
+            ?? self::plugin_missing($a)
+            ?? self::identity_refusal($a)
+            ?? Content_Guard::input_refusal($a, $input)
+            ?? self::capability_refusal($a, $input)
+            ?? $this->memory_refusal($a, $input)
+            ?? false;
+    }
+
+    /**
+     * The refusal when the identity this connection acts as is why the call
+     * is denied (issue #627): an unknown identity, an address the identity
+     * does not allow (identity_ip_not_allowed), or a tool outside its scope
+     * (identity_scope). Null when no identity is active or it allows the
+     * tool. Never names the address or the identity's allowed list.
+     */
+    private static function identity_refusal(Ability $a): ?\WP_Error
+    {
+        if (null === Identity_Context::current() || Governance::is_within_identity_scope($a)) {
+            return null;
+        }
+        $unavailable = Availability::explain_identity($a);
+
+        return null === $unavailable ? null : $unavailable->to_wp_error();
+    }
+
+    /**
+     * The refusal when a published severity=block project memory entry is
+     * what denied the call (issue #627), as memory_blocked with the entry id.
+     * Asked only after every other refusal came back empty, and only when
+     * the denial's own reason is that memory block, so it never takes the
+     * blame for a post or object denial.
+     *
+     * @param array<string, mixed> $input
+     */
+    private function memory_refusal(Ability $a, array $input): ?\WP_Error
+    {
+        $reason = (string) $this->denial_reason($a, $input);
+        if (0 !== strpos($reason, 'memory-block:')) {
+            return null;
+        }
+        $entry = (int) substr($reason, strlen('memory-block:'));
+
+        return Availability::memory_blocked($a, $entry)->to_wp_error('', [ 'memory_entry' => $entry ]);
     }
 
     /**
@@ -351,7 +422,8 @@ class Registrar
             $data['operation'] = $operation;
         }
 
-        return new \WP_Error('operation_denied', $message, $data);
+        $unavailable = new Unavailable('capability_missing', '', 'Ask a site administrator for a role that has the capability.', [ 'admin_url' => admin_url('users.php') ]);
+        return $unavailable->attach(new \WP_Error('operation_denied', $message, $data));
     }
 
     /**
@@ -412,6 +484,16 @@ class Registrar
     }
 
     /**
+     * The plugin a domain's tools need, by name, when it is not loaded, or
+     * null when it is loaded or the domain needs none (issue #629: the
+     * availability report names it).
+     */
+    public static function missing_domain_plugin(string $domain): ?string
+    {
+        return self::plugin_loaded($domain) ? null : self::PLUGIN_DOMAINS[ $domain ]['name'];
+    }
+
+    /**
      * The refusal for a tool whose plugin is not active (issue #631), or
      * null when the plugin is loaded or the tool needs none. Asked twice:
      * after a permission denial, because a plugin never installed leaves no
@@ -426,9 +508,10 @@ class Registrar
         if (self::plugin_loaded($a->domain)) {
             return null;
         }
-        $dependency = self::PLUGIN_DOMAINS[ $a->domain ];
+        $dependency  = self::PLUGIN_DOMAINS[ $a->domain ];
+        $unavailable = new Unavailable('plugin_missing', '', 'A site administrator installs and activates the plugin.', [ 'admin_url' => admin_url('plugins.php') ]);
 
-        return new \WP_Error(
+        return $unavailable->attach(new \WP_Error(
             'plugin_missing',
             sprintf(
                 '%1$s is not active on this site, so %2$s cannot run. Install and activate %1$s, then try again.',
@@ -436,7 +519,17 @@ class Registrar
                 $a->name
             ),
             [ 'status' => 403, 'plugin' => $dependency['slug'] ]
-        );
+        ));
+    }
+
+    /**
+     * plugin_missing() for Availability::explain() (issue #627): the
+     * refusal when the plugin the ability's domain depends on is not
+     * loaded, or null.
+     */
+    public static function domain_plugin_missing(Ability $a): ?\WP_Error
+    {
+        return self::plugin_missing($a);
     }
 
     /**
@@ -605,6 +698,22 @@ class Registrar
     }
 
     /**
+     * Every ability held back because its plugin is not active (issue
+     * #790), keyed by name, with the plugin to name. Read-only; for the
+     * availability report (issue #629).
+     *
+     * @return array<string, array{ability: Ability, plugin: string, several: bool}>
+     */
+    public function held(): array
+    {
+        $held = [];
+        foreach ($this->held_for_plugin as $name => $entry) {
+            $held[ $name ] = [ 'ability' => $entry['ability'], 'plugin' => $entry['plugin'], 'several' => $entry['several'] ];
+        }
+        return $held;
+    }
+
+    /**
      * The refusal for a name that is not registered because its plugin is
      * not active (issue #790), or null when that is not the reason. Names
      * the plugin to activate instead of claiming no such tool exists. A
@@ -655,7 +764,8 @@ class Registrar
                     $plugins_url
                 );
 
-            return new \WP_Error('plugin_missing', $message, [ 'plugin' => $host['name'], 'operation' => $operation, 'plugins_url' => $plugins_url ]);
+            return ( new Unavailable('plugin_missing', '', 'A site administrator installs and activates the plugin, then the MCP client reconnects.', [ 'admin_url' => $plugins_url ]) )
+                ->attach(new \WP_Error('plugin_missing', $message, [ 'plugin' => $host['name'], 'operation' => $operation, 'plugins_url' => $plugins_url ]));
         }
 
         $message = $held['several']
@@ -672,7 +782,8 @@ class Registrar
                 $plugins_url
             );
 
-        return new \WP_Error('plugin_missing', $message, [ 'plugin' => $held['plugin'], 'plugins_url' => $plugins_url ]);
+        return ( new Unavailable('plugin_missing', '', 'A site administrator installs and activates the plugin, then the MCP client reconnects.', [ 'admin_url' => $plugins_url ]) )
+            ->attach(new \WP_Error('plugin_missing', $message, [ 'plugin' => $held['plugin'], 'plugins_url' => $plugins_url ]));
     }
 
     /**
@@ -688,6 +799,30 @@ class Registrar
             if (Stdio_Transport::tool_name($name) === $tool_name) {
                 return $this->plugin_inactive($name, $arguments);
             }
+        }
+        return null;
+    }
+
+    /**
+     * The refusal for an advertised MCP tool name that this site declares
+     * but does not register for this connection (issue #628): a tool outside
+     * the edition this site runs (declared, or known by name from the build
+     * on a copy that carries none of its code), one governance switched off,
+     * or one held back because its plugin is not active. Null when nothing
+     * declares the name, or it is registered. The transports answer a direct
+     * call with it as a tool error, so only a name nothing declares is
+     * unknown. Grants nothing.
+     *
+     * @param array<mixed> $arguments the call's arguments, if any
+     */
+    public function hidden_for_tool(string $tool_name, array $arguments = []): ?\WP_Error
+    {
+        $arguments = array_filter($arguments, 'is_string', ARRAY_FILTER_USE_KEY);
+        foreach (array_merge(array_keys($this->declared + $this->held_for_plugin), $this->pro_catalog()->names()) as $name) {
+            if (isset($this->abilities[ $name ]) || Stdio_Transport::tool_name($name) !== $tool_name) {
+                continue;
+            }
+            return $this->governance_disabled($name) ?? $this->plugin_inactive($name, $arguments);
         }
         return null;
     }
@@ -715,17 +850,21 @@ class Registrar
         $key                  = 'ability' === $dimension ? $name : $declared->{$dimension};
         if ('toggle' === $kind) {
             $cause = sprintf('the %s toggle for "%s" is off', $dimension, $key);
-            $fix   = 'An administrator can switch it back on under WP MCP > Abilities in wp-admin, or with wpmcp/update-governance-settings.';
+            $fix   = 'An administrator can switch it back on under WPMCP > Abilities in wp-admin, or with wpmcp/update-governance-settings.';
         } else {
             $cause = sprintf('the wpmcp_%s_enabled filter on this site switches off "%s"', $dimension, $key);
             $fix   = 'An administrator or developer has to change that filter in the site code before it can be used.';
         }
 
-        return new \WP_Error(
+        $unavailable = 'toggle' === $kind
+            ? new Unavailable('disabled_by_admin', '', 'A site administrator switches it back on under WPMCP > Abilities.', [ 'admin_url' => admin_url('admin.php?page=wpmcp-abilities') ])
+            : new Unavailable('disabled_by_code', '', 'A site developer changes the governance filter in the site code.');
+
+        return $unavailable->attach(new \WP_Error(
             'governance_disabled',
             sprintf('"%s" is registered on this site but disabled by governance: %s. %s', $name, $cause, $fix),
             [ 'layer' => $layer, 'dimension' => $dimension, 'key' => $key ]
-        );
+        ));
     }
 
     /**
@@ -778,6 +917,7 @@ class Registrar
                         'remaining'   => $status['remaining'],
                     ]
                 );
+                Availability::rate_limited($a, (int) $status['retry_after'])->attach($error);
                 $this->record_outcome($a, $client, $error, 0, $args, null);
                 return $error;
             }
@@ -874,7 +1014,9 @@ class Registrar
      * "callback threw an exception" prefix made a clear refusal read like a
      * crash. A PHP engine error (\Error, such as a TypeError) is a real
      * crash, so it keeps the prefix. An Opt_In_Required refusal gets the
-     * opt_in_required code; everything else keeps ability_callback_exception.
+     * opt_in_required code, with its filter in the data and the
+     * unavailability contract (issue #628); everything else keeps
+     * ability_callback_exception.
      */
     private static function exception_error(Ability $a, \Throwable $e): \WP_Error
     {
@@ -892,10 +1034,11 @@ class Registrar
             );
         }
 
-        return new \WP_Error(
-            $e instanceof Opt_In_Required ? 'opt_in_required' : 'ability_callback_exception',
-            $message
-        );
+        if ($e instanceof Opt_In_Required) {
+            return $e->refusal($message);
+        }
+
+        return new \WP_Error('ability_callback_exception', $message);
     }
 
     /**

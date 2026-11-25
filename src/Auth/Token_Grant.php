@@ -20,10 +20,12 @@ if (! defined('ABSPATH')) {
  * audit log under ability 'oauth/token' with only the allow/deny outcome and
  * client_id, never the code, secret, or the minted token.
  *
- * Client authentication (client_id + client_secret) happens FIRST, before the
- * code is ever consumed: every client this plugin registers via DCR is
- * issued a secret (Client_Store::create() has no "public client" mode yet),
- * so client_secret is required and verified here, and a request that fails
+ * Client authentication happens FIRST, before the code is ever consumed:
+ * every client this plugin registers via DCR is issued a secret
+ * (Client_Store::create() has no "public client" mode yet), so its
+ * client_secret is required and verified here; a Client ID Metadata
+ * Document client authenticates as its document declares (see
+ * authenticate()); and a request that fails
  * client authentication must not burn the code (Code_Store::consume() is
  * single-use, so checking auth first preserves the code for a legitimate
  * retry). This uses the distinct RFC 6749 'invalid_client' error code, since
@@ -79,9 +81,17 @@ class Token_Grant
 
         $client_id     = (string) ($params['client_id'] ?? '');
         $client_secret = (string) ($params['client_secret'] ?? '');
-        if (! self::authenticate($client_id, $client_secret)) {
+        $assertion     = self::assertion($params);
+        if ('' === $client_id && is_string($assertion)) {
+            // RFC 7523 3.1: client_id may be omitted; the assertion names
+            // the client, and authenticate() then verifies that claim.
+            $client_id = (string) Client_Assertion::unverified_issuer($assertion);
+        }
+
+        $authenticated = self::authenticate($client_id, $client_secret, $assertion);
+        if (is_wp_error($authenticated)) {
             self::audit(false, $client_id);
-            return new \WP_Error('invalid_client', 'Client authentication failed.');
+            return $authenticated;
         }
 
         // RFC 8707: a resource sent to the token endpoint must name the
@@ -104,20 +114,75 @@ class Token_Grant
     }
 
     /**
-     * A registered (DCR) client proves itself with its secret. A Client ID
-     * Metadata Document client (issue #388) is public: it presents no
-     * secret, the code it redeems is PKCE-bound, and it must still be
-     * admitted (not denied, and approved when the site requires approval).
-     * A DCR row always wins, so a URL-shaped id can never borrow the public
-     * path to skip a secret it was issued.
+     * How a client proves itself (issues #388, #1098). A DCR row always
+     * wins and needs its secret, so a URL-shaped id can never borrow a CIMD
+     * path to skip a secret it was issued. A Client ID Metadata Document
+     * client must be admitted (not denied, and approved when the site
+     * requires approval) and then authenticates exactly the way its
+     * document declared, never another way:
+     *
+     *  - "none": no secret and no assertion; the code it redeems is
+     *    PKCE-bound;
+     *  - "private_key_jwt": a client assertion Client_Assertion verifies,
+     *    and no secret. PKCE still applies to the code on top.
+     *
+     * Every refusal is 'invalid_client' and happens before a code is spent.
+     *
+     * @param string|\WP_Error|null $assertion From assertion().
      */
-    private static function authenticate(string $client_id, string $client_secret): bool
+    private static function authenticate(string $client_id, string $client_secret, string|\WP_Error|null $assertion): bool|\WP_Error
     {
-        if (null !== Client_Store::get($client_id)) {
-            return Client_Store::verify_secret($client_id, $client_secret);
+        $refused = new \WP_Error('invalid_client', 'Client authentication failed.');
+
+        if (is_wp_error($assertion)) {
+            return $assertion;
         }
 
-        return '' === $client_secret && Client_Metadata_Document::is_admitted($client_id);
+        if (null !== Client_Store::get($client_id)) {
+            return null === $assertion && Client_Store::verify_secret($client_id, $client_secret) ? true : $refused;
+        }
+
+        if ('' !== $client_secret || ! Client_Metadata_Document::is_admitted($client_id)) {
+            return $refused;
+        }
+
+        $auth = Client_Metadata_Document::auth_of($client_id);
+
+        if ('none' === $auth['auth_method']) {
+            return null === $assertion ? true : $refused;
+        }
+
+        if (Client_Assertion::METHOD !== $auth['auth_method'] || null === $assertion) {
+            return $refused;
+        }
+
+        $verified = Client_Assertion::verify($assertion, $client_id, $auth);
+
+        return is_wp_error($verified)
+            ? new \WP_Error('invalid_client', 'Client authentication failed: ' . $verified->get_error_message())
+            : true;
+    }
+
+    /**
+     * The RFC 7523 client assertion in a token request: null when none was
+     * sent, the JWT string, or an error when the parameters are malformed
+     * (a wrong assertion type, or only one of the pair).
+     *
+     * @param array<mixed> $params
+     */
+    private static function assertion(array $params): string|\WP_Error|null
+    {
+        $type      = $params['client_assertion_type'] ?? null;
+        $assertion = $params['client_assertion'] ?? null;
+
+        if (null === $type && null === $assertion) {
+            return null;
+        }
+        if (Client_Assertion::ASSERTION_TYPE !== $type || ! is_string($assertion) || '' === $assertion) {
+            return new \WP_Error('invalid_client', 'Client authentication failed: client_assertion_type must be ' . Client_Assertion::ASSERTION_TYPE . ' with a client_assertion.');
+        }
+
+        return $assertion;
     }
 
     /** The RFC 6749 4.1.3 authorization_code exchange, PKCE-verified. */

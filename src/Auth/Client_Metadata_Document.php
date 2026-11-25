@@ -15,10 +15,12 @@ if (! defined('ABSPATH')) {
  * The client_id is an https URL. When /authorize sees one that is not a
  * dynamically registered client, this class fetches the JSON document at
  * that URL, requires its client_id to equal the URL exactly, and takes the
- * client's name and redirect_uris from it. The client is public: it has no
- * secret, and the token endpoint accepts it on PKCE alone
- * (token_endpoint_auth_method "none"). Documents declaring any other
- * authentication method, or carrying a client_secret, are refused.
+ * client's name and redirect_uris from it. The client has no secret. A
+ * public client (token_endpoint_auth_method "none") is accepted at the
+ * token endpoint on PKCE alone; one declaring "private_key_jwt" (ChatGPT,
+ * issue #1098) must also sign an RFC 7523 client assertion with a key from
+ * its published JWKS (Client_Assertion). Documents declaring a shared-secret
+ * method, or carrying a client_secret, are refused.
  *
  * Fetching a caller-chosen URL is an SSRF surface, so the request is held to
  * the same rules the remote readers use: https only, the default port, no
@@ -68,7 +70,7 @@ class Client_Metadata_Document
     /**
      * Fetch (or read from cache) and validate the document behind $client_id.
      *
-     * @return array{client_id: string, client_name: string, redirect_uris: string[]}|\WP_Error
+     * @return array{client_id: string, client_name: string, redirect_uris: string[], auth_method: string}|\WP_Error
      */
     public static function resolve(string $client_id): array|\WP_Error
     {
@@ -170,53 +172,77 @@ class Client_Metadata_Document
         return max(512, (int) apply_filters('wpmcp_oauth_cimd_max_bytes', self::DEFAULT_MAX_BYTES));
     }
 
-    /** @return array{0: array{client_id: string, client_name: string, redirect_uris: string[]}, 1: int}|\WP_Error */
+    /** @return array{0: array<string, mixed>, 1: int}|\WP_Error */
     private static function fetch(string $client_id): array|\WP_Error
     {
-        $max      = self::max_bytes();
-        $response = wp_safe_remote_get($client_id, [
+        $fetched = self::fetch_json($client_id, self::max_bytes(), 'client metadata document', 'WPMCP-OAuth-Client-Metadata/1.0');
+        if (is_wp_error($fetched)) {
+            return self::invalid($fetched->get_error_message());
+        }
+
+        $client = self::validate_document($fetched['document'], $client_id);
+        if (is_wp_error($client)) {
+            return $client;
+        }
+
+        return [$client, self::cache_ttl($fetched['cache_control'])];
+    }
+
+    /**
+     * The guarded GET behind both the document fetch and the client's JWKS
+     * fetch (issue #1098): the URL must pass assert_safe_url(), redirects
+     * are not followed, the body is capped at $max_bytes and must be a JSON
+     * object. Failure messages are lowercase reasons naming $what.
+     *
+     * @return array{document: array<mixed>, cache_control: string}|\WP_Error
+     */
+    public static function fetch_json(string $url, int $max_bytes, string $what, string $user_agent): array|\WP_Error
+    {
+        try {
+            self::assert_safe_url($url);
+        } catch (\InvalidArgumentException $e) {
+            return new \WP_Error('invalid_client', sprintf('the %s URL is not acceptable: %s', $what, $e->getMessage()));
+        }
+
+        $response = wp_safe_remote_get($url, [
             'timeout'             => self::TIMEOUT,
             'redirection'         => 0,
-            'limit_response_size' => $max + 1,
-            'user-agent'          => 'WPMCP-OAuth-Client-Metadata/1.0',
+            'limit_response_size' => $max_bytes + 1,
+            'user-agent'          => $user_agent,
             'headers'             => ['Accept' => 'application/json'],
         ]);
 
         if (is_wp_error($response)) {
-            return self::invalid('the client metadata document could not be fetched.');
+            return new \WP_Error('invalid_client', sprintf('the %s could not be fetched.', $what));
         }
 
         $code = (int) wp_remote_retrieve_response_code($response);
         if ($code >= 300 && $code < 400) {
-            return self::invalid('the client metadata document URL redirected; redirects are not followed.');
+            return new \WP_Error('invalid_client', sprintf('the %s URL redirected; redirects are not followed.', $what));
         }
         if (200 !== $code) {
-            return self::invalid(sprintf('the client metadata document URL answered HTTP %d.', $code));
+            return new \WP_Error('invalid_client', sprintf('the %s URL answered HTTP %d.', $what, $code));
         }
 
         $declared = wp_remote_retrieve_header($response, 'content-length');
         $body     = (string) wp_remote_retrieve_body($response);
-        if (('' !== (string) $declared && (int) $declared > $max) || strlen($body) > $max) {
-            return self::invalid(sprintf('the client metadata document is larger than %d bytes.', $max));
+        $declared = is_array($declared) ? implode('', array_slice(array_filter($declared, 'is_string'), -1)) : $declared;
+        if (('' !== $declared && (int) $declared > $max_bytes) || strlen($body) > $max_bytes) {
+            return new \WP_Error('invalid_client', sprintf('the %s is larger than %d bytes.', $what, $max_bytes));
         }
 
         $document = json_decode($body, true, 16);
         if (! is_array($document) || array_is_list($document)) {
-            return self::invalid('the client metadata document is not a JSON object.');
-        }
-
-        $client = self::validate_document($document, $client_id);
-        if (is_wp_error($client)) {
-            return $client;
+            return new \WP_Error('invalid_client', sprintf('the %s is not a JSON object.', $what));
         }
 
         $cache_control = wp_remote_retrieve_header($response, 'cache-control');
         $cache_control = is_array($cache_control) ? implode(', ', $cache_control) : (string) $cache_control;
 
-        return [$client, self::cache_ttl($cache_control)];
+        return ['document' => $document, 'cache_control' => $cache_control];
     }
 
-    /** @return array{client_id: string, client_name: string, redirect_uris: string[]}|\WP_Error */
+    /** @return array{client_id: string, client_name: string, redirect_uris: string[], auth_method: string}|\WP_Error */
     private static function validate_document(array $document, string $client_id): array|\WP_Error
     {
         if (! isset($document['client_id']) || $client_id !== $document['client_id']) {
@@ -238,21 +264,102 @@ class Client_Metadata_Document
             }
         }
 
-        // Public clients only: a shared secret cannot be published in a
-        // document anyone can read, and private_key_jwt is not supported.
-        $method = $document['token_endpoint_auth_method'] ?? 'none';
-        if ('none' !== $method) {
-            return self::invalid('only token_endpoint_auth_method "none" is supported for client metadata documents.');
-        }
         if (array_key_exists('client_secret', $document) || array_key_exists('client_secret_expires_at', $document)) {
             return self::invalid('a client metadata document must not carry a client secret.');
+        }
+
+        $auth = self::validate_auth_method($document, $client_id);
+        if (is_wp_error($auth)) {
+            return $auth;
         }
 
         return [
             'client_id'     => $client_id,
             'client_name'   => sanitize_text_field(substr($name, 0, 200)),
             'redirect_uris' => array_values(array_unique($uris)),
-        ];
+        ] + $auth;
+    }
+
+    /**
+     * The token endpoint authentication the document declares (issue
+     * #1098). The singular token_endpoint_auth_method is what the client
+     * will use, so it is honoured as declared and never downgraded:
+     *
+     *  - "none" (or absent): a public client, PKCE alone, as before.
+     *  - "private_key_jwt": RFC 7523 client assertions, as ChatGPT
+     *    declares. The CIMD draft says the server MUST then require that
+     *    authentication. The keys come from a jwks_uri on the document's own
+     *    origin, or an inline jwks; a pinned token_endpoint_auth_signing_alg
+     *    must be one Client_Assertion verifies.
+     *  - anything else, the shared-secret methods included, is refused: a
+     *    secret cannot live in a document anyone can read.
+     *
+     * @param array<mixed> $document
+     * @return array{auth_method: string, jwks_uri?: string, jwks?: array<mixed>, signing_alg?: string}|\WP_Error
+     */
+    private static function validate_auth_method(array $document, string $client_id): array|\WP_Error
+    {
+        $method = $document['token_endpoint_auth_method'] ?? 'none';
+
+        if ('none' === $method) {
+            return ['auth_method' => 'none'];
+        }
+
+        if (Client_Assertion::METHOD !== $method) {
+            $shown = is_string($method) && 1 === preg_match('/^[A-Za-z0-9_.:-]{1,64}$/', $method) ? '"' . $method . '"' : 'an unrecognised value';
+
+            return self::invalid(sprintf(
+                'the document declares token_endpoint_auth_method %s. Client metadata documents may use "none" or "private_key_jwt"; a client that authenticates with a client secret must use dynamic client registration instead.',
+                $shown
+            ));
+        }
+
+        $auth = ['auth_method' => Client_Assertion::METHOD];
+
+        $alg = $document['token_endpoint_auth_signing_alg'] ?? null;
+        if (null !== $alg) {
+            if (! is_string($alg) || ! in_array($alg, Client_Assertion::ALGORITHMS, true)) {
+                return self::invalid('the document\'s token_endpoint_auth_signing_alg is not one of ' . implode(', ', Client_Assertion::ALGORITHMS) . '.');
+            }
+            $auth['signing_alg'] = $alg;
+        }
+
+        $jwks_uri = $document['jwks_uri'] ?? null;
+        $jwks     = $document['jwks'] ?? null;
+        if (null !== $jwks_uri && null !== $jwks) {
+            return self::invalid('the document carries both jwks and jwks_uri; RFC 7591 allows only one.');
+        }
+
+        if (null !== $jwks) {
+            $keys = is_array($jwks) ? Client_Assertion::parse_jwks($jwks) : [];
+            if ([] === $keys) {
+                return self::invalid('the document\'s jwks holds no usable RSA signing key.');
+            }
+            $auth['jwks'] = $jwks;
+
+            return $auth;
+        }
+
+        if (! is_string($jwks_uri) || '' === $jwks_uri) {
+            return self::invalid('a private_key_jwt client must publish its keys at a jwks_uri (or an inline jwks).');
+        }
+
+        try {
+            self::assert_safe_url($jwks_uri);
+        } catch (\InvalidArgumentException $e) {
+            return self::invalid('the document\'s jwks_uri is not acceptable: ' . $e->getMessage());
+        }
+
+        // Same origin as the document: the document is the client's
+        // identity, and a key set it points at elsewhere would let whoever
+        // controls that other host sign for the client.
+        if (strtolower((string) wp_parse_url($jwks_uri, PHP_URL_HOST)) !== strtolower((string) wp_parse_url($client_id, PHP_URL_HOST))) {
+            return self::invalid('the document\'s jwks_uri must be on the same host as its client_id.');
+        }
+
+        $auth['jwks_uri'] = $jwks_uri;
+
+        return $auth;
     }
 
     private static function invalid(string $reason): \WP_Error
@@ -342,12 +449,48 @@ class Client_Metadata_Document
             'status'         => $status,
             'first_seen'     => (int) ($clients[ $client_id ]['first_seen'] ?? time()),
             'last_seen'      => time(),
-        ];
+        ] + self::auth_fields($client);
         self::save(self::trim($clients));
 
         return self::admitted_status($status, $required)
             ? true
             : self::refusal($status);
+    }
+
+    /**
+     * How the token endpoint must authenticate a recorded client (issue
+     * #1098), as its document declared at the last authorization: an
+     * auth_method of "none" or "private_key_jwt", plus jwks_uri or jwks and
+     * an optional signing_alg for the latter. An entry recorded before this
+     * field existed came from a document that could only declare "none".
+     *
+     * @return array{auth_method: string, jwks_uri?: string, jwks?: array<mixed>, signing_alg?: string}
+     */
+    public static function auth_of(string $client_id): array
+    {
+        $entry  = self::clients()[ $client_id ] ?? [];
+        $method = $entry['auth_method'] ?? null;
+
+        return ['auth_method' => is_string($method) ? $method : 'none'] + self::auth_fields($entry);
+    }
+
+    /**
+     * @param array<mixed> $source
+     * @return array{auth_method?: string, jwks_uri?: string, jwks?: array<mixed>, signing_alg?: string}
+     */
+    private static function auth_fields(array $source): array
+    {
+        $fields = [];
+        foreach (['auth_method', 'jwks_uri', 'signing_alg'] as $key) {
+            if (isset($source[ $key ]) && is_string($source[ $key ])) {
+                $fields[ $key ] = $source[ $key ];
+            }
+        }
+        if (isset($source['jwks']) && is_array($source['jwks'])) {
+            $fields['jwks'] = $source['jwks'];
+        }
+
+        return $fields;
     }
 
     /** Whether a CIMD client_id may redeem codes and refresh tokens right now. */
@@ -402,7 +545,7 @@ class Client_Metadata_Document
     {
         return 'denied' === $status
             ? new \WP_Error('access_denied', 'A site administrator has blocked this client.')
-            : new \WP_Error('access_denied', 'This client is waiting for a site administrator to approve it on the WP MCP Connection screen.');
+            : new \WP_Error('access_denied', 'This client is waiting for a site administrator to approve it on the WPMCP Connection screen.');
     }
 
     private static function set_status(string $client_id, string $status): bool

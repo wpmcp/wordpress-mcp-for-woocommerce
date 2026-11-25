@@ -110,7 +110,7 @@ class Get_Page_Snapshot
     private const OPT_IN_SECTIONS = ['global_tokens', 'responsive_overrides'];
 
     /** Builders whose page body is not stored in post_content. */
-    private const OFF_CONTENT_BUILDERS = ['elementor', 'bricks', 'beaver-builder', 'breakdance', 'oxygen', 'oxygen-classic'];
+    private const OFF_CONTENT_BUILDERS = ['elementor', 'bricks', 'beaver-builder', 'breakdance', 'oxygen', 'oxygen-classic', 'kirki'];
 
     /**
      * Sections derived from the extracted content, as paths into the digest.
@@ -357,6 +357,26 @@ class Get_Page_Snapshot
             ];
         }
 
+        if ('brizy' === $builder) {
+            return [
+                'source'             => 'post_content',
+                'complete'           => false,
+                'unmeasured'         => self::CONTENT_SECTIONS,
+                'stale_post_content' => false,
+                'note'               => 'Brizy renders this page from its compiled postmeta, not post_content; the element inventory covers post_content only (get-builder-content reads the Brizy elements).',
+            ];
+        }
+
+        if ('siteorigin' === $builder) {
+            return [
+                'source'             => 'post_content',
+                'complete'           => false,
+                'unmeasured'         => self::CONTENT_SECTIONS,
+                'stale_post_content' => false,
+                'note'               => 'SiteOrigin Page Builder renders this page from its panels_data postmeta; post_content holds its HTML copy only when the copy-content setting is on, so the element inventory may miss widgets (get-builder-content reads the layout).',
+            ];
+        }
+
         if ('thrive' === $builder) {
             return [
                 'source'             => 'post_content',
@@ -367,7 +387,7 @@ class Get_Page_Snapshot
             ];
         }
 
-        if (in_array($builder, ['divi', 'wpbakery', 'avada'], true)) {
+        if (in_array($builder, ['divi', 'wpbakery', 'avada', 'flatsome'], true)) {
             return [
                 'source'             => 'post_content',
                 'complete'           => false,
@@ -378,7 +398,7 @@ class Get_Page_Snapshot
                 'stale_post_content' => false,
                 'note'               => sprintf(
                     '%s stores its layout as shortcodes in post_content. word_count includes shortcode markup and the element inventory is partial.',
-                    ['divi' => 'Divi', 'wpbakery' => 'WPBakery', 'avada' => 'Avada'][ $builder ]
+                    ['divi' => 'Divi', 'wpbakery' => 'WPBakery', 'avada' => 'Avada', 'flatsome' => 'Flatsome'][ $builder ]
                 ),
             ];
         }

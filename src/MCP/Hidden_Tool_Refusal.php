@@ -9,14 +9,16 @@ if (! defined('ABSPATH')) {
 }
 
 /**
- * A direct tools/call for a tool that is not registered because no plugin
- * it covers is active (issue #876): the plugin-data pair registers only
- * while a covered plugin is loaded, so the adapter answers "Tool not found"
- * and stdio "Unknown tool". Both are replaced with the refusal that names
- * the plugin to activate (Registrar::plugin_inactive_for_tool), as a tool
- * error carrying the code and data. It runs after the request was
- * authenticated and dispatched, only rewrites that one not-found answer,
- * and grants nothing: the tool stays unregistered.
+ * A direct tools/call for a tool that is declared but not registered for
+ * this connection (issue #876, widened by #628): a pair held back because
+ * no plugin it covers is active, a tool governance switched off, or one
+ * outside this edition. The adapter answers "Tool not found"; that answer is
+ * replaced with the tool's refusal (Registrar::hidden_for_tool), as the tool
+ * error every refusal is (Refusal_Result). Http_Tool_Call answers a single
+ * 2025-11-25 call itself, so this is left with the calls it does not take,
+ * such as a batch. It runs after the request was authenticated and
+ * dispatched, only rewrites that one not-found answer, and grants nothing:
+ * the tool stays unregistered.
  */
 class Hidden_Tool_Refusal
 {
@@ -26,27 +28,13 @@ class Hidden_Tool_Refusal
     }
 
     /**
-     * A tool error result for a refusal: isError, the message as text, and
-     * the code, message and data as structuredContent.
+     * The tool error result for a refusal (Refusal_Result::for_error()).
      *
      * @return array<string, mixed>
      */
     public static function result(\WP_Error $error): array
     {
-        $data = $error->get_error_data();
-        unset($data['status']);
-
-        return [
-            'isError'           => true,
-            'content'           => [ [ 'type' => 'text', 'text' => $error->get_error_message() ] ],
-            'structuredContent' => [
-                'error' => [
-                    'code'    => $error->get_error_code(),
-                    'message' => $error->get_error_message(),
-                    'data'    => is_array($data) ? $data : [],
-                ],
-            ],
-        ];
+        return Refusal_Result::for_error($error);
     }
 
     /**
@@ -111,7 +99,7 @@ class Hidden_Tool_Refusal
             return $answer;
         }
         $arguments = is_array($params['arguments'] ?? null) ? $params['arguments'] : [];
-        $error     = Plugin::instance()->registrar()->plugin_inactive_for_tool($name, $arguments);
+        $error     = Plugin::instance()->registrar()->hidden_for_tool($name, $arguments);
         if (null === $error) {
             return $answer;
         }

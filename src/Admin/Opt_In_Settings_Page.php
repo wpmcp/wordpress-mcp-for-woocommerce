@@ -20,7 +20,7 @@ if (! defined('ABSPATH')) {
  * recorded in the governance audit log with the acting user. Writing a
  * toggle takes manage_options on the site screen and
  * manage_network_options on the network screen (multisite only); viewing
- * either takes the management capability like the other WP MCP screens.
+ * either takes the management capability like the other WPMCP screens.
  *
  * A group whose filter is set in code shows "set in code" and has no
  * working toggle: the code decides (Opt_In_Settings::apply() stands down),
@@ -40,7 +40,7 @@ class Opt_In_Settings_Page
         add_submenu_page(
             'settings.php',
             Plugin::page_title(__('Opt-in operations', 'safe-mcp-for-woocommerce')),
-            __('WP MCP opt-in operations', 'safe-mcp-for-woocommerce'),
+            __('WPMCP opt-in operations', 'safe-mcp-for-woocommerce'),
             'manage_network_options',
             self::SLUG,
             [ new self(), 'render_network' ]

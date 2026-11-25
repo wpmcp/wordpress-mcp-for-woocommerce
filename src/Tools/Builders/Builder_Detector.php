@@ -37,12 +37,24 @@ if (! defined('ABSPATH')) {
  * before block markers, since Oxygen leaves post_content as it was),
  * a BeTheme BeBuilder layout (a non-empty `mfn-page-items` row, issue #643;
  * also before block markers, since BeTheme renders it beside post_content),
+ * Brizy's `brizy_enabled` flag (issue #645, before block markers for the
+ * same reason),
+ * a SiteOrigin Page Builder layout (a `panels_data` row holding a row or a
+ * widget, issue #644; before block markers, since the plugin renders it in
+ * place of post_content, which may hold its HTML copy),
+ * a Kirki page builder page (`kirki_editor_mode` = 'kirki', issue #641;
+ * Kirki renders its layout from postmeta too),
+ * a Visual Composer page (a `vcv-pageContent` document with elements on a
+ * page not switched to another editor, issue #642; before block markers,
+ * since the markup it saves can hold blocks),
  * Divi 5's `<!-- wp:divi/ -->` blocks (a Divi 5 layout whose flags were
  * never written, as on imported content), Gutenberg's `<!-- wp: -->` block
  * comment markers in post_content, then a WPBakery `[vc_row]` or
  * `[vc_section]` shortcode in post_content (a WPBakery page saved with its
  * backend editor off) or an Avada `[fusion_builder_container]` (an Avada
  * page whose flag is off or was never written, as on imported content),
+ * then, while Flatsome is the active theme, a UX Builder `[section]`,
+ * `[row]` or `[ux_*]` shortcode or a UX Block post (`blocks`),
  * falling back to 'classic' when none match.
  */
 class Builder_Detector
@@ -110,6 +122,28 @@ class Builder_Detector
             return 'betheme';
         }
 
+        // Brizy's own isBrizyEnabled() test (issue #645). Brizy renders the
+        // page from its compiled postmeta, whatever post_content holds.
+        if ((bool) get_post_meta($post_id, 'brizy_enabled', true)) {
+            return 'brizy';
+        }
+
+        $panels = get_post_meta($post_id, 'panels_data', true);
+        if (is_array($panels) && (! empty($panels['grids']) || ! empty($panels['widgets']))) {
+            return 'siteorigin';
+        }
+
+        // Kirki's builder renders the page from its `kirki` row while this
+        // flag is set (it deletes it when the owner goes back to the
+        // WordPress editor).
+        if ('kirki' === get_post_meta($post_id, 'kirki_editor_mode', true)) {
+            return 'kirki';
+        }
+
+        if (self::has_visual_composer_document($post_id)) {
+            return 'visual-composer';
+        }
+
         $post = get_post($post_id);
         $content = $post ? (string) $post->post_content : '';
 
@@ -128,6 +162,12 @@ class Builder_Detector
 
         if (preg_match('/\[fusion_builder_container[\s\]]/', $content)) {
             return 'avada';
+        }
+
+        // Flatsome (UX Builder) shortcodes, or a UX Block (`blocks` post),
+        // count only while Flatsome is the template (a child's parent too).
+        if ((bool) apply_filters('wpmcp_flatsome_active', 'flatsome' === strtolower((string) get_template())) && (($post && 'blocks' === $post->post_type) || preg_match('/\[(?:section|row|ux_[a-z_]+)[\s\]]/', $content))) {
+            return 'flatsome';
         }
 
         return 'classic';
@@ -176,6 +216,23 @@ class Builder_Detector
         }
 
         return is_array($data) && [] !== $data;
+    }
+
+    /**
+     * Visual Composer's own test for a page it renders (isVcvPost(): a
+     * `vcv-pageContent` row, rawurlencode()d JSON, with elements), unless
+     * its `vcv-be-editor` row says the page went back to the block or
+     * classic editor.
+     */
+    private static function has_visual_composer_document(int $post_id): bool
+    {
+        $raw = get_post_meta($post_id, 'vcv-pageContent', true);
+        if (! is_string($raw) || '' === $raw || in_array((string) get_post_meta($post_id, 'vcv-be-editor', true), ['gutenberg', 'classic'], true)) {
+            return false;
+        }
+        $doc = json_decode(rawurldecode($raw), true);
+
+        return is_array($doc) && is_array($doc['elements'] ?? null) && [] !== $doc['elements'];
     }
 
     /**

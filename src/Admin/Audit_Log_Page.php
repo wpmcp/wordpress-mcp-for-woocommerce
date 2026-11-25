@@ -4,6 +4,8 @@ namespace WPMCP\Admin;
 
 use WPMCP\MCP\Request_Log;
 use WPMCP\Plugin;
+use WPMCP\Safety\Snapshot_Store;
+use WPMCP\Tools\Backup\Backup_Job_Store;
 use WPMCP\Tools\List_Operations;
 
 if (! defined('ABSPATH')) {
@@ -189,49 +191,232 @@ class Audit_Log_Page
             $paged  = $pages;
             $result = $this->get_operations($filters + ['limit' => $per_page, 'offset' => ($paged - 1) * $per_page]);
         }
-        $ops   = $result['operations'];
-        $nonce = wp_create_nonce('wpmcp_restore');
+        $ops           = $result['operations'];
+        $nonce         = wp_create_nonce('wpmcp_restore');
+        $session_nonce = wp_create_nonce(Restore_Controller::SESSION_ACTION);
+        $sessions_seen = [];
 
         $this->render_filter_form($filters);
         $this->render_pagination(self::TAB_MUTATIONS, $filters, $total, $paged, $pages, 'top');
-        echo '<table class="widefat"><thead><tr>'
+        echo '<table class="widefat striped"><thead><tr>'
             . '<th>' . esc_html__('Who', 'safe-mcp-for-woocommerce') . '</th>'
             . '<th>' . esc_html__('When', 'safe-mcp-for-woocommerce') . '</th>'
             . '<th>' . esc_html__('What', 'safe-mcp-for-woocommerce') . '</th>'
             . '<th>' . esc_html__('Domain', 'safe-mcp-for-woocommerce') . '</th>'
-            . '<th></th>'
+            . '<th>' . esc_html__('Session', 'safe-mcp-for-woocommerce') . '</th>'
+            . '<th>' . esc_html__('Undo', 'safe-mcp-for-woocommerce') . '</th>'
             . '</tr></thead><tbody>';
 
-        foreach ($ops as $op) {
+        foreach (self::group_calls($ops) as $group) {
+            $op    = $group[0];
             $user  = get_userdata((int) $op['user_id']);
             /* translators: %d: numeric user ID. */
             $user_label = __('User #%d', 'safe-mcp-for-woocommerce');
             $who   = $user ? $user->display_name : sprintf($user_label, (int) $op['user_id']);
-            $object = List_Operations::object_label($op);
-            $what   = '' !== $object ? sprintf('%s (%s)', $op['tool_name'], $object) : (string) $op['tool_name'];
+            $what  = self::what_label($op);
 
             echo '<tr>';
             printf('<td>%s</td>', esc_html($who));
-            printf('<td>%s</td>', esc_html($op['created_at']));
-            printf('<td>%s</td>', esc_html($what));
-            printf('<td>%s</td>', esc_html((string) ($op['domain'] ?? '')));
-            echo '<td>';
-            if (! empty($op['rollback_available'])) {
+            printf('<td>%s</td>', esc_html(self::site_time((string) $op['created_at'])));
+            echo '<td>' . esc_html($what);
+            if (count($group) > 1) {
                 printf(
-                    '<button class="button wpmcp-restore" data-op="%s" data-nonce="%s">%s</button>',
-                    esc_attr($op['operation_id']),
+                    '<br><span class="wpmcp-call-count">%s</span>',
+                    /* translators: %d: number of changes one call made. */
+                    esc_html(sprintf(_n('%d change', '%d changes', count($group), 'safe-mcp-for-woocommerce'), count($group)))
+                );
+            }
+            echo '</td>';
+            printf('<td class="column-domain">%s</td>', esc_html(self::domain_label($op)));
+            echo '<td>';
+            $this->render_session_cell((string) ($op['session_id'] ?? ''), $session_nonce, $sessions_seen);
+            echo '</td><td>';
+            $live = array_values(array_filter($group, static fn (array $o): bool => ! empty($o['rollback_available'])));
+            if ([] !== $live) {
+                printf(
+                    '<button class="button wpmcp-restore" data-op="%s" data-nonce="%s" data-label="%s">%s</button>',
+                    esc_attr(implode(',', array_column($live, 'operation_id'))),
                     esc_attr($nonce),
+                    esc_attr($what),
                     esc_html__('Restore', 'safe-mcp-for-woocommerce')
                 );
             } elseif (! empty($op['rolled_back_at'])) {
                 // Already undone (issue #593): no second Restore.
-                echo esc_html(History_Page::undone_label((string) $op['rolled_back_at']));
+                /* translators: %s: date and time the change was undone, in the site timezone. */
+                echo esc_html(sprintf(__('Undone %s', 'safe-mcp-for-woocommerce'), self::site_time((string) $op['rolled_back_at'])));
             }
             echo '</td></tr>';
         }
 
         echo '</tbody></table>';
         $this->render_pagination(self::TAB_MUTATIONS, $filters, $total, $paged, $pages, 'bottom');
+        $this->render_jobs();
+    }
+
+    /**
+     * Consecutive rows of one call (issue #1126): same session, tool, user
+     * and arguments hash, written within two seconds of each other. A
+     * switch-theme call, for one, records two operations.
+     *
+     * @param array<int, array<string, mixed>> $ops newest first
+     * @return array<int, array<int, array<string, mixed>>>
+     */
+    public static function group_calls(array $ops): array
+    {
+        $hashes = Snapshot_Store::args_hashes(array_column($ops, 'operation_id'));
+        $groups = [];
+        $key    = null;
+        $at     = 0;
+        foreach ($ops as $op) {
+            $this_key = implode('|', [ (string) $op['session_id'], (string) $op['tool_name'], (int) $op['user_id'], $hashes[ (string) $op['operation_id'] ] ?? (string) $op['operation_id'] ]);
+            $this_at  = (int) strtotime((string) $op['created_at'] . ' UTC');
+            if (null !== $key && $this_key === $key && abs($at - $this_at) <= 2) {
+                $groups[ count($groups) - 1 ][] = $op;
+            } else {
+                $groups[] = [ $op ];
+            }
+            $key = $this_key;
+            $at  = $this_at;
+        }
+        return $groups;
+    }
+
+    /** "tool: Title (#id)" where the object has a title, else "tool (#id)" (issue #1126). */
+    public static function what_label(array $op): string
+    {
+        $tool   = (string) $op['tool_name'];
+        $object = List_Operations::object_label($op);
+        if ('' === $object) {
+            return $tool;
+        }
+        $title = self::object_title((string) ($op['object_type'] ?? ''), (int) ($op['object_id'] ?? 0));
+        return '' !== $title ? sprintf('%s: %s (%s)', $tool, $title, $object) : sprintf('%s (%s)', $tool, $object);
+    }
+
+    private static function object_title(string $type, int $id): string
+    {
+        if ($id <= 0) {
+            return '';
+        }
+        switch ($type) {
+            case 'post':
+                $post = get_post($id);
+                return $post instanceof \WP_Post ? wp_strip_all_tags(get_the_title($post)) : '';
+            case 'term':
+                $term = get_term($id);
+                return $term instanceof \WP_Term ? $term->name : '';
+            case 'user':
+                $user = get_userdata($id);
+                return $user ? $user->display_name : '';
+            case 'comment':
+                $comment = get_comment($id);
+                /* translators: %s: comment author. */
+                return $comment ? sprintf(__('comment by %s', 'safe-mcp-for-woocommerce'), $comment->comment_author) : '';
+        }
+        return '';
+    }
+
+    /** A plain domain name (issue #1126): theme writes read Themes, not the packages domain. */
+    public static function domain_label(array $op): string
+    {
+        $domain = (string) ($op['domain'] ?? '');
+        if (false !== strpos((string) $op['tool_name'], 'theme') && in_array($domain, [ 'packages', 'theme', '' ], true)) {
+            return __('Themes', 'safe-mcp-for-woocommerce');
+        }
+        $names = [
+            'packages' => __('Plugins and themes', 'safe-mcp-for-woocommerce'),
+            'theme'    => __('Themes', 'safe-mcp-for-woocommerce'),
+            'seo'      => 'SEO',
+            'acf'      => 'Advanced Custom Fields',
+            'woocommerce' => 'WooCommerce',
+            'rest'     => 'REST API',
+            'cli'      => 'WP-CLI',
+        ];
+        return $names[ $domain ] ?? ucwords(str_replace([ '-', '_' ], ' ', $domain));
+    }
+
+    /** A stored UTC time in the site timezone, named (issue #1126). */
+    public static function site_time(string $utc): string
+    {
+        $ts = strtotime($utc . ' UTC');
+        return false === $ts ? $utc : self::site_time_ts($ts);
+    }
+
+    public static function site_time_ts(int $ts): string
+    {
+        return wp_date('Y-m-d H:i:s', $ts) . ' ' . wp_timezone_string();
+    }
+
+    /** The newest backup and restore jobs with status and time (issue #1126). */
+    private function render_jobs(): void
+    {
+        $jobs = array_slice(Backup_Job_Store::list(), 0, 10);
+        echo '<h2>' . esc_html__('Backup and restore jobs', 'safe-mcp-for-woocommerce') . '</h2>';
+        if ([] === $jobs) {
+            echo '<p>' . esc_html__('No backup or restore has run yet.', 'safe-mcp-for-woocommerce') . '</p>';
+            return;
+        }
+        echo '<table class="widefat striped"><thead><tr>'
+            . '<th>' . esc_html__('Job', 'safe-mcp-for-woocommerce') . '</th>'
+            . '<th>' . esc_html__('Kind', 'safe-mcp-for-woocommerce') . '</th>'
+            . '<th>' . esc_html__('Status', 'safe-mcp-for-woocommerce') . '</th>'
+            . '<th>' . esc_html__('When', 'safe-mcp-for-woocommerce') . '</th>'
+            . '<th>' . esc_html__('Details', 'safe-mcp-for-woocommerce') . '</th>'
+            . '</tr></thead><tbody>';
+        foreach ($jobs as $job) {
+            $restore = 'restore' === ($job['type'] ?? '');
+            printf(
+                '<tr class="wpmcp-job" data-job="%d"><td>#%d</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>',
+                (int) $job['id'],
+                (int) $job['id'],
+                esc_html($restore ? __('Restore', 'safe-mcp-for-woocommerce') : __('Backup', 'safe-mcp-for-woocommerce') . ' (' . (string) ($job['scope'] ?? $job['type'] ?? '') . ')'),
+                esc_html((string) ($job['status'] ?? '')),
+                esc_html(self::site_time_ts((int) ($job['updated_at'] ?? $job['created_at'] ?? 0))),
+                esc_html((string) ($job['error'] ?? ($job['purpose'] ?? '')))
+            );
+        }
+        echo '</tbody></table>';
+        printf('<p class="description">%s</p>', esc_html__('get-backup-status shows a job in full.', 'safe-mcp-for-woocommerce'));
+    }
+
+    /**
+     * A row's session (issue #1150): a link that filters the table to it,
+     * and on the session's first row on the page an Undo session button
+     * that runs rollback-session. The catch-all session ('' or 'default')
+     * and a session with nothing left to undo get no button.
+     *
+     * @param array<string, bool> $seen sessions that already have a button on this page
+     */
+    private function render_session_cell(string $session_id, string $nonce, array &$seen): void
+    {
+        if (Snapshot_Store::is_loose_session($session_id)) {
+            echo esc_html__('None', 'safe-mcp-for-woocommerce');
+            return;
+        }
+
+        printf(
+            '<a href="%s" title="%s"><code>%s</code></a>',
+            esc_url(add_query_arg(['page' => self::SLUG, 'tab' => self::TAB_MUTATIONS, 'session_id' => rawurlencode($session_id)], admin_url('admin.php'))),
+            esc_attr__('Show only this session', 'safe-mcp-for-woocommerce'),
+            esc_html(strlen($session_id) > 24 ? substr($session_id, 0, 24) . '...' : $session_id)
+        );
+
+        if (isset($seen[ $session_id ])) {
+            return;
+        }
+        $seen[ $session_id ] = true;
+
+        $live = Snapshot_Store::live_count_for_session($session_id);
+        if ($live < 1) {
+            return;
+        }
+        printf(
+            ' <button type="button" class="button wpmcp-undo-session" data-session="%s" data-count="%d" data-nonce="%s">%s</button>',
+            esc_attr($session_id),
+            (int) $live,
+            esc_attr($nonce),
+            esc_html__('Undo session', 'safe-mcp-for-woocommerce')
+        );
     }
 
     /** The requested page of either tab, 1 or more. */
@@ -263,19 +448,46 @@ class Audit_Log_Page
                 array_map('rawurlencode', array_merge(['page' => self::SLUG, 'tab' => $tab], array_map('strval', $filters))),
                 admin_url('admin.php')
             );
-            $links = paginate_links([
-                'base'      => add_query_arg('paged', '%#%', $base),
-                'format'    => '',
-                'current'   => $paged,
-                'total'     => $pages,
-                'prev_text' => __('&lsaquo; Previous', 'safe-mcp-for-woocommerce'),
-                'next_text' => __('Next &rsaquo;', 'safe-mcp-for-woocommerce'),
-            ]);
-            // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- paginate_links() escapes its own URLs and the link text above is translator-provided entities.
-            echo ' <span class="pagination-links">' . $links . '</span>';
+            echo ' <span class="pagination-links">';
+            // Core list-table paging (issue #1125): first, previous, "N of M",
+            // next and last, a disabled span where a button would go nowhere.
+            $this->render_page_button('first-page', __('First page', 'safe-mcp-for-woocommerce'), '&laquo;', $paged > 1 ? 1 : null, $base);
+            $this->render_page_button('prev-page', __('Previous page', 'safe-mcp-for-woocommerce'), '&lsaquo;', $paged > 1 ? $paged - 1 : null, $base);
+            printf(
+                '<span class="screen-reader-text">%s</span><span id="table-paging-%s" class="paging-input"><span class="tablenav-paging-text">%s</span></span>',
+                esc_html__('Current Page', 'safe-mcp-for-woocommerce'),
+                esc_attr($which),
+                sprintf(
+                    /* translators: 1: current page, 2: total pages. */
+                    esc_html_x('%1$s of %2$s', 'paging', 'safe-mcp-for-woocommerce'),
+                    esc_html(number_format_i18n($paged)),
+                    '<span class="total-pages">' . esc_html(number_format_i18n($pages)) . '</span>'
+                )
+            );
+            $this->render_page_button('next-page', __('Next page', 'safe-mcp-for-woocommerce'), '&rsaquo;', $paged < $pages ? $paged + 1 : null, $base);
+            $this->render_page_button('last-page', __('Last page', 'safe-mcp-for-woocommerce'), '&raquo;', $paged < $pages ? $pages : null, $base);
+            echo '</span>';
         }
 
         echo '</div><br class="clear" /></div>';
+    }
+
+    /** One core paging button, or its disabled span when $target is null. */
+    private function render_page_button(string $class, string $label, string $glyph, ?int $target, string $base): void
+    {
+        if (null === $target) {
+            // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- $glyph is one of the literal HTML entities passed above.
+            printf('<span class="tablenav-pages-navspan button disabled" aria-hidden="true">%s</span> ', $glyph);
+            return;
+        }
+        printf(
+            '<a class="%s button" href="%s"><span class="screen-reader-text">%s</span><span aria-hidden="true">%s</span></a> ',
+            esc_attr($class),
+            esc_url(add_query_arg('paged', $target, $base)),
+            esc_html($label),
+            // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- $glyph is one of the literal HTML entities passed above.
+            $glyph
+        );
     }
 
     private function render_requests(): void
@@ -307,7 +519,7 @@ class Audit_Log_Page
         $this->render_request_filter_form($filters);
         $this->render_pagination(self::TAB_REQUESTS, $filters, $total, $paged, $pages, 'top');
 
-        echo '<table class="widefat"><thead><tr>'
+        echo '<table class="widefat striped"><thead><tr>'
             . '<th>' . esc_html__('When', 'safe-mcp-for-woocommerce') . '</th>'
             . '<th>' . esc_html__('Tool', 'safe-mcp-for-woocommerce') . '</th>'
             . '<th>' . esc_html__('Client', 'safe-mcp-for-woocommerce') . '</th>'
@@ -320,7 +532,7 @@ class Audit_Log_Page
             echo '<tr>';
             printf(
                 '<td>%s</td>',
-                esc_html(gmdate('Y-m-d H:i:s', (int) ($row['timestamp'] ?? 0)))
+                esc_html(self::site_time_ts((int) ($row['timestamp'] ?? 0)))
             );
             printf('<td>%s</td>', esc_html((string) ($row['tool'] ?? '')));
             printf('<td>%s</td>', esc_html((string) ($row['client'] ?? '')));
@@ -396,16 +608,14 @@ class Audit_Log_Page
             esc_attr($filters['date_to'] ?? ''),
             esc_attr__('To date (UTC)', 'safe-mcp-for-woocommerce')
         );
-        printf(
-            '<input type="number" name="user_id" placeholder="%s" value="%s" />',
-            esc_attr__('User ID', 'safe-mcp-for-woocommerce'),
-            esc_attr($filters['user_id'] ?? '')
-        );
-        printf(
-            '<input type="text" name="tool" placeholder="%s" value="%s" />',
-            esc_attr__('Tool', 'safe-mcp-for-woocommerce'),
-            esc_attr($filters['tool'] ?? '')
-        );
+        // Dropdowns of the users and tools in the log (issue #1126).
+        $rows  = Request_Log::list();
+        $tools = array_values(array_unique(array_filter(array_map(static fn (array $r): string => (string) ($r['tool'] ?? ''), $rows), 'strlen')));
+        sort($tools);
+        $users = array_values(array_unique(array_map(static fn (array $r): int => (int) ($r['user_id'] ?? 0), $rows)));
+        sort($users);
+        $this->render_select('user_id', __('All users', 'safe-mcp-for-woocommerce'), self::user_choices($users), (string) ($filters['user_id'] ?? ''));
+        $this->render_select('tool', __('All tools', 'safe-mcp-for-woocommerce'), array_combine($tools, $tools) ?: [], (string) ($filters['tool'] ?? ''));
         $outcome = $filters['outcome'] ?? '';
         echo '<select name="outcome">';
         foreach ([ '' => __('Any outcome', 'safe-mcp-for-woocommerce'), 'ok' => __('OK', 'safe-mcp-for-woocommerce'), 'error' => __('Error', 'safe-mcp-for-woocommerce') ] as $value => $label) {
@@ -425,7 +635,7 @@ class Audit_Log_Page
     private function filters_from_request(): array
     {
         $filters = [];
-        foreach (['user_id', 'tool_name', 'domain', 'object_type', 'object_id', 'date_from', 'date_to'] as $key) {
+        foreach (['user_id', 'tool_name', 'domain', 'object_type', 'object_id', 'session_id', 'date_from', 'date_to'] as $key) {
             // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- read-only filter on an admin list screen; the value only narrows what is displayed.
             $value = isset($_GET[ $key ]) ? sanitize_text_field(wp_unslash($_GET[ $key ])) : '';
             if ('' !== $value) {
@@ -444,15 +654,13 @@ class Audit_Log_Page
         // round-tripping the superglobal.
         printf('<input type="hidden" name="page" value="%s" />', esc_attr(self::SLUG));
         printf('<input type="hidden" name="tab" value="%s" />', esc_attr(self::TAB_MUTATIONS));
+        $values = Snapshot_Store::filter_values();
+        $this->render_select('tool_name', __('All tools', 'safe-mcp-for-woocommerce'), array_combine($values['tools'], $values['tools']) ?: [], (string) ($filters['tool_name'] ?? ''));
+        $this->render_select('user_id', __('All users', 'safe-mcp-for-woocommerce'), self::user_choices($values['users']), (string) ($filters['user_id'] ?? ''));
         printf(
-            '<input type="text" name="tool_name" placeholder="%s" value="%s" />',
-            esc_attr__('Tool name', 'safe-mcp-for-woocommerce'),
-            esc_attr((string) ($filters['tool_name'] ?? ''))
-        );
-        printf(
-            '<input type="number" name="user_id" placeholder="%s" value="%s" />',
-            esc_attr__('User ID', 'safe-mcp-for-woocommerce'),
-            esc_attr((string) ($filters['user_id'] ?? ''))
+            '<input type="text" name="session_id" placeholder="%s" value="%s" />',
+            esc_attr__('Session', 'safe-mcp-for-woocommerce'),
+            esc_attr((string) ($filters['session_id'] ?? ''))
         );
         printf(
             '<input type="date" name="date_from" value="%s" />',
@@ -466,8 +674,44 @@ class Audit_Log_Page
         echo '</form>';
     }
 
+    /** A filter dropdown (issue #1126). @param array<string, string> $choices value => label */
+    private function render_select(string $name, string $any, array $choices, string $current): void
+    {
+        printf('<select name="%s">', esc_attr($name));
+        printf('<option value="">%s</option>', esc_html($any));
+        foreach ($choices as $value => $label) {
+            printf('<option value="%s"%s>%s</option>', esc_attr((string) $value), selected($current, (string) $value, false), esc_html($label));
+        }
+        echo '</select> ';
+    }
+
+    /**
+     * @param int[] $ids
+     * @return array<string, string> user id => display name
+     */
+    private static function user_choices(array $ids): array
+    {
+        $out = [];
+        foreach ($ids as $id) {
+            $user = get_userdata($id);
+            /* translators: %d: numeric user ID. */
+            $out[ (string) $id ] = $user ? $user->display_name : (0 === $id ? __('No user', 'safe-mcp-for-woocommerce') : sprintf(__('User #%d', 'safe-mcp-for-woocommerce'), $id));
+        }
+        return $out;
+    }
+
     private function render_restore_script(): void
     {
+        $undo_text = [
+            /* translators: 1: number of writes, 2: session id. */
+            'ask'    => __('Undo %1$s writes from session %2$s, newest first? Each object goes back to how it was before the session. If any write cannot be undone, nothing is changed.', 'safe-mcp-for-woocommerce'),
+            /* translators: %s: number of writes undone. */
+            'done'   => __('Undid %s writes from the session.', 'safe-mcp-for-woocommerce'),
+            'failed' => __('The session could not be undone.', 'safe-mcp-for-woocommerce'),
+            /* translators: %s: what the change was, e.g. "update-post: About (#12)". */
+            'restore'       => __('Restore %s to how it was before this change? Anything changed on it since is overwritten.', 'safe-mcp-for-woocommerce'),
+            'restoreFailed' => __('The change could not be restored.', 'safe-mcp-for-woocommerce'),
+        ];
         ?>
         <script>
         document.addEventListener('click', function (e) {
@@ -476,12 +720,90 @@ class Audit_Log_Page
                 return;
             }
             e.preventDefault();
+            // Issue #1126: confirm naming the object, then show the refusal
+            // instead of reloading as if it had worked.
+            if (! window.confirm(wpmcpUndoText.restore.replace('%s', btn.dataset.label || btn.dataset.op))) {
+                return;
+            }
+            btn.disabled = true;
             var body = new URLSearchParams();
             body.set('action', 'wpmcp_restore');
             body.set('operation_id', btn.dataset.op);
             body.set('nonce', btn.dataset.nonce);
             fetch(ajaxurl, { method: 'POST', credentials: 'same-origin', body: body })
-                .then(function () { window.location.reload(); });
+                .then(function (r) { return r.json(); })
+                .then(function (res) {
+                    if (res && res.success) {
+                        window.location.reload();
+                        return;
+                    }
+                    btn.disabled = false;
+                    wpmcpUndoNotice(false, (res && res.data && res.data.message) ? res.data.message : wpmcpUndoText.restoreFailed);
+                })
+                .catch(function () {
+                    btn.disabled = false;
+                    wpmcpUndoNotice(false, wpmcpUndoText.restoreFailed);
+                });
+        });
+
+        // Undo session (issue #1150): confirm with the number of writes,
+        // run rollback-session, then show what it did or the refusal.
+        var wpmcpUndoKey = 'wpmcpUndoSessionResult';
+        var wpmcpUndoText = <?php echo wp_json_encode($undo_text); ?>;
+        var wpmcpUndoNotice = function (ok, text) {
+            var wrap = document.querySelector('.wrap h1');
+            if (! wrap) {
+                return;
+            }
+            var div = document.createElement('div');
+            div.className = 'notice is-dismissible ' + (ok ? 'notice-success' : 'notice-error');
+            var p = document.createElement('p');
+            p.textContent = text;
+            div.appendChild(p);
+            wrap.insertAdjacentElement('afterend', div);
+        };
+        try {
+            var wpmcpSaved = window.sessionStorage.getItem(wpmcpUndoKey);
+            if (wpmcpSaved) {
+                window.sessionStorage.removeItem(wpmcpUndoKey);
+                var wpmcpParsed = JSON.parse(wpmcpSaved);
+                wpmcpUndoNotice(!! wpmcpParsed.ok, String(wpmcpParsed.text));
+            }
+        } catch (err) {}
+        document.addEventListener('click', function (e) {
+            var btn = e.target.closest('.wpmcp-undo-session');
+            if (! btn) {
+                return;
+            }
+            e.preventDefault();
+            var count = parseInt(btn.dataset.count, 10) || 0;
+            if (! window.confirm(wpmcpUndoText.ask.replace('%1$s', count).replace('%2$s', btn.dataset.session))) {
+                return;
+            }
+            btn.disabled = true;
+            var body = new URLSearchParams();
+            body.set('action', '<?php echo esc_js(Restore_Controller::SESSION_ACTION); ?>');
+            body.set('session_id', btn.dataset.session);
+            body.set('nonce', btn.dataset.nonce);
+            fetch(ajaxurl, { method: 'POST', credentials: 'same-origin', body: body })
+                .then(function (r) { return r.json(); })
+                .then(function (res) {
+                    if (res && res.success) {
+                        var done = wpmcpUndoText.done.replace('%s', res.data.restored_count);
+                        var warnings = (res.data.warnings || []).join(' ');
+                        try {
+                            window.sessionStorage.setItem(wpmcpUndoKey, JSON.stringify({ ok: true, text: warnings ? done + ' ' + warnings : done }));
+                        } catch (err) {}
+                        window.location.reload();
+                        return;
+                    }
+                    btn.disabled = false;
+                    wpmcpUndoNotice(false, (res && res.data && res.data.message) ? res.data.message : wpmcpUndoText.failed);
+                })
+                .catch(function () {
+                    btn.disabled = false;
+                    wpmcpUndoNotice(false, wpmcpUndoText.failed);
+                });
         });
         </script>
         <?php

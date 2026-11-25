@@ -7,7 +7,7 @@ if (! defined('ABSPATH')) {
 }
 
 /**
- * The two MCP protocol revisions WP MCP serves, and what differs between
+ * The two MCP protocol revisions WPMCP serves, and what differs between
  * them on the wire (issue #386).
  *
  * 2025-11-25 is session based: initialize negotiates the revision once and
@@ -19,7 +19,7 @@ if (! defined('ABSPATH')) {
  * identifies itself in result _meta instead of in an initialize result.
  *
  * The WordPress MCP adapter implements 2026-07-28 from 0.7.0 on. The copy
- * WP MCP bundles (0.6.x) predates it, so this class is the one place that
+ * WPMCP bundles (0.6.x) predates it, so this class is the one place that
  * knows the revision's rules; the stdio transport and, when the loaded
  * adapter cannot, the HTTP route both answer 2026-07-28 through it.
  */
@@ -30,6 +30,8 @@ final class Protocol_Revision
 
     public const META_PROTOCOL_VERSION    = 'io.modelcontextprotocol/protocolVersion';
     public const META_CLIENT_CAPABILITIES = 'io.modelcontextprotocol/clientCapabilities';
+    /** The client's name and version, sent with every request in place of initialize's clientInfo. */
+    public const META_CLIENT_INFO         = 'io.modelcontextprotocol/clientInfo';
     public const META_SERVER_INFO         = 'io.modelcontextprotocol/serverInfo';
 
     public const INVALID_REQUEST     = -32600;

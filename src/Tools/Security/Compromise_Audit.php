@@ -27,7 +27,7 @@ if (! defined('ABSPATH')) {
  * - Administrators created recently or with a generic or random login.
  *
  * Read-only. Files are only stat()ed, hashed or have their header read; they
- * are never executed or included. WP MCP's own backups (#604) are skipped.
+ * are never executed or included. WPMCP's own backups (#604) are skipped.
  * Logins are masked (src/Privacy/Masking.php). Bounded by max_files and
  * max_seconds; a truncated run says so.
  */
@@ -92,15 +92,32 @@ class Compromise_Audit
     private ?string $truncated = null;
 
     /**
-     * @return array{ findings: array, stats: array{ files_checked:int, truncated:bool, truncated_reason:?string, requests:int } }
+     * Issue #1151: the walk is one fixed sequence over every root (uploads
+     * for dumps, then plugins, must-use plugins and themes for back-dated
+     * files). $position counts the files of that sequence this run has
+     * passed; files before $skip were covered by an earlier call and are
+     * passed over without counting toward max_files.
      */
-    public function run(int $max_files, int $max_seconds): array
+    private int $position = 0;
+    private int $skip     = 0;
+
+    /**
+     * A truncated walk returns next_cursor (issue #1151); passing it back
+     * as $cursor continues the file walk where it stopped. The checks that
+     * use the walk then report on the files after the cursor, and a check
+     * whose walk was cut short reports itself incomplete instead of pass.
+     *
+     * @return array{ findings: array, stats: array{ files_checked:int, truncated:bool, truncated_reason:?string, requests:int, next_cursor:?string, continued_from:int } }
+     */
+    public function run(int $max_files, int $max_seconds, ?string $cursor = null): array
     {
         $this->deadline  = time() + max(1, $max_seconds);
         $this->max_files = max(1, $max_files);
         $this->checked   = 0;
         $this->requests  = 0;
         $this->truncated = null;
+        $this->position  = 0;
+        $this->skip      = self::decode_cursor($cursor);
 
         $findings = array_merge(
             $this->check_admins(),
@@ -120,8 +137,66 @@ class Compromise_Audit
                 'truncated'        => null !== $this->truncated,
                 'truncated_reason' => $this->truncated,
                 'requests'         => $this->requests,
+                'next_cursor'      => $this->next_cursor(),
+                'continued_from'   => $this->skip,
             ],
         ];
+    }
+
+    /** Files of the walk sequence passed so far, as an opaque cursor, or null when the walk finished. */
+    private function next_cursor(): ?string
+    {
+        return null === $this->truncated ? null : self::encode_cursor($this->position);
+    }
+
+    private static function encode_cursor(int $position): string
+    {
+        return 'c1.' . $position;
+    }
+
+    /** A cursor this class returned, or 0 (start over) for anything else. */
+    private static function decode_cursor(?string $cursor): int
+    {
+        if (null === $cursor || 1 !== preg_match('/^c1\.(\d{1,10})$/', $cursor, $m)) {
+            return 0;
+        }
+        return (int) $m[1];
+    }
+
+    /** @return array<string, mixed> what an incomplete walk check adds to its value */
+    private function incomplete_value(): array
+    {
+        return [
+            'incomplete'       => true,
+            'truncated_reason' => $this->truncated,
+            'files_checked'    => $this->checked,
+            'continued_from'   => $this->skip,
+            'next_cursor'      => $this->next_cursor(),
+        ];
+    }
+
+    /**
+     * The finding a walk check reports when its walk was cut short (issue
+     * #1151): info, never pass, naming why it stopped, how many files this
+     * call checked and the cursor to continue with.
+     *
+     * @return array<string, mixed>
+     */
+    private function incomplete(string $id, string $label): array
+    {
+        return Security_Finding::make(
+            $id,
+            self::CATEGORY,
+            $label . ' (incomplete)',
+            'info',
+            $this->incomplete_value(),
+            sprintf(
+                'The file walk stopped early (%s) after %d files, so this check did not look at every file and is not a clean result.',
+                'time_budget' === $this->truncated ? 'time budget reached' : 'file limit reached',
+                $this->checked
+            ),
+            'Run scan-security again with checks ["compromise"] and cursor set to next_cursor to continue where it stopped.'
+        );
     }
 
     // Pure helpers.
@@ -589,7 +664,9 @@ class Compromise_Audit
     private function check_dumps(): array
     {
         $candidates = [];
-        foreach ([(string) ABSPATH, (string) WP_CONTENT_DIR] as $root) {
+        // A continued call (issue #1151) walks on from its cursor; the
+        // top-level folders were already listed by the first call.
+        foreach (0 === $this->skip ? [(string) ABSPATH, (string) WP_CONTENT_DIR] : [] as $root) {
             foreach ($this->list_dir($root) as $path) {
                 if (is_file($path) && $this->is_exposed_name(basename($path), true)) {
                     $candidates[ $this->real($path) ] = true;
@@ -603,7 +680,7 @@ class Compromise_Audit
             foreach ($this->walk($uploads) as $path) {
                 $rel = ltrim(substr($path, strlen($abspath)), '/');
                 if ($this->in_dirs($rel, $backups)) {
-                    continue; // WP MCP's own backups (#604).
+                    continue; // WPMCP's own backups (#604).
                 }
                 if ($this->is_exposed_name(basename($path), false)) {
                     $candidates[ $path ] = true;
@@ -674,7 +751,9 @@ class Compromise_Audit
                 'Keep them only if a backup tool you use put them there.'
             );
         }
-        if ([] === $findings) {
+        if (null !== $this->truncated) {
+            $findings[] = $this->incomplete('compromise_public_dump', 'Backups and dumps in public folders');
+        } elseif ([] === $findings) {
             $findings[] = $this->pass('compromise_public_dump', 'Backups and dumps in public folders', 'No database dump, wp-config copy or site archive was found in a public folder.');
         }
         return $findings;
@@ -690,11 +769,15 @@ class Compromise_Audit
             $roots[] = (string) get_theme_root();
         }
 
+        // The PHP files to judge: the ABSPATH root (first call only) and
+        // those the walk reached in this call, grouped by folder.
         /** @var array<string, array<string, array{0:int, 1:int}>> $by_dir */
         $by_dir = [];
-        foreach ($this->list_dir((string) ABSPATH) as $path) {
-            if (is_file($path) && 1 === preg_match(self::PHP_EXT, $path)) {
-                $by_dir[ dirname($path) ][ $path ] = $this->file_times($path);
+        if (0 === $this->skip) {
+            foreach ($this->list_dir((string) ABSPATH) as $path) {
+                if (is_file($path) && 1 === preg_match(self::PHP_EXT, $path)) {
+                    $by_dir[ dirname($path) ][ $path ] = $this->file_times($path);
+                }
             }
         }
         foreach (array_unique($roots) as $root) {
@@ -706,13 +789,17 @@ class Compromise_Audit
         }
 
         $flagged = [];
-        foreach ($by_dir as $files) {
-            if (count($files) < self::MIN_SIBLINGS + 1) {
+        foreach ($by_dir as $dir => $files) {
+            // Siblings come from the folder itself, not from the walk, so a
+            // folder the file limit cut in two (issue #1151) is still judged
+            // against all its PHP files.
+            $all = $this->php_files_in((string) $dir, $files);
+            if (count($all) < self::MIN_SIBLINGS + 1) {
                 continue;
             }
             foreach ($files as $path => $times) {
                 $siblings = [];
-                foreach ($files as $other => $other_times) {
+                foreach ($all as $other => $other_times) {
                     if ($other !== $path) {
                         $siblings[] = $other_times[1];
                     }
@@ -728,17 +815,46 @@ class Compromise_Audit
         }
 
         if ([] === $flagged) {
-            return [$this->pass('compromise_backdated_files', 'Back-dated files', 'No PHP file looks back-dated against its neighbours.')];
+            return [null !== $this->truncated
+                ? $this->incomplete('compromise_backdated_files', 'Back-dated files')
+                : $this->pass('compromise_backdated_files', 'Back-dated files', 'No PHP file looks back-dated against its neighbours.')];
         }
-        return [Security_Finding::make(
+        $value = ['count' => count($flagged), 'files' => array_slice($flagged, 0, self::MAX_LISTED)];
+        if (null !== $this->truncated) {
+            // Found some, but did not look everywhere (issue #1151).
+            $value = array_merge($value, $this->incomplete_value());
+        }
+        $findings   = [];
+        $findings[] = Security_Finding::make(
             'compromise_backdated_files',
             self::CATEGORY,
             'Back-dated PHP files',
             'warning',
-            ['count' => count($flagged), 'files' => array_slice($flagged, 0, self::MAX_LISTED)],
+            $value,
             'These PHP files were written later than the other files in their folder, yet their modification time was set back to look old, a common way to hide a planted file. A deploy that keeps file times can cause it too.',
             'Compare each, over SFTP or in your hosting file manager, with a fresh copy of its plugin or theme. Replace or remove it if it differs.'
-        )];
+        );
+        return $findings;
+    }
+
+    /**
+     * Every PHP file directly in $dir with its times, keeping the times
+     * already read for $known.
+     *
+     * @param array<string, array{0:int, 1:int}> $known
+     * @return array<string, array{0:int, 1:int}>
+     */
+    private function php_files_in(string $dir, array $known): array
+    {
+        $all = $known;
+        foreach ($this->list_dir($dir) as $path) {
+            $real = $this->real($path);
+            if ('' === $real || isset($all[ $real ]) || ! is_file($real) || 1 !== preg_match(self::PHP_EXT, $real)) {
+                continue;
+            }
+            $all[ $real ] = $this->file_times($real);
+        }
+        return $all;
     }
 
     private function check_cloaking(): array
@@ -1023,6 +1139,12 @@ class Compromise_Audit
                 if ($file->isLink() || ! $file->isFile()) {
                     continue;
                 }
+                // Covered by an earlier call (issue #1151).
+                if ($this->position < $this->skip) {
+                    $this->position++;
+                    continue;
+                }
+                $this->position++;
                 $this->checked++;
                 $real = $this->real($file->getPathname());
                 if ('' !== $real) {

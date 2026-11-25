@@ -8,7 +8,7 @@ if (! defined('ABSPATH')) {
 
 /**
  * The one at-rest sealing primitive for secrets this plugin stores in the
- * options table (issue #141): the WP MCP Cloud credential vault and the BYO
+ * options table (issue #141): the WPMCP Cloud credential vault and the BYO
  * stock-provider keys both go through it, so there is a single place that
  * decides how a secret is sealed and what happens when that is impossible.
  *

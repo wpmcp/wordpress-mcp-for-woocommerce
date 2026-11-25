@@ -11,7 +11,7 @@ if (! defined('ABSPATH')) {
  * (issue #386).
  *
  * The route belongs to the WordPress MCP adapter. Adapter 0.7.0 and later
- * implement 2026-07-28 themselves; the 0.6.x copy WP MCP bundles predates
+ * implement 2026-07-28 themselves; the 0.6.x copy WPMCP bundles predates
  * it and would answer a sessionless 2026 request with a missing-session
  * error. So on this one route:
  *
@@ -20,19 +20,22 @@ if (! defined('ABSPATH')) {
  *    stdio transport (the adapter's own discovery result has no filter and
  *    would advertise the server description instead);
  *  - a 2026-07-28 tools/call is always answered here (issue #501): the
- *    confirm gates answered as elicitation and the Tasks extension are WP
- *    MCP's, and the adapter's own tools/call has neither (0.7.0 rejects
+ *    confirm gates answered as elicitation and the Tasks extension are WPMCP's,
+ *    and the adapter's own tools/call has neither (0.7.0 rejects
  *    continuation parameters for ability-backed tools);
  *  - other 2026-07-28 requests are answered here only when the loaded
  *    adapter does not speak that revision, and left to the adapter when it
  *    does;
  *  - a request naming a revision nobody serves gets the -32022 error with
  *    the supported list, which is what 0.7.0 answers too;
- *  - every 2025-11-25 request passes through to the adapter untouched.
+ *  - a 2025-11-25 tools/call for a tool this site declares, on a session
+ *    the adapter accepts, is answered here by Http_Tool_Call (issue #628),
+ *    so a refusal keeps its code and data on this revision too;
+ *  - every other 2025-11-25 request passes through to the adapter untouched.
  *
  * It hooks rest_dispatch_request, which core applies after the route's
  * permission_callback has passed, so the adapter's transport permission
- * check (and everything WP MCP layers on it) still decides who gets in.
+ * check (and everything WPMCP layers on it) still decides who gets in.
  * The answer itself comes from the stdio transport's dispatcher, the one
  * implementation of the tool, prompt and resource methods outside the
  * adapter, so the two transports cannot drift.
@@ -89,7 +92,10 @@ final class Modern_Http_Bridge
         $named     = $body ?? $header;
 
         if (! self::answers_here($method, $is_modern, $named, Protocol_Revision::adapter_speaks_modern())) {
-            return $result;
+            // A 2025-11-25 tools/call is answered here too, so a refusal
+            // keeps its code and data (issue #628); anything else, and a
+            // call Http_Tool_Call does not take, stays the adapter's.
+            return ( new Http_Tool_Call(new Adapter_Mcp_Session(), new Stdio_Transport()) )->answer($request, $message);
         }
 
         $id = $message['id'] ?? null;

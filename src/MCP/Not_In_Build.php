@@ -82,7 +82,7 @@ final class Not_In_Build
                 return new \WP_Error(
                     'not_in_this_build',
                     sprintf(
-                        '"%s" is not in this build. Safe MCP for WooCommerce ships store, content and safety tools only, and leaves out %s. The full WP MCP plugin includes it.',
+                        '"%s" is not in this build. Safe MCP for WooCommerce ships store, content and safety tools only, and leaves out %s. The full WPMCP plugin includes it.',
                         $ability,
                         $category
                     ),
@@ -100,7 +100,7 @@ final class Not_In_Build
             return new \WP_Error(
                 'not_in_this_build',
                 sprintf(
-                    'The "%s" action of "%s" is not in this build. Safe MCP for WooCommerce ships store, content and safety tools only, and leaves out %s. The full WP MCP plugin includes it.',
+                    'The "%s" action of "%s" is not in this build. Safe MCP for WooCommerce ships store, content and safety tools only, and leaves out %s. The full WPMCP plugin includes it.',
                     $action,
                     $ability,
                     $actions[ $action ]

@@ -2,7 +2,10 @@
 
 namespace WPMCP\Tools\Meta;
 
+use WPMCP\Safety\Kses_Safety;
+use WPMCP\Safety\Post_Write_Refused;
 use WPMCP\Safety\Safe_Mutation;
+use WPMCP\Tools\Builders\Builder_Meta_Keys;
 use WPMCP\Tools\Content\Code_Posts;
 use WPMCP\Tools\Content\Content_Guard;
 
@@ -24,6 +27,12 @@ if (! defined('ABSPATH')) {
  */
 class Set_Post_Meta
 {
+    public function __construct(
+        private readonly Builder_Meta_Keys $builder_keys = new Builder_Meta_Keys(),
+        private readonly Kses_Safety $kses = new Kses_Safety()
+    ) {
+    }
+
     public function handle(array $args): array
     {
         $post_id = (int) ($args['post_id'] ?? 0);
@@ -44,6 +53,14 @@ class Set_Post_Meta
             throw new \InvalidArgumentException($guard);
         }
         Code_Posts::assert_meta_writable((string) $post->post_type, [$key], $post_id);
+        $this->builder_keys->assert_writable([$key], $post_id);
+        // A string that is serialized data is unserialized when the row is read.
+        $stored  = get_post_meta($post_id, wp_unslash($key), true);
+        $refusal = $this->kses->serialized_refusal([$stored, maybe_serialize($stored)], $value, 'meta value');
+        if (null !== $refusal) {
+            // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Post_Write_Refused escapes the message it is given.
+            throw new Post_Write_Refused($refusal);
+        }
 
         $out = Safe_Mutation::run(
             [

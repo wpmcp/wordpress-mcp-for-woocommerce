@@ -20,7 +20,7 @@ if (! defined('ABSPATH')) {
  * deliberately NOT restricted here. Extend this list via the
  * wpmcp_cron_protected_hooks filter.
  *
- * WP MCP's own hooks (issue #563) are refused as well, and NOT through that
+ * WPMCP's own hooks (issue #563) are refused as well, and NOT through that
  * filter, so it cannot reopen them: every hook in Cron_Registry moves a
  * background job or runs a backup schedule, takes a job or schedule id as
  * its argument, and is only ever queued by the tool that created that job
@@ -55,7 +55,7 @@ class Core_Hooks
         return in_array($hook, (array) $protected, true);
     }
 
-    /** Whether $hook is one of WP MCP's own cron hooks (Cron_Registry). */
+    /** Whether $hook is one of WPMCP's own cron hooks (Cron_Registry). */
     public static function is_internal(string $hook): bool
     {
         return in_array($hook, Cron_Registry::hooks(), true);

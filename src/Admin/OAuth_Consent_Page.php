@@ -207,7 +207,7 @@ class OAuth_Consent_Page
             $first = false;
         }
         $body .= '</fieldset>';
-        $body .= '<p class="note">' . esc_html__('Whatever you choose, it can never do more than your own account can. A site owner can change this later on the WP MCP Connection screen.', 'safe-mcp-for-woocommerce') . '</p>';
+        $body .= '<p class="note">' . esc_html__('Whatever you choose, it can never do more than your own account can. A site owner can change this later on the WPMCP Connection screen.', 'safe-mcp-for-woocommerce') . '</p>';
         $body .= '<p class="actions"><button type="submit" name="decision" value="allow" class="primary">' . esc_html__('Allow', 'safe-mcp-for-woocommerce') . '</button> '
             . '<button type="submit" name="decision" value="deny">' . esc_html__('Deny', 'safe-mcp-for-woocommerce') . '</button></p>';
         $body .= '</form>';

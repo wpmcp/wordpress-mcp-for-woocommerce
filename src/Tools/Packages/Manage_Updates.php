@@ -30,6 +30,11 @@ if (! defined('ABSPATH')) {
  * prior list. On multisite they are network site options, which the
  * option snapshot does not cover, so the toggle refuses there.
  *
+ * type=plugins|themes (plural) are the safe package updates of issue #843:
+ * action=plan|run|status|restore, served by Safe_Package_Update, which
+ * snapshots each package, checks the site after the update and rolls a
+ * broken one back on its own.
+ *
  * The core and database upgraders are constructor-injected callables so the
  * gates can be tested without ever replacing core files or calling out to
  * wordpress.org; production uses the defaults below.
@@ -44,10 +49,13 @@ class Manage_Updates
     /** @var callable(): void */
     private $db_upgrader;
 
-    public function __construct(?callable $core_upgrader = null, ?callable $db_upgrader = null)
+    private Safe_Package_Update $safe_update;
+
+    public function __construct(?callable $core_upgrader = null, ?callable $db_upgrader = null, ?Safe_Package_Update $safe_update = null)
     {
         $this->core_upgrader = $core_upgrader ?? [self::class, 'upgrade_core'];
         $this->db_upgrader   = $db_upgrader ?? [self::class, 'upgrade_database'];
+        $this->safe_update   = $safe_update ?? new Safe_Package_Update();
     }
 
     public function handle(array $args): array
@@ -60,8 +68,22 @@ class Manage_Updates
         if ('plugin' === $type || 'theme' === $type) {
             return $this->auto_update($type, $args);
         }
+        if ('plugins' === $type || 'themes' === $type) {
+            return $this->safe_update->handle($type, self::string_keys($args));
+        }
 
-        throw new \InvalidArgumentException('type must be core, plugin or theme.');
+        throw new \InvalidArgumentException('type must be core, plugin, theme, plugins or themes.');
+    }
+
+    /**
+     * The input with string keys, as Safe_Package_Update takes it.
+     *
+     * @param array<mixed> $args
+     * @return array<string, mixed>
+     */
+    private static function string_keys(array $args): array
+    {
+        return Package_Update_Values::map($args);
     }
 
     private function core(array $args): array

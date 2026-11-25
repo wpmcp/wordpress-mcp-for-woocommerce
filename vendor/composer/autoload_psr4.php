@@ -8,6 +8,7 @@ $baseDir = dirname($vendorDir);
 return array(
     'WP\\McpSchema\\' => array($vendorDir . '/wordpress/php-mcp-schema/src'),
     'WP\\MCP\\' => array($vendorDir . '/wordpress/mcp-adapter/includes'),
-    'WPMCP\\' => array($baseDir . '/src'),
+    'WPMCP\\Modules\\' => array($baseDir . '/src/Modules', $baseDir . '/pro/modules'),
+    'WPMCP\\' => array($baseDir . '/src', $baseDir . '/pro/src'),
     'Automattic\\Jetpack\\Autoloader\\' => array($vendorDir . '/automattic/jetpack-autoloader/src'),
 );

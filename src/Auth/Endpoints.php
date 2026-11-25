@@ -348,7 +348,7 @@ class Endpoints
     /** What the authorization address says while OAuth is off. */
     public static function oauth_off_message(): string
     {
-        return __('OAuth is off for this site (the default), so WP MCP has no sign-in service here and a custom connector cannot connect.', 'safe-mcp-for-woocommerce')
+        return __('OAuth is off for this site (the default), so WPMCP has no sign-in service here and a custom connector cannot connect.', 'safe-mcp-for-woocommerce')
             . ' ' . \WPMCP\Connect\Client_Config_Generator::oauth_switch_on();
     }
 

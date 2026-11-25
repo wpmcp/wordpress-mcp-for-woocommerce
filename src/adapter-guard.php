@@ -3,7 +3,7 @@
 /**
  * MCP Adapter coexistence guard (issue #386).
  *
- * WP MCP bundles the WordPress MCP Adapter (wordpress/mcp-adapter) and the
+ * WPMCP bundles the WordPress MCP Adapter (wordpress/mcp-adapter) and the
  * schema package it depends on (wordpress/php-mcp-schema) through Composer.
  * The adapter is also a canonical plugin of its own, and other plugins
  * bundle it too. Adapter 0.7.0 deprecates bundling in favour of the
@@ -24,7 +24,7 @@
  *     bundle before plugins_loaded. The canonical plugin checks whether
  *     another copy is already loaded while plugins are still loading; if our
  *     bundle answered that check, the canonical plugin would stand down in
- *     favour of our older copy and show an admin error. Nothing in WP MCP
+ *     favour of our older copy and show an admin error. Nothing in WPMCP
  *     touches adapter classes before plugins_loaded (Server::register defers
  *     its boot to plugins_loaded), so the fallback is still in place the
  *     moment we need it.

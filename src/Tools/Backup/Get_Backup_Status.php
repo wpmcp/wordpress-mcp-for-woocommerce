@@ -47,7 +47,9 @@ class Get_Backup_Status
         unset($job['build']);
         $job['storage'] = self::storage();
 
-        return $job;
+        // A job kind added by a module (issue #854) may add fields to its
+        // own records, such as a download link.
+        return apply_filters('wpmcp_backup_job_view', $job);
     }
 
     /**

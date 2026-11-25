@@ -26,6 +26,11 @@
  * the licensing SDK's premium slug, wpmcp-main/ from a GitHub zip, wpmcp/ in
  * a checkout), so no path-based rule can tell them apart.
  *
+ * The self-hosted full plugin ships as two zips with the same flavor: the
+ * free zip and the premium zip, which adds a `.wpmcp-pro` file beside
+ * its main file. That marker breaks the tie (wpmcp_build_rank()), so the
+ * premium copy boots and the free copy stands down whichever loads first.
+ *
  * Deliberately not namespaced and not autoloaded: it has to run before any
  * autoloader exists.
  *
@@ -71,7 +76,7 @@ if (! function_exists('wpmcp_flavor_rank')) {
 if (! function_exists('wpmcp_flavor_of')) {
     /**
      * The flavor id a plugin main file declares, or '' when the file is
-     * missing or is not a WP MCP build.
+     * missing or is not a WPMCP build.
      *
      * A missing file is the stale-entry case: core's loader skips an
      * active_plugins entry whose file is gone but only prunes the entry when
@@ -94,6 +99,67 @@ if (! function_exists('wpmcp_flavor_of')) {
         $data = get_file_data($path, ['flavor' => 'WPMCP Flavor']);
 
         return trim((string) ($data['flavor'] ?? ''));
+    }
+}
+
+if (! function_exists('wpmcp_is_pro_build')) {
+    /**
+     * Whether the build whose main file is $main_file is the premium zip:
+     * that zip carries a `.wpmcp-pro` file beside its main file, the free
+     * zip does not. Both declare the same flavor.
+     *
+     * @param string $main_file Absolute path of the main file.
+     */
+    function wpmcp_is_pro_build(string $main_file): bool
+    {
+        return is_readable(dirname($main_file) . '/.wpmcp-pro');
+    }
+}
+
+if (! function_exists('wpmcp_build_rank')) {
+    /**
+     * Precedence of one installed build: its flavor rank, doubled, plus one
+     * when it is the premium zip. Doubling keeps the premium bonus below one
+     * flavor step, so a premium copy outranks a free copy of the same
+     * flavor and never a higher flavor.
+     *
+     * @param string $main_file Absolute path of the main file.
+     * @param string $flavor    Flavor id from that file's `WPMCP Flavor:` header.
+     */
+    function wpmcp_build_rank(string $main_file, string $flavor): int
+    {
+        $bonus = wpmcp_is_pro_build($main_file) ? 1 : 0;
+
+        return wpmcp_flavor_rank($flavor) * 2 + $bonus;
+    }
+}
+
+if (! function_exists('wpmcp_active_plugin_basenames')) {
+    /**
+     * The active plugin basenames of this site, plus the network-activated
+     * ones on multisite.
+     *
+     * @return list<string>
+     */
+    function wpmcp_active_plugin_basenames(): array
+    {
+        $active = (array) get_option('active_plugins', []);
+
+        if (function_exists('is_multisite') && is_multisite()) {
+            $active = array_merge(
+                $active,
+                array_keys((array) get_site_option('active_sitewide_plugins', []))
+            );
+        }
+
+        $names = [];
+        foreach ($active as $plugin) {
+            if (is_string($plugin)) {
+                $names[] = $plugin;
+            }
+        }
+
+        return array_values(array_unique($names));
     }
 }
 
@@ -128,25 +194,14 @@ if (! function_exists('wpmcp_flavor_should_defer')) {
         }
 
         $self = plugin_basename($file);
-        $rank = wpmcp_flavor_rank($flavor);
+        $rank = wpmcp_build_rank($file, $flavor);
 
-        $active = (array) get_option('active_plugins', []);
-
-        if (function_exists('is_multisite') && is_multisite()) {
-            $active = array_merge(
-                $active,
-                array_keys((array) get_site_option('active_sitewide_plugins', []))
-            );
-        }
-
-        foreach ($active as $plugin) {
-            $plugin = (string) $plugin;
-
+        foreach (wpmcp_active_plugin_basenames() as $plugin) {
             if ($plugin === $self) {
                 continue;
             }
 
-            // Every WP MCP main file is named wpmcp*.php. Filtering on that
+            // Every WPMCP main file is named wpmcp*.php. Filtering on that
             // before touching the filesystem keeps this to one header read
             // per sibling build rather than one per active plugin, and an
             // unrelated 'wpmcp-companion/wpmcp-companion.php' still has to
@@ -155,9 +210,134 @@ if (! function_exists('wpmcp_flavor_should_defer')) {
                 continue;
             }
 
-            $other = wpmcp_flavor_of(WP_PLUGIN_DIR . '/' . $plugin);
+            $path  = WP_PLUGIN_DIR . '/' . $plugin;
+            $other = wpmcp_flavor_of($path);
 
-            if ('' !== $other && wpmcp_flavor_rank($other) > $rank) {
+            if ('' !== $other && wpmcp_build_rank($path, $other) > $rank) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+}
+
+if (! function_exists('wpmcp_pro_deactivate_free_copies')) {
+    /**
+     * When $main_file is the premium zip, deactivate every other active
+     * 'full' build that is not: the free zip the premium one replaces. The
+     * free copy already stands down for it (wpmcp_build_rank()), so this
+     * only takes the stale entry off the active list. Silent, so no
+     * deactivation hook of the free copy runs, and network-wide entries
+     * are removed from the network list.
+     *
+     * Every WPMCP main file is named wpmcp*.php, so the header is read only
+     * for active plugins whose basename starts with 'wpmcp': on a site with
+     * no other copy this costs one marker check and no file read.
+     *
+     * @param string $main_file The calling main file (__FILE__).
+     * @return list<string> The basenames deactivated.
+     */
+    function wpmcp_pro_deactivate_free_copies(string $main_file): array
+    {
+        if (! wpmcp_is_pro_build($main_file)) {
+            return [];
+        }
+
+        $self = plugin_basename($main_file);
+        $free = [];
+
+        foreach (wpmcp_active_plugin_basenames() as $plugin) {
+            if ($plugin === $self || 0 !== strpos(basename($plugin), 'wpmcp')) {
+                continue;
+            }
+
+            $path = WP_PLUGIN_DIR . '/' . $plugin;
+
+            if ('full' === wpmcp_flavor_of($path) && ! wpmcp_is_pro_build($path)) {
+                $free[] = $plugin;
+            }
+        }
+
+        if ([] === $free) {
+            return [];
+        }
+
+        if (! function_exists('deactivate_plugins')) {
+            require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        }
+
+        // A null $network_wide removes each entry from whichever list holds it.
+        deactivate_plugins($free, true);
+
+        return $free;
+    }
+}
+
+if (! function_exists('wpmcp_other_build_installed')) {
+    /**
+     * Whether another WPMCP build is installed on this site, active or not:
+     * any plugin outside $plugin_dir whose main file carries a `WPMCP Flavor:`
+     * header.
+     *
+     * The uninstall paths ask this first. Every build shares the same options,
+     * custom tables and cron hooks, so deleting one build (the free copy next
+     * to the premium one, say) must not clear the crons or drop the data the
+     * build that stays depends on. Unlike wpmcp_flavor_should_defer() it reads
+     * every installed plugin's header, not only wpmcp*.php ones: the
+     * verticals' main files are named after their slug, and an uninstall is
+     * rare enough that one header read per plugin costs nothing.
+     *
+     * @param string $plugin_dir Absolute directory of the build being removed.
+     */
+    function wpmcp_other_build_installed(string $plugin_dir): bool
+    {
+        if (! function_exists('get_plugins')) {
+            $admin = ABSPATH . 'wp-admin/includes/plugin.php';
+            if (! is_file($admin)) {
+                return false;
+            }
+            require_once $admin;
+        }
+
+        $self = basename(rtrim(str_replace('\\', '/', $plugin_dir), '/'));
+
+        foreach (array_keys(get_plugins()) as $plugin) {
+            $plugin = (string) $plugin;
+            if (false === strpos($plugin, '/') || dirname($plugin) === $self) {
+                continue;
+            }
+            if ('' !== wpmcp_flavor_of(WP_PLUGIN_DIR . '/' . $plugin)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+}
+
+if (! function_exists('wpmcp_other_build_active')) {
+    /**
+     * Whether another WPMCP build is active on this site or network-wide:
+     * an active plugin outside $plugin_dir whose main file carries a
+     * `WPMCP Flavor:` header.
+     *
+     * Deactivation asks this first. Deactivating one build while another is
+     * active hands the site to the other one on the next request, and that
+     * one runs on the same recurring cron events and background jobs, so
+     * they must stay.
+     *
+     * @param string $plugin_dir Absolute directory of the build being deactivated.
+     */
+    function wpmcp_other_build_active(string $plugin_dir): bool
+    {
+        $self = basename(rtrim(str_replace('\\', '/', $plugin_dir), '/'));
+
+        foreach (wpmcp_active_plugin_basenames() as $plugin) {
+            if (false === strpos($plugin, '/') || dirname($plugin) === $self) {
+                continue;
+            }
+            if ('' !== wpmcp_flavor_of(WP_PLUGIN_DIR . '/' . $plugin)) {
                 return true;
             }
         }

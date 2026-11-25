@@ -265,10 +265,23 @@ final class Secret_Options
             'weglot-translate'                  => [ 'api_key', 'api_key_private' ],
             'weglot-translate-v3'               => [ 'api_key', 'api_key_private' ],
 
+            // Email marketing connectors (issue #900), read from the wordpress.org
+            // releases: MailerLite 1.7.28 keeps its key as its own option; Kit 3.5.2
+            // keeps OAuth tokens, the legacy key and secret and the spam protection
+            // secrets in one settings array; Omnisend for WooCommerce 1.22.10 keeps
+            // its key and a connect token as options; ActiveCampaign 8.1.21 keeps
+            // its key in its settings array. Klaviyo's public key is a site id, not
+            // a credential, and stays readable here.
+            'mailerlite_api_key'                => true,
+            '_wp_convertkit_settings'           => [ 'access_token', 'refresh_token', 'api_key', 'api_secret', 'recaptcha_secret_key', 'cloudflare_turnstile_secret_key' ],
+            'omnisend_api_key'                  => true,
+            'omnisend_connect_token'            => true,
+            'settings_activecampaign'           => [ 'api_key' ],
+
             // Akismet.
             'wordpress_api_key'                 => true,
 
-            // WP MCP's own credential stores (sealed or hashed today; masked as defence in depth).
+            // WPMCP's own credential stores (sealed or hashed today; masked as defence in depth).
             'wpmcp_seo_data_keys'               => true,
             'wpmcp_stock_keys'                  => true,
             'wpmcp_oauth_tokens'                => true,

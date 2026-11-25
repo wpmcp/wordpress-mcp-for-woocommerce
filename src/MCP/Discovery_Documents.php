@@ -119,7 +119,7 @@ class Discovery_Documents
             'url'  => Mcp_Resource::canonical(),
         ];
         // Every revision the endpoint answers, whichever adapter copy
-        // mounts it: 2026-07-28 is served by WP MCP when the adapter
+        // mounts it: 2026-07-28 is served by WPMCP when the adapter
         // predates it (issue #386).
         $remote['supportedProtocolVersions'] = Protocol_Revision::advertised_versions();
 
@@ -160,7 +160,7 @@ class Discovery_Documents
             '$schema'     => self::SERVER_CARD_SCHEMA,
             'name'        => self::card_name(),
             'title'       => self::clip(self::site_name()),
-            'description' => self::clip(__('AI builds and edits your WordPress site, and physically cannot wreck it.', 'safe-mcp-for-woocommerce')),
+            'description' => self::clip(__('AI builds and edits your WordPress site, with a snapshot before each supported write.', 'safe-mcp-for-woocommerce')),
             'version'     => defined('WPMCP_VERSION') ? WPMCP_VERSION : '0.0.0',
             'websiteUrl'  => home_url('/'),
             'remotes'     => [ $remote ],
@@ -274,6 +274,11 @@ class Discovery_Documents
                 continue;
             }
             if ('free' !== ($record['tier'] ?? 'free') || Skill_Library::is_locked($record)) {
+                continue;
+            }
+            // Issue #850: a skill shown only while a given plugin is active
+            // would tell an anonymous reader which plugins the site runs.
+            if ([] !== (array) ($record['requires_any'] ?? [])) {
                 continue;
             }
 

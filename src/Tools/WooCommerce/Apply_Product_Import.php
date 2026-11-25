@@ -3,8 +3,10 @@
 namespace WPMCP\Tools\WooCommerce;
 
 use WPMCP\Plugin;
+use WPMCP\Safety\Mutation_Failed;
 use WPMCP\Safety\Rollback_Service;
 use WPMCP\Safety\Safe_Mutation;
+use WPMCP\Safety\Session_Id;
 use WPMCP\Safety\Snapshot_Store;
 use WPMCP\Tools\Media\Media_Import_Snapshot;
 use WPMCP\Tools\Media\Remote_Image_Guard;
@@ -31,12 +33,16 @@ if (! defined('ABSPATH')) {
  *  - image URLs through Remote_Image_Guard::sideload(), the guarded path
  *    import-stock-image uses, each recorded as a media_import;
  *  - each created product or variation recorded as a wc_product_create.
- * Everything shares one fresh session_id, so rollback-session undoes the
- * whole import. Pruning is held for the duration so an import larger than
- * the history limit cannot drop its own first undo points.
+ * Everything shares one session_id, so rollback-session undoes the whole
+ * import: the caller's session_id when one is given, so the import joins that
+ * chat's session and is undone with its other writes, and a fresh one
+ * otherwise (issue #1255). Pruning is held for the duration so an import
+ * larger than the history limit cannot drop its own first undo points.
  *
- * A row that fails part way rolls back the whole session and the call
- * reports the failure: an import is all or nothing.
+ * A row that fails part way rolls back everything the call wrote and the
+ * call reports the failure: an import is all or nothing. In the caller's
+ * session only the undo points the call added are undone, so the chat's
+ * earlier writes stay.
  */
 class Apply_Product_Import
 {
@@ -81,10 +87,13 @@ class Apply_Product_Import
 
         $this->assert_permitted($plan['ops'], $args);
 
-        $session_id = wp_generate_uuid4();
-        $ids        = Snapshot_Store::hold_pruning(fn () => $this->run($plan['ops'], $public['rows'], $session_id));
+        $joined     = $this->joins_session($args);
+        $session_id = $joined ?? wp_generate_uuid4();
+        $floor      = null === $joined ? 0 : self::newest_row($session_id);
+        $rows       = is_array($public['rows'] ?? null) ? $public['rows'] : [];
+        $ids        = Snapshot_Store::hold_pruning(fn () => $this->run($plan['ops'], $rows, $session_id, $floor, null === $joined));
 
-        $undo_points = count(Snapshot_Store::index_by_session($session_id, 1000000));
+        $undo_points = count(self::operations_since($session_id, $floor));
         $limit       = Snapshot_Store::history_limit();
         $warnings    = [];
         if ($undo_points > $limit) {
@@ -98,14 +107,20 @@ class Apply_Product_Import
             'updated'     => $public['summary']['update'],
             'skipped'     => $public['summary']['skip'],
             'undo_points' => $undo_points,
-            'undo'        => 'rollback-session with this session_id undoes the whole import.',
+            'undo'        => null === $joined
+                ? 'rollback-session with this session_id undoes the whole import.'
+                : 'rollback-session with this session_id undoes the whole import, with the other writes recorded under it.',
             'rows'        => $this->row_results($public['rows'], $ids),
             'warnings'    => $warnings,
         ];
     }
 
-    /** @return array<int, int> row index => product id written */
-    private function run(array $ops, array $rows, string $session_id): array
+    /**
+     * @param array<mixed> $ops  the plan's write list
+     * @param array<mixed> $rows the plan's rows, for the failure message
+     * @return array<int, int> row index => product id written
+     */
+    private function run(array $ops, array $rows, string $session_id, int $floor, bool $own_session): array
     {
         $fetched = [];
         $ids     = [];
@@ -118,8 +133,7 @@ class Apply_Product_Import
                     ? $this->create($op, $session_id, $fetched)
                     : $this->update($op, $session_id, $fetched);
             } catch (\Throwable $e) {
-                Rollback_Service::restore_session($session_id);
-                $leftovers = Rollback_Service::take_warnings();
+                $leftovers = self::undo_run($session_id, $floor, $own_session);
                 throw new \RuntimeException(esc_html(sprintf(
                     'Row %d (SKU %s) failed: %s Everything this call wrote was rolled back%s.',
                     (int) $index,
@@ -130,6 +144,80 @@ class Apply_Product_Import
             }
         }
         return $ids;
+    }
+
+    /**
+     * The caller's session_id, when one is given: the import records under it
+     * and so joins that chat's session. Null asks for a fresh one. A session
+     * another user started is refused here, before anything is written, since
+     * Snapshot_Store would refuse the import's first write into it.
+     *
+     * @param array<mixed> $args
+     * @throws Mutation_Failed When the session belongs to another user.
+     */
+    private function joins_session(array $args): ?string
+    {
+        $session = Session_Id::given($args);
+        if (null === $session) {
+            return null;
+        }
+        $denial = Snapshot_Store::session_write_denial($session);
+        if (null !== $denial) {
+            throw new Mutation_Failed($denial); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- session_write_denial() escapes the only variable part.
+        }
+        return $session;
+    }
+
+    /**
+     * Undo what this call wrote after a row failed. Its own session is rolled
+     * back whole, as before. In the caller's session only the undo points
+     * after $floor, the ones this call added, are undone, newest first, so
+     * the chat's earlier writes stay.
+     *
+     * @return list<string> the undo's warnings
+     */
+    private static function undo_run(string $session_id, int $floor, bool $own_session): array
+    {
+        if ($own_session) {
+            Rollback_Service::restore_session($session_id);
+            return array_values(array_filter(Rollback_Service::take_warnings(), 'is_string'));
+        }
+        $warnings = [];
+        foreach (self::operations_since($session_id, $floor) as $operation_id) {
+            Rollback_Service::restore_operation($operation_id);
+            $warnings = array_merge($warnings, array_values(array_filter(Rollback_Service::take_warnings(), 'is_string')));
+        }
+        return $warnings;
+    }
+
+    /** The ledger id of the session's newest undo point, 0 when it has none yet. */
+    private static function newest_row(string $session_id): int
+    {
+        $id = Snapshot_Store::index_by_session($session_id, 1)[0]['id'] ?? null;
+        return is_numeric($id) ? (int) $id : 0;
+    }
+
+    /**
+     * The operation ids of the session's undo points written after ledger row
+     * $floor, newest first: with $floor read before the run, the ones this
+     * call added.
+     *
+     * @return list<string>
+     */
+    private static function operations_since(string $session_id, int $floor): array
+    {
+        $operation_ids = [];
+        foreach (Snapshot_Store::index_by_session($session_id, 1000000) as $row) {
+            $id = $row['id'] ?? null;
+            if (! is_numeric($id) || (int) $id <= $floor) {
+                break;
+            }
+            $operation_id = $row['operation_id'] ?? null;
+            if (is_string($operation_id) && '' !== $operation_id) {
+                $operation_ids[] = $operation_id;
+            }
+        }
+        return $operation_ids;
     }
 
     private function create(array $op, string $session_id, array &$fetched): int

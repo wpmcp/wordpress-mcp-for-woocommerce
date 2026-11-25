@@ -46,11 +46,13 @@ class Create_Term
         }
 
         $parent = (int) ($args['parent'] ?? 0);
-        if ($parent > 0 && ! get_term($parent, $taxonomy) instanceof \WP_Term) {
-            throw new \InvalidArgumentException(sprintf('Parent term %d does not exist in "%s".', (int) $parent, esc_html($taxonomy)));
-        }
+        // Not hierarchical first (issue #1198): a tag's parent id may exist
+        // in another taxonomy, and "does not exist" would hide the reason.
         if ($parent > 0 && ! is_taxonomy_hierarchical($taxonomy)) {
             throw new \InvalidArgumentException(sprintf('Taxonomy "%s" is not hierarchical, so a parent cannot be set.', esc_html($taxonomy)));
+        }
+        if ($parent > 0 && ! get_term($parent, $taxonomy) instanceof \WP_Term) {
+            throw new \InvalidArgumentException(sprintf('Parent term %d does not exist in "%s".', (int) $parent, esc_html($taxonomy)));
         }
 
         $description = (string) ($args['description'] ?? '');

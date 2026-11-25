@@ -35,7 +35,7 @@ if (! defined('ABSPATH')) {
 class Import_Content
 {
     /** The one refusal for any file outside the exports directory (issue #603). */
-    public const OUTSIDE_MESSAGE = '"file" must be a WXR (.xml) file in the WP MCP exports directory (uploads/wpmcp-exports). Pass a name from list-exports or the path export-content returned.';
+    public const OUTSIDE_MESSAGE = '"file" must be a WXR (.xml) file in the WPMCP exports directory (uploads/wpmcp-exports). Pass a name from list-exports or the path export-content returned.';
 
     private const VALID_STATUSES = ['draft', 'publish', 'pending', 'private', 'future'];
 

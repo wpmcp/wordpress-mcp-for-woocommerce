@@ -57,7 +57,7 @@ class Security_Scanner
     /**
      * Live: run the requested audits and assemble the scored report.
      *
-     * @param array $input { checks?, deep?, max_files?, max_seconds?, vulnerabilities? }
+     * @param array $input { checks?, deep?, max_files?, max_seconds?, vulnerabilities?, cursor? }
      * @return array { summary, sections, scan_meta, top_recommendations, vulnerabilities? }
      */
     public function scan(array $input): array
@@ -107,7 +107,10 @@ class Security_Scanner
             $findings = array_merge($findings, $this->software->run());
         }
         if (in_array('compromise', $checks, true)) {
-            $compromise              = $this->compromise->run($max_files, $max_seconds);
+            // A truncated compromise walk returns next_cursor; passing it
+            // back as cursor continues the walk (issue #1151).
+            $cursor                  = isset($input['cursor']) && is_string($input['cursor']) && '' !== $input['cursor'] ? $input['cursor'] : null;
+            $compromise              = $this->compromise->run($max_files, $max_seconds, $cursor);
             $findings                = array_merge($findings, $compromise['findings']);
             $scan_meta['compromise'] = $compromise['stats'];
         }

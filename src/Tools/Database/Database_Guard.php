@@ -1021,7 +1021,7 @@ class Database_Guard
     }
 
     /**
-     * Table-name suffixes of WP MCP's own stores that hold raw copies of
+     * Table-name suffixes of WPMCP's own stores that hold raw copies of
      * what a write replaced (issue #550): the snapshot ledger
      * ({prefix}wpmcp_snapshots, on every site of a network). Its payload is
      * the exact undo copy, gateway credentials included, encoded as base64
@@ -1031,7 +1031,7 @@ class Database_Guard
      */
     public const INTERNAL_STORE_TABLE_SUFFIXES = ['wpmcp_snapshots'];
 
-    /** Whether $table is one of WP MCP's internal raw-copy stores (case-insensitive). */
+    /** Whether $table is one of WPMCP's internal raw-copy stores (case-insensitive). */
     public static function is_internal_store_table(string $table): bool
     {
         $table = strtolower(trim($table));
@@ -1073,7 +1073,7 @@ class Database_Guard
 
         return new \WP_Error(
             'internal_store_read_blocked',
-            'Reads of the WP MCP snapshot ledger are blocked: it holds the exact undo copy of every '
+            'Reads of the WPMCP snapshot ledger are blocked: it holds the exact undo copy of every '
             . 'change, credentials included. Use list-operations to see the undo history and the '
             . 'rollback tools to restore it.'
         );
@@ -1376,7 +1376,7 @@ class Database_Guard
 
     /**
      * Why a raw row write may not run because it reaches a post of one of
-     * WP MCP's private stores (issue #517), or null. Agent memory entries
+     * WPMCP's private stores (issue #517), or null. Agent memory entries
      * are published only by an administrator in wp-admin; with
      * wpmcp_enable_db_writes on, update-rows on wp_posts would otherwise
      * publish or rewrite one, insert-row would create one, an update could
@@ -1420,7 +1420,7 @@ class Database_Guard
             return null;
         }
         $why = Content_Guard::store_refusal($type);
-        return 'Refusing to write rows of a WP MCP internal store (' . $type . ').' . (null === $why ? '' : ' ' . $why);
+        return 'Refusing to write rows of a WPMCP internal store (' . $type . ').' . (null === $why ? '' : ' ' . $why);
     }
 
     /**
@@ -1917,7 +1917,7 @@ class Database_Guard
     }
 
     /**
-     * One-time pass over WP MCP's internal logs written before their values
+     * One-time pass over WPMCP's internal logs written before their values
      * were masked on write (issue #550, PR #584 review): mask the gateway
      * credentials in every audit log before-image, and drop the captured
      * arguments of request log rows. Runs before query reads anything and

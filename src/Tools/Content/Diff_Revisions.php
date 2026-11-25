@@ -2,6 +2,8 @@
 
 namespace WPMCP\Tools\Content;
 
+use WPMCP\Tools\Revisions\Revision_Time;
+
 if (! defined('ABSPATH')) {
     exit;
 }
@@ -87,15 +89,21 @@ class Diff_Revisions
         ] + (null === $code ? [] : [ 'code_withheld' => true, 'note' => $code ]);
     }
 
-    /** @return array{id: int, is_revision: bool, modified: string, author: int} */
+    /**
+     * modified is UTC (post_modified_gmt); date_gmt, date_iso and
+     * modified_iso name the zone, matching list-revisions (issue #1199).
+     *
+     * @return array{id: int, is_revision: bool, modified: string, modified_iso: string, date_gmt: string, date_iso: string, author: int}
+     */
     private function describe(\WP_Post $post): array
     {
         return [
-            'id'          => (int) $post->ID,
-            'is_revision' => 'revision' === $post->post_type,
-            'modified'    => (string) $post->post_modified_gmt,
-            'author'      => (int) $post->post_author,
-        ];
+            'id'           => (int) $post->ID,
+            'is_revision'  => 'revision' === $post->post_type,
+            'modified'     => (string) $post->post_modified_gmt,
+            'modified_iso' => Revision_Time::iso_utc((string) $post->post_modified_gmt),
+            'author'       => (int) $post->post_author,
+        ] + Revision_Time::fields($post);
     }
 
     /**

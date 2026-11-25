@@ -7,7 +7,7 @@ if (! defined('ABSPATH')) {
 }
 
 /**
- * Who may manage WP MCP (issue #479): its screens, its admin-post and AJAX
+ * Who may manage WPMCP (issue #479): its screens, its admin-post and AJAX
  * handlers, its admin REST routes and its options.php groups.
  *
  * Every one of those entry points checks self::CAPABILITY, a capability no
@@ -31,7 +31,7 @@ final class Management_Access
     public const CONSTANT   = 'WPMCP_MANAGEMENT_ADMINS';
 
     /**
-     * Admin-post hooks WP MCP registers that are not plugin management: the
+     * Admin-post hooks WPMCP registers that are not plugin management: the
      * OAuth consent screen, where any user approves a connection to their
      * own account. The entry point test fails on any other unguarded one.
      */
@@ -71,7 +71,7 @@ final class Management_Access
 
     /**
      * Register an admin-post or AJAX handler behind the management check.
-     * Every WP MCP admin handler goes through here; the entry point test
+     * Every WPMCP admin handler goes through here; the entry point test
      * fails on one that does not.
      */
     public static function add_handler(string $hook, callable $handler): void
@@ -81,7 +81,7 @@ final class Management_Access
 
     public static function refusal_message(): string
     {
-        return __('Sorry, you are not allowed to manage WP MCP on this site.', 'safe-mcp-for-woocommerce');
+        return __('Sorry, you are not allowed to manage WPMCP on this site.', 'safe-mcp-for-woocommerce');
     }
 
     /**
@@ -128,7 +128,7 @@ final class Management_Access
         return $caps;
     }
 
-    /** Whether $user_id may manage WP MCP. Null means the current user. */
+    /** Whether $user_id may manage WPMCP. Null means the current user. */
     public static function can_manage(?int $user_id = null): bool
     {
         $user_id = null === $user_id ? get_current_user_id() : $user_id;
@@ -260,7 +260,7 @@ final class Management_Access
 
         $parsed = self::parse_ids($ids);
         if (null === $parsed) {
-            return new \WP_Error('wpmcp_management_invalid', __('Choose at least one administrator who can manage WP MCP.', 'safe-mcp-for-woocommerce'));
+            return new \WP_Error('wpmcp_management_invalid', __('Choose at least one administrator who can manage WPMCP.', 'safe-mcp-for-woocommerce'));
         }
         foreach ($parsed as $id) {
             if (! self::is_administrator($id)) {
@@ -274,7 +274,7 @@ final class Management_Access
         if (! in_array($actor_id, $parsed, true)) {
             return new \WP_Error(
                 'wpmcp_management_self_lockout',
-                __('You cannot remove yourself from the administrators who manage WP MCP. Ask another listed administrator to do it.', 'safe-mcp-for-woocommerce')
+                __('You cannot remove yourself from the administrators who manage WPMCP. Ask another listed administrator to do it.', 'safe-mcp-for-woocommerce')
             );
         }
 
@@ -300,7 +300,7 @@ final class Management_Access
         return true;
     }
 
-    /** `wp wpmcp management-access reset`: let every administrator manage WP MCP again. */
+    /** `wp wpmcp management-access reset`: let every administrator manage WPMCP again. */
     public static function cli_reset(array $args = [], array $assoc = []): void
     {
         $result = self::reset();
@@ -308,7 +308,8 @@ final class Management_Access
             \WP_CLI::error($result->get_error_message());
             return;
         }
-        \WP_CLI::success('Every administrator can manage WP MCP again.');
+        // @phpstan-ignore class.notFound (WP-CLI is not in the analysis stubs; this runs only under WP-CLI, like the error() call above.)
+        \WP_CLI::success('Every administrator can manage WPMCP again.');
     }
 
     /**

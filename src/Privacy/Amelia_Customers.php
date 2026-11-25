@@ -18,7 +18,7 @@ if (! defined('ABSPATH')) {
 /**
  * Amelia's customer records in WordPress's personal data export and erasure
  * (issue #499, on the #478 framework). Amelia keeps its customers in its own
- * tables and registers no exporter or eraser for them, and WP MCP's Amelia
+ * tables and registers no exporter or eraser for them, and WPMCP's Amelia
  * ops create and change those records, so Personal_Data registers this pair
  * while Amelia is present (wpmcp_amelia_active).
  *
@@ -31,13 +31,13 @@ if (! defined('ABSPATH')) {
  * record of what was booked and paid, so the eraser reports them retained.
  *
  * Amelia's booking rows key the person by Amelia's own customer id and hold
- * no email, so WP MCP's generic undo snapshot eraser cannot find them
+ * no email, so WPMCP's generic undo snapshot eraser cannot find them
  * (issue #552). This eraser therefore also rewrites the person's rows in
  * every Amelia undo snapshot (amelia_rows) to exactly what it wrote live,
  * a page of snapshots at a time: an undo of an earlier write still works
  * and puts none of it back. Amelia_Rows_Snapshot::restore() also keeps an
  * erased customer's fields erased for a snapshot this did not reach. It
- * runs before WP MCP's undo snapshot eraser.
+ * runs before WPMCP's undo snapshot eraser.
  */
 class Amelia_Customers
 {

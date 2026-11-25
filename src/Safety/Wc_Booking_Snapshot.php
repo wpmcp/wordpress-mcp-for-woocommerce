@@ -409,7 +409,8 @@ final class Wc_Booking_Snapshot
             $order = wc_get_order($order_id);
             if ($order instanceof \WC_Order && $order->get_status('edit') !== $wanted) {
                 try {
-                    $order->update_status($wanted, 'Restored by a WP MCP rollback of booking #' . $id . '.');
+                    // @phpstan-ignore method.notFound (WooCommerce declares WC_Order::update_status(); the analysis stubs do not.)
+                    $order->update_status($wanted, 'Restored by a WPMCP rollback of booking #' . $id . '.');
                 } catch (\Throwable $e) {
                     $warnings[] = "Order {$order_id}'s status could not be put back: " . $e->getMessage();
                 }

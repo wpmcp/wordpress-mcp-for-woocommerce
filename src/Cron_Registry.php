@@ -55,6 +55,8 @@ final class Cron_Registry
     public const JOB_HOOKS = [
         'wpmcp_run_backup_job'         => [ 'wpmcp_backup_jobs', 'jobs' ],
         'wpmcp_run_restore_job'        => [ 'wpmcp_backup_jobs', 'jobs' ],
+        // The static HTML export (issue #854) keeps its jobs in the backup store.
+        'wpmcp_run_static_export'      => [ 'wpmcp_backup_jobs', 'jobs' ],
         'wpmcp_run_cli_job'            => [ 'wpmcp_cli_jobs', 'jobs' ],
         'wpmcp_run_broken_link_scan'   => [ 'wpmcp_broken_link_scans', 'scans' ],
         'wpmcp_run_optimize_media_job' => [ 'wpmcp_optimize_media_jobs', 'jobs' ],
@@ -63,7 +65,7 @@ final class Cron_Registry
     /** Statuses a job can still be moved out of by its next event. */
     private const ACTIVE = [ 'queued', 'running' ];
 
-    public const CANCELED_ERROR = 'Canceled because WP MCP was deactivated before the job finished. Start it again if you still need it.';
+    public const CANCELED_ERROR = 'Canceled because WPMCP was deactivated before the job finished. Start it again if you still need it.';
 
     /** @return string[] Every hook the plugin schedules. */
     public static function hooks(): array

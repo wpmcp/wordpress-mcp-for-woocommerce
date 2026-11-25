@@ -11,7 +11,7 @@ if (! defined('ABSPATH')) {
 }
 
 /**
- * Creates WP MCP's per-site tables on every site that needs them (issue #527).
+ * Creates WPMCP's per-site tables on every site that needs them (issue #527).
  *
  * Each table uses the site's table prefix, so on a network every site needs
  * its own copy. Three paths make sure it has one:

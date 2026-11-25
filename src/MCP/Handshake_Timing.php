@@ -18,7 +18,7 @@ if (! defined('ABSPATH')) {
  *  - app: milliseconds from the start of the PHP request (REQUEST_TIME_FLOAT)
  *    to the response, so WordPress and every plugin booting are included;
  *  - abilities: milliseconds spent registering abilities
- *    (wp_abilities_api_init, every plugin's, not only WP MCP's), present when
+ *    (wp_abilities_api_init, every plugin's, not only WPMCP's), present when
  *    this request ran the registration.
  *
  * Durations only: no names, versions or paths, so it tells a caller nothing

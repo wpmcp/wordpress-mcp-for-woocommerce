@@ -9,9 +9,9 @@ if (! defined('ABSPATH')) {
 }
 
 /**
- * The hardening settings WP MCP applies itself (issue #847): the fixes for
+ * The hardening settings WPMCP applies itself (issue #847): the fixes for
  * what the hardening audit reports, each on or off on its own, stored in ONE
- * option and applied by WP MCP's own hooks on every request. Nothing is
+ * option and applied by WPMCP's own hooks on every request. Nothing is
  * written to wp-config.php, .htaccess or any other file, so turning a
  * setting off (or rolling back the write that turned it on) takes effect on
  * the next request.
@@ -59,12 +59,12 @@ final class Hardening_Settings
         'Referrer-Policy'        => 'strict-origin-when-cross-origin',
     ];
 
-    /** While true every hook passes its value through, so a probe sees what the site does without WP MCP. */
+    /** While true every hook passes its value through, so a probe sees what the site does without WPMCP. */
     private static bool $standing_down = false;
 
     private static bool $registered = false;
 
-    /** display_errors as it was before WP MCP touched it. */
+    /** display_errors as it was before WPMCP touched it. */
     private static ?string $display_errors_at_boot = null;
 
     public static function register(): void
@@ -113,7 +113,7 @@ final class Hardening_Settings
     /**
      * Run $probe with every hardening hook passing its value through, so a
      * caller can tell what the site does on its own (another plugin, the
-     * theme, the server) from what WP MCP adds.
+     * theme, the server) from what WPMCP adds.
      *
      * @template T
      * @param callable():T $probe
@@ -130,7 +130,7 @@ final class Hardening_Settings
         }
     }
 
-    /** display_errors before WP MCP changed it, null when PHP did not say. */
+    /** display_errors before WPMCP changed it, null when PHP did not say. */
     public static function display_errors_at_boot(): ?string
     {
         return self::$display_errors_at_boot;

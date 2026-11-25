@@ -45,6 +45,43 @@ class Ability_Grid_Page
     public const SLUG         = 'wpmcp-abilities';
     public const NONCE_ACTION = 'wpmcp_ability_grid';
 
+    /** Section headings, in screen order (issue #1128). Unlisted domains go under Integrations. */
+    private const GROUP_WORDPRESS = 'WordPress';
+    private const GROUP_BUILDERS  = 'Page builders';
+    private const GROUP_TOOLS     = 'Site tools';
+    private const GROUP_PLUGINS   = 'Integrations';
+
+    /** @var array<string, string> domain slug => section */
+    private const DOMAIN_GROUPS = [
+        'blocks' => self::GROUP_WORDPRESS, 'comments' => self::GROUP_WORDPRESS, 'content' => self::GROUP_WORDPRESS,
+        'core' => self::GROUP_WORDPRESS, 'cron' => self::GROUP_WORDPRESS, 'media' => self::GROUP_WORDPRESS,
+        'menus' => self::GROUP_WORDPRESS, 'meta' => self::GROUP_WORDPRESS, 'multisite' => self::GROUP_WORDPRESS,
+        'packages' => self::GROUP_WORDPRESS, 'rest' => self::GROUP_WORDPRESS, 'settings' => self::GROUP_WORDPRESS,
+        'structure' => self::GROUP_WORDPRESS, 'taxonomy' => self::GROUP_WORDPRESS, 'theme' => self::GROUP_WORDPRESS,
+        'users' => self::GROUP_WORDPRESS,
+        'builders' => self::GROUP_BUILDERS, 'elementor' => self::GROUP_BUILDERS, 'divi' => self::GROUP_BUILDERS,
+        'bricks' => self::GROUP_BUILDERS, 'beaver' => self::GROUP_BUILDERS, 'breakdance' => self::GROUP_BUILDERS,
+        'oxygen' => self::GROUP_BUILDERS,
+        'analysis' => self::GROUP_TOOLS, 'analytics' => self::GROUP_TOOLS, 'bridge' => self::GROUP_TOOLS,
+        'cli' => self::GROUP_TOOLS, 'code' => self::GROUP_TOOLS, 'connect' => self::GROUP_TOOLS,
+        'context' => self::GROUP_TOOLS, 'database' => self::GROUP_TOOLS, 'diagnostics' => self::GROUP_TOOLS,
+        'dispatch' => self::GROUP_TOOLS, 'export' => self::GROUP_TOOLS, 'filesystem' => self::GROUP_TOOLS,
+        'gateway' => self::GROUP_TOOLS, 'governance' => self::GROUP_TOOLS, 'maintenance' => self::GROUP_TOOLS,
+        'migration' => self::GROUP_TOOLS, 'performance' => self::GROUP_TOOLS, 'security' => self::GROUP_TOOLS,
+        'skills' => self::GROUP_TOOLS, 'sync' => self::GROUP_TOOLS, 'translation' => self::GROUP_TOOLS,
+    ];
+
+    /** @var array<string, string> domain slug => readable name; brand names are not translated */
+    private const DOMAIN_LABELS = [
+        'acf' => 'Advanced Custom Fields', 'cli' => 'WP-CLI', 'rest' => 'REST API', 'seo' => 'SEO',
+        'tec' => 'The Events Calendar', 'mec' => 'Modern Events Calendar', 'pmpro' => 'Paid Memberships Pro',
+        'gravitytables' => 'Gravity Tables', 'woocommerce' => 'WooCommerce', 'edd' => 'Easy Digital Downloads',
+        'buddypress' => 'BuddyPress', 'bbpress' => 'bbPress', 'learndash' => 'LearnDash', 'wpml' => 'WPML',
+        'packages' => 'Plugins and themes', 'theme' => 'Themes', 'meta' => 'Custom fields',
+        'taxonomy' => 'Categories and tags', 'cron' => 'Scheduled tasks', 'core' => 'WordPress core',
+        'builders' => 'Page builders', 'filesystem' => 'Files', 'code' => 'Code', 'multisite' => 'Multisite network',
+    ];
+
     /**
      * Dispatch a posted screen action. Returns null when no action was
      * posted, otherwise a result array for render(); failures come back as
@@ -189,6 +226,74 @@ class Ability_Grid_Page
      *
      * @return array<string, array<int, array>>
      */
+    /**
+     * The summary bar (issue #1128): how many abilities there are, how many
+     * are on and off, and how many high-risk ones (destructive or
+     * default-off) are on.
+     *
+     * @param array<string, array<int, array>> $grid rows()
+     * @return array{total: int, enabled: int, disabled: int, high_risk_enabled: int}
+     */
+    public function summary(array $grid): array
+    {
+        $out = [ 'total' => 0, 'enabled' => 0, 'disabled' => 0, 'high_risk_enabled' => 0 ];
+        foreach ($grid as $rows) {
+            foreach ($rows as $row) {
+                $out['total']++;
+                $out[ $row['enabled'] ? 'enabled' : 'disabled' ]++;
+                if ($row['enabled'] && ($row['destructive'] || $row['dangerous'])) {
+                    $out['high_risk_enabled']++;
+                }
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * rows() under section headings (issue #1128), in a fixed order, each
+     * section sorted by readable name. Empty sections are left out.
+     *
+     * @return array<string, array<string, array<int, array>>> section => domain => rows
+     */
+    public function groups(): array
+    {
+        $groups = [ self::GROUP_WORDPRESS => [], self::GROUP_BUILDERS => [], self::GROUP_TOOLS => [], self::GROUP_PLUGINS => [] ];
+        foreach ($this->rows() as $domain => $rows) {
+            $groups[ self::DOMAIN_GROUPS[ $domain ] ?? self::GROUP_PLUGINS ][ $domain ] = $rows;
+        }
+        foreach ($groups as $label => $domains) {
+            uksort($domains, static fn (string $a, string $b): int => strcasecmp(self::domain_label($a), self::domain_label($b)));
+            $groups[ $label ] = $domains;
+        }
+        return array_filter($groups);
+    }
+
+    /** A domain's readable name: a known product name, or its slug as words. */
+    public static function domain_label(string $domain): string
+    {
+        return self::DOMAIN_LABELS[ $domain ] ?? ucwords(str_replace([ '-', '_' ], ' ', $domain));
+    }
+
+    /**
+     * Read, write and destructive counts of a domain's rows (issue #1128).
+     * Read and write add up to the total; destructive counts the writes
+     * that delete or are default-off.
+     *
+     * @param array<int, array> $rows
+     * @return array{read: int, write: int, destructive: int}
+     */
+    public static function risk_counts(array $rows): array
+    {
+        $out = [ 'read' => 0, 'write' => 0, 'destructive' => 0 ];
+        foreach ($rows as $row) {
+            $out[ 'read' === $row['operation'] ? 'read' : 'write' ]++;
+            if ($row['destructive'] || $row['dangerous']) {
+                $out['destructive']++;
+            }
+        }
+        return $out;
+    }
+
     public function rows(): array
     {
         $rows = [];
@@ -317,7 +422,7 @@ class Ability_Grid_Page
         <div class="wrap">
             <h1><?php echo esc_html(Plugin::page_title(_x('Abilities', 'admin menu', 'safe-mcp-for-woocommerce'))); ?></h1>
             <p>
-                <?php echo esc_html__('Every ability the plugin declares, grouped by domain. Toggles write governance state (a narrowing layer: they can disable, or clear a disable, never bypass another layer), and every change is recorded in the governance audit log.', 'safe-mcp-for-woocommerce'); ?>
+                <?php echo esc_html__('Every tool WPMCP offers to AI clients on this site, grouped by area. Switching a tool off here stops clients from using it; switching it on cannot override a tool that is blocked elsewhere, such as in site code. Every change is recorded in the audit log.', 'safe-mcp-for-woocommerce'); ?>
             </p>
 
             <?php if (isset($result['error'])) : ?>
@@ -364,30 +469,34 @@ class Ability_Grid_Page
             <form method="post" style="margin: 1em 0;">
                 <input type="hidden" name="wpmcp_grid_action" value="toggle_auto_enable_new">
                 <input type="hidden" name="_wpnonce" value="<?php echo esc_attr($nonce); ?>">
-                <input type="hidden" name="enabled" value="<?php echo $auto_new ? '0' : '1'; ?>">
-                <strong><?php echo esc_html__('Switch on new tools after updates:', 'safe-mcp-for-woocommerce'); ?></strong>
-                <?php echo $auto_new ? esc_html__('on', 'safe-mcp-for-woocommerce') : esc_html__('off', 'safe-mcp-for-woocommerce'); ?>
-                <button type="submit" class="button button-small">
-                    <?php echo $auto_new ? esc_html__('Turn off', 'safe-mcp-for-woocommerce') : esc_html__('Turn on', 'safe-mcp-for-woocommerce'); ?>
-                </button>
-                <br><span class="description">
-                    <?php echo esc_html__('When on, tools that a WP MCP update adds arrive switched on. Tools that run code, write files or database rows, or manage users, plugins or themes always arrive off, and a tool you switched off stays off.', 'safe-mcp-for-woocommerce'); ?>
-                </span>
+                <input type="checkbox" id="wpmcp-auto-enable-new" name="enabled" value="1"<?php checked($auto_new); ?> onchange="this.form.submit()">
+                <label for="wpmcp-auto-enable-new"><strong><?php echo esc_html__('Switch on new tools after updates', 'safe-mcp-for-woocommerce'); ?></strong></label>
+                <noscript><button type="submit" class="button"><?php echo esc_html__('Save', 'safe-mcp-for-woocommerce'); ?></button></noscript>
+                <p class="description">
+                    <?php echo esc_html__('When on, tools that a WPMCP update adds arrive switched on. Tools that run code, write files or database rows, or manage users, plugins or themes always arrive off, and a tool you switched off stays off.', 'safe-mcp-for-woocommerce'); ?>
+                </p>
             </form>
 
             <?php
-            $grid        = $this->rows();
+            $groups      = $this->groups();
             $open_domain = $this->acted_domain($result);
+            $this->render_summary($this->summary($this->rows()));
             $this->render_filters();
             ?>
 
-            <?php foreach ($grid as $domain => $rows) : ?>
-                <?php
-                $disabled_count = count(array_filter($rows, static fn (array $r): bool => ! $r['enabled']));
-                ?>
-                <details class="wpmcp-domain" data-domain="<?php echo esc_attr($domain); ?>"<?php echo $domain === $open_domain ? ' open' : ''; ?> style="margin-top: 1em;">
-                    <summary style="cursor: pointer; padding: 0.4em 0; font-size: 1.15em;">
-                        <code><?php echo esc_html($domain); ?></code>
+            <div class="wpmcp-ability-list" style="max-width: none; width: 100%;">
+            <?php foreach ($groups as $group_label => $grid) : ?>
+            <div class="wpmcp-domain-group-section">
+            <h2 class="wpmcp-domain-group"><?php echo esc_html($group_label); ?></h2>
+                <?php foreach ($grid as $domain => $rows) : ?>
+                    <?php
+                    $disabled_count = count(array_filter($rows, static fn (array $r): bool => ! $r['enabled']));
+                    $risk           = self::risk_counts($rows);
+                    ?>
+                <details class="wpmcp-domain" data-domain="<?php echo esc_attr($domain); ?>"<?php echo $domain === $open_domain ? ' open' : ''; ?> style="margin-top: 0.5em; border: 1px solid #c3c4c7; background: #fff; padding: 0 1em;">
+                    <summary style="cursor: pointer; padding: 0.6em 0; display: flex; flex-wrap: wrap; gap: 0.5em 1.5em; align-items: baseline;">
+                        <span style="font-size: 1.15em; font-weight: 600; min-width: 16em;"><span class="wpmcp-domain-name"><?php echo esc_html(self::domain_label($domain)); ?></span>
+                        <code class="wpmcp-domain-slug"><small><?php echo esc_html($domain); ?></small></code></span>
                         <span class="wpmcp-domain-counts" style="font-weight: normal; font-size: 13px;">
                             <?php
                             echo esc_html(sprintf(
@@ -398,6 +507,17 @@ class Ability_Grid_Page
                                 /* translators: %d: number of abilities in the domain that are disabled. */
                                 __('%d disabled', 'safe-mcp-for-woocommerce'),
                                 $disabled_count
+                            ));
+                            ?>
+                        </span>
+                        <span class="wpmcp-domain-risk" style="font-weight: normal; font-size: 13px;">
+                            <?php
+                            echo esc_html(sprintf(
+                                /* translators: 1: read-only abilities, 2: abilities that write, 3: destructive or default-off abilities. */
+                                __('%1$d read, %2$d write, %3$d destructive', 'safe-mcp-for-woocommerce'),
+                                $risk['read'],
+                                $risk['write'],
+                                $risk['destructive']
                             ));
                             ?>
                         </span>
@@ -493,7 +613,10 @@ class Ability_Grid_Page
                     </tbody>
                 </table>
                 </details>
+                <?php endforeach; ?>
+            </div>
             <?php endforeach; ?>
+            </div>
             <?php $this->render_filter_script(); ?>
         </div>
         <?php
@@ -532,6 +655,34 @@ class Ability_Grid_Page
             $tokens[] = 'default-off';
         }
         return implode(' ', $tokens);
+    }
+
+    /**
+     * The summary bar at the top (issue #1128). Each count carries
+     * data-count so it can be read back; toggles reload the screen, so it
+     * always reflects the saved state.
+     *
+     * @param array{total: int, enabled: int, disabled: int, high_risk_enabled: int} $summary
+     */
+    private function render_summary(array $summary): void
+    {
+        $items = [
+            'total'             => __('Abilities', 'safe-mcp-for-woocommerce'),
+            'enabled'           => __('Enabled', 'safe-mcp-for-woocommerce'),
+            'disabled'          => __('Disabled', 'safe-mcp-for-woocommerce'),
+            'high-risk-enabled' => __('High-risk enabled', 'safe-mcp-for-woocommerce'),
+        ];
+        echo '<div class="wpmcp-ability-summary" style="display: flex; flex-wrap: wrap; gap: 1em; margin: 1em 0;">';
+        foreach ($items as $key => $label) {
+            printf(
+                '<div class="card" style="margin: 0; min-width: 10em; padding: 0.6em 1em;"><span data-count="%s" style="display: block; font-size: 1.8em; font-weight: 600;%s">%d</span>%s</div>',
+                esc_attr($key),
+                'high-risk-enabled' === $key && $summary['high_risk_enabled'] > 0 ? ' color: #b32d2e;' : '',
+                (int) $summary[ str_replace('-', '_', $key) ],
+                esc_html($label)
+            );
+        }
+        echo '</div>';
     }
 
     /**
@@ -628,6 +779,9 @@ class Ability_Grid_Page
                         section.open = false;
                         delete section.dataset.filterOpened;
                     }
+                });
+                document.querySelectorAll('.wpmcp-domain-group-section').forEach(function (group) {
+                    group.hidden = active && null === group.querySelector('details.wpmcp-domain:not([hidden])');
                 });
                 status.textContent = ! active ? '' : (0 === total ? i18n.none : i18n.matches.replace('%d', total));
             }

@@ -17,7 +17,7 @@ if (! defined('ABSPATH')) {
  *
  * Scheduling (adding/duplicating) a core-critical hook whose recurrence
  * WordPress itself manages is refused (Core_Hooks::PROTECTED): re-adding it
- * could double-run version checks or transient cleanup. So is every WP MCP
+ * could double-run version checks or transient cleanup. So is every WPMCP
  * internal hook (Cron_Registry, issue #563), which would otherwise run a
  * backup or other background job out of band with caller-chosen arguments. Unscheduling those
  * same hooks is intentionally NOT restricted (disabling wp_version_check is a
@@ -39,7 +39,7 @@ class Schedule_Event
         }
 
         if (Core_Hooks::is_internal($hook)) {
-            throw new \RuntimeException(sprintf('Refusing to schedule "%s": it is one of WP MCP\'s internal hooks, queued only by the tool that owns the job.', esc_html($hook)));
+            throw new \RuntimeException(sprintf('Refusing to schedule "%s": it is one of WPMCP\'s internal hooks, queued only by the tool that owns the job.', esc_html($hook)));
         }
         if (Core_Hooks::is_protected($hook)) {
             throw new \RuntimeException(sprintf('Refusing to schedule protected core hook "%s".', esc_html($hook)));

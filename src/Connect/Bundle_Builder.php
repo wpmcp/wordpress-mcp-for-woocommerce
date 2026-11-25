@@ -58,7 +58,7 @@ class Bundle_Builder
         return [
             'manifest_version' => '0.2',
             'name'             => 'wpmcp',
-            'display_name'     => 'WP MCP',
+            'display_name'     => 'WPMCP',
             'version'          => defined('WPMCP_VERSION') ? WPMCP_VERSION : '0.0.0',
             'description'      => 'Connect Claude Desktop to the wpmcp server at ' . $endpoint,
             'author'           => ['name' => 'wpmcp'],

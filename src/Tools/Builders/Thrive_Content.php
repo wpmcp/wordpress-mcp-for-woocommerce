@@ -2,6 +2,9 @@
 
 namespace WPMCP\Tools\Builders;
 
+use WPMCP\Safety\Kses_Safety;
+use WPMCP\Safety\Post_Write_Refused;
+
 if (! defined('ABSPATH')) {
     exit;
 }
@@ -43,6 +46,8 @@ class Thrive_Content
     public const CSS_META_KEY = 'tve_custom_css';
 
     public const OPTIMIZED_VERSION_META_KEY = '_tve_lightspeed_version';
+
+    public const KSES_SUBJECT = 'Thrive Architect page';
 
     /** Script lists Thrive loads instead of all of its scripts when present. */
     private const JS_MODULE_META_KEYS = ['_tve_js_modules', '_tve_js_modules_woo'];
@@ -155,12 +160,70 @@ class Thrive_Content
     }
 
     /**
+     * The layout rows a write can change, as this page stores them now, by
+     * base key (the rows a Thrive revision holds).
+     *
+     * @return array<string,mixed>
+     */
+    public static function rows(int $post_id): array
+    {
+        $rows = [];
+        foreach (Thrive_Page::REVISION_KEYS as $base) {
+            $rows[ $base ] = get_post_meta($post_id, self::key($post_id, $base), true);
+        }
+
+        return $rows;
+    }
+
+    /**
+     * The refusal for layout rows (base key => value) holding a new value
+     * wp_kses_post would change, or new code (see Thrive_Code_Fields), or
+     * null. Post meta skips kses, so a user without unfiltered_html could
+     * otherwise store a script on the page. The layout is one HTML value:
+     * changed anywhere, it is judged whole. Values the page's rows hold now
+     * were stored by someone allowed to; a revision's rows are judged like
+     * any other, since revision rows are plain post meta.
+     *
+     * @param array<string,mixed> $rows
+     */
+    public static function kses_refusal(int $post_id, array $rows): ?\WP_Error
+    {
+        return (new Kses_Safety())->values_refusal(self::rows($post_id), $rows, self::KSES_SUBJECT, new Thrive_Code_Fields());
+    }
+
+    /**
+     * The rows save() writes, by base key, for kses_refusal().
+     *
+     * @return array<string,string>
+     */
+    public static function saved_rows(string $content, ?string $before_more, ?string $css = null): array
+    {
+        return array_filter([self::LAYOUT_META_KEY => $content, 'tve_content_before_more' => $before_more, self::CSS_META_KEY => $css], 'is_string');
+    }
+
+    /**
+     * @param array<string,mixed> $rows
+     * @throws Post_Write_Refused When kses_refusal() refuses the rows; nothing is written.
+     */
+    private static function assert_kses(int $post_id, array $rows): void
+    {
+        $refusal = self::kses_refusal($post_id, $rows);
+        if (null !== $refusal) {
+            // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Post_Write_Refused escapes the message it is given.
+            throw new Post_Write_Refused($refusal);
+        }
+    }
+
+    /**
      * Store a new layout (see before_more() for the Read More part), drop the
      * optimized assets computed for the old one, and refresh the plain-text
      * copy through Thrive when it is loaded.
+     *
+     * @throws Post_Write_Refused When kses_refusal() refuses the layout; nothing is written.
      */
     public static function save(int $post_id, string $content, ?string $before_more, ?string $css = null): void
     {
+        self::assert_kses($post_id, self::saved_rows($content, $before_more, $css));
         update_post_meta($post_id, self::key($post_id, self::LAYOUT_META_KEY), wp_slash($content));
         if (null !== $before_more) {
             update_post_meta($post_id, self::key($post_id, 'tve_content_before_more'), wp_slash($before_more));
@@ -185,9 +248,11 @@ class Thrive_Content
      * stored under this page's key), then refresh what Thrive derives.
      *
      * @param array<string,mixed> $rows
+     * @throws Post_Write_Refused When kses_refusal() refuses the rows; nothing is written.
      */
     public static function restore_rows(int $post_id, array $rows): void
     {
+        self::assert_kses($post_id, $rows);
         foreach ($rows as $base => $value) {
             update_post_meta($post_id, self::key($post_id, $base), wp_slash($value));
         }

@@ -3,6 +3,7 @@
 namespace WPMCP\Tools\Settings;
 
 use WPMCP\Safety\Safe_Mutation;
+use WPMCP\Safety\Session_Id;
 use WPMCP\Safety\Snapshot;
 
 if (! defined('ABSPATH')) {
@@ -18,7 +19,9 @@ if (! defined('ABSPATH')) {
  * rollback-operation. Keys that fail validation (not allowlisted, read-only,
  * invalid enum/permalink value) are skipped and reported, not silently
  * dropped: the valid subset of the request still applies (partial failure
- * does not abort the whole batch).
+ * does not abort the whole batch). Each undo point is recorded under the
+ * caller's session_id, so rollback-session undoes the chat's settings changes
+ * with its other writes, and under 'default' when none is given (issue #1255).
  */
 class Update_Settings
 {
@@ -36,10 +39,11 @@ class Update_Settings
         $skipped         = [];
         $rewrite_flushed = false;
         $operation_ids   = [];
+        $session_id      = Session_Id::of($args);
 
         foreach ($settings as $key => $raw_value) {
             $key    = (string) $key;
-            $result = $this->apply_one($key, $raw_value);
+            $result = $this->apply_one($key, $raw_value, $session_id);
 
             if (isset($result['skip'])) {
                 $skipped[] = ['key' => $key, 'reason' => $result['skip']];
@@ -69,8 +73,10 @@ class Update_Settings
      * Validate/coerce one key => value pair, then (if valid and actually
      * changing anything) write it through Safe_Mutation. Returns either
      * ['skip' => reason] or ['value' => coerced value, 'operation_id' => ...].
+     *
+     * @return array<string, mixed>
      */
-    private function apply_one(string $key, $raw_value): array
+    private function apply_one(string $key, mixed $raw_value, string $session_id): array
     {
         if (! Settings_Registry::has($key)) {
             return ['skip' => 'not allowlisted'];
@@ -116,7 +122,7 @@ class Update_Settings
             [
                 'object_type' => $timezone ? 'option_set' : 'option',
                 'object_id'   => $timezone ? Snapshot::option_set_id(Site_Locale::TIMEZONE_OPTIONS) : $key,
-                'session_id'  => 'default',
+                'session_id'  => $session_id,
                 'tool_name'   => 'update-settings',
                 'args'        => [$key => $raw_value],
             ],

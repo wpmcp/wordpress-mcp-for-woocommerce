@@ -53,7 +53,7 @@ class Handshake_Instructions
             $parts[] = $admin;
         }
 
-        $parts[] = $this->can_view_site_context() ? $this->auto_summary() : $this->safety_line();
+        $parts[] = $this->can_view_site_context() ? $this->auto_summary() : $this->safety_line() . $this->availability_line();
 
         $memory = $this->memory_block();
         if ('' !== $memory) {
@@ -141,7 +141,22 @@ class Handshake_Instructions
             $name,
             $this->active_builder(),
             $this->safety_line()
-        );
+        ) . $this->availability_line();
+    }
+
+    /**
+     * The one line that tells an agent some tools are unavailable here and
+     * how to find out which (issue #629), with a leading space, or '' when
+     * every declared tool is available. Names no site data, so it rides
+     * along in both the summary and the safety-only answer.
+     */
+    public function availability_line(): string
+    {
+        try {
+            return Tool_Availability::any() ? ' ' . Tool_Availability::HANDSHAKE_LINE : '';
+        } catch (\Throwable $e) {
+            return '';
+        }
     }
 
     /**
@@ -163,7 +178,7 @@ class Handshake_Instructions
      * tools check: Elementor's plugin class, then the Bricks and Divi theme
      * constants/templates, then the WPBakery, Beaver Builder, Breakdance
      * engine (Breakdance or Oxygen 6), classic Oxygen, Avada builder and
-     * Thrive Architect plugin constants, then the BeTheme theme, falling back to gutenberg (the WP default).
+     * Thrive Architect plugin constants, then the BeTheme theme and the Brizy pluginthen the BeTheme theme and the Kirki page builder, falling back to gutenberg (the WP default).
      */
     public function active_builder(): string
     {
@@ -200,6 +215,17 @@ class Handshake_Instructions
         }
         if ('betheme' === $template && defined('MFN_THEME_VERSION')) {
             return 'betheme';
+        }
+        if (defined('BRIZY_VERSION')) {
+            return 'brizy';
+        }
+        // KIRKI_VERSION alone is also the Kirki customizer framework themes
+        // bundle; KIRKI_POST_TYPE comes only with the page builder (#641).
+        if (defined('KIRKI_VERSION') && defined('KIRKI_POST_TYPE')) {
+            return 'kirki';
+        }
+        if ('flatsome' === $template) {
+            return 'flatsome';
         }
 
         return 'gutenberg';

@@ -18,7 +18,7 @@ if (! defined('ABSPATH')) {
  *    gate such as the ability bridge, uses this code and a message built
  *    here: what is off, that it is off on purpose, and the exact filter (and
  *    constant, where one exists) a developer sets to switch it on. When the
- *    filter is a group on the WP MCP > Opt-in operations screen (#823), the
+ *    filter is a group on the WPMCP > Opt-in operations screen (#823), the
  *    message names that screen, the group and its URL first (issue #966);
  *    only code-only gates say there is no wp-admin setting.
  *  - operation_disabled: the feature is on by default and this site has
@@ -37,7 +37,11 @@ class Opt_In_Required extends \RuntimeException
     public const CODE = 'opt_in_required';
 
     /** The admin menu path of the opt-in operations screen (issue #823). */
-    public const SCREEN = 'WP MCP > Opt-in operations';
+    public const SCREEN = 'WPMCP > Opt-in operations';
+
+    private string $filter;
+
+    private string $constant;
 
     /**
      * @param string $disabled The opening sentence, such as "The delete-plugin tool is disabled."
@@ -48,6 +52,39 @@ class Opt_In_Required extends \RuntimeException
     public function __construct(string $disabled, string $filter, string $constant = '', string $warning = '')
     {
         parent::__construct(self::message($disabled, $filter, $constant, $warning));
+        $this->filter   = $filter;
+        $this->constant = $constant;
+    }
+
+    /**
+     * This refusal as the WP_Error the Registrar returns for it, with
+     * $message (its plain-text copy of the message): the same code and data
+     * error() gives (issue #628).
+     */
+    public function refusal(string $message): \WP_Error
+    {
+        return self::contract($this->filter)->attach(new \WP_Error(self::CODE, $message, self::data($this->filter, $this->constant)));
+    }
+
+    /**
+     * The issue #627 contract of a closed opt-in: who switches it on, and
+     * where. The screen and its group when the filter is one, else the
+     * snippet a developer adds.
+     */
+    public static function contract(string $filter): Unavailable
+    {
+        $snippet = sprintf("add_filter('%s', '__return_true');", $filter);
+        $screen  = self::admin_setting($filter);
+        if (null === $screen) {
+            return new Unavailable('opt_in_required', '', sprintf('A site developer switches it on with %s', $snippet), [ 'who' => 'developer' ]);
+        }
+
+        return new Unavailable(
+            'opt_in_required',
+            '',
+            sprintf('A site administrator switches it on under %s, group "%s", or a site developer with %s', self::SCREEN, $screen['admin_group'], $snippet),
+            [ 'admin_url' => $screen['admin_url'] ]
+        );
     }
 
     /**
@@ -128,18 +165,28 @@ class Opt_In_Required extends \RuntimeException
      * The same refusal as a WP_Error, for tools that return errors rather
      * than throw. Its data names the filter (and constant), and the admin
      * screen when one switches the group on, so a client can show them
-     * without parsing the message.
+     * without parsing the message, and carries the contract (issue #628).
      *
      * @param array<string, mixed> $data Extra data merged in (such as a status).
      */
     public static function error(string $disabled, string $filter, string $constant = '', string $warning = '', array $data = []): \WP_Error
     {
-        $data += [ 'filter' => $filter ];
-        if ('' !== $constant) {
-            $data += [ 'constant' => $constant ];
-        }
-        $data += self::admin_setting($filter) ?? [];
+        return self::contract($filter)->attach(new \WP_Error(self::CODE, self::message($disabled, $filter, $constant, $warning), $data + self::data($filter, $constant)));
+    }
 
-        return new \WP_Error(self::CODE, self::message($disabled, $filter, $constant, $warning), $data);
+    /**
+     * The filter, the constant when there is one, and the admin screen when
+     * one switches the group on.
+     *
+     * @return array<string, string>
+     */
+    private static function data(string $filter, string $constant): array
+    {
+        $data = [ 'filter' => $filter ];
+        if ('' !== $constant) {
+            $data['constant'] = $constant;
+        }
+
+        return $data + (self::admin_setting($filter) ?? []);
     }
 }

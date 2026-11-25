@@ -107,6 +107,7 @@ use WPMCP\Tools\Redirects\Create_Redirect;
 use WPMCP\Tools\Redirects\Delete_Redirect;
 use WPMCP\Tools\Redirects\Find_Broken_Links;
 use WPMCP\Tools\Redirects\List_Redirects;
+use WPMCP\Tools\Redirects\Redirect_Router;
 use WPMCP\Tools\Redirects\Redirect_Handler;
 use WPMCP\Tools\Redirects\Redirect_Store;
 use WPMCP\Tools\Redirects\Run_Broken_Link_Scan;
@@ -169,6 +170,7 @@ use WPMCP\Tools\Packages\Deactivate_Plugin;
 use WPMCP\Tools\Packages\Install_Plugin;
 use WPMCP\Tools\Packages\Update_Plugin;
 use WPMCP\Tools\Packages\Manage_Updates;
+use WPMCP\Tools\Packages\Safe_Package_Update;
 use WPMCP\Tools\Packages\Delete_Plugin;
 use WPMCP\Tools\Packages\List_Themes;
 use WPMCP\Tools\Packages\Switch_Theme;
@@ -284,11 +286,17 @@ final class Plugin
      * inside a msgid is one more literal for a flavor build to chase. This
      * constant is the single place such a build would rewrite; today neither
      * scripts/build-woo-release.sh nor build-wporg-release.sh does, so every
-     * flavor still renders "wpmcp" here. Menu and page titles compose it with
+     * flavor renders "WPMCP" here. Menu and page titles compose it with
      * a translated tail through page_title() instead of baking it into a
      * msgid.
      */
-    public const BRAND = 'wpmcp';
+    public const BRAND = 'WPMCP';
+
+    /**
+     * The product name in page titles and H1s (issues #1127, #1128):
+     * "WPMCP: Abilities". The admin menu keeps BRAND.
+     */
+    public const PRODUCT_NAME = 'WPMCP';
 
     /**
      * "<brand>: <screen>" for a page title or an H1. One translatable
@@ -302,13 +310,15 @@ final class Plugin
         return sprintf(
             /* translators: 1: product name (not translated), 2: admin screen name */
             __('%1$s: %2$s', 'safe-mcp-for-woocommerce'),
-            self::BRAND,
+            self::PRODUCT_NAME,
             $screen
         );
     }
 
     private static ?Plugin $instance = null;
     private ?Registrar $registrar = null;
+    private ?\WPMCP\Edition\Edition $edition = null;
+
     public static function instance(): Plugin
     {
         return self::$instance ??= new self();
@@ -326,6 +336,33 @@ final class Plugin
     public function registrar(): Registrar
     {
         return $this->registrar ??= new Registrar();
+    }
+
+    /**
+     * The edition slots: Pro registers its part of the surface through the
+     * wpmcp_edition_slots filter (src/Edition/Edition.php). Built once per
+     * instance, on first use, so the free build pays for one filter call.
+     */
+    private function edition(): \WPMCP\Edition\Edition
+    {
+        return $this->edition ??= \WPMCP\Edition\Edition::from_hooks();
+    }
+
+    /** Run one edition slot outside the boot sequence (tests replay a slot this way). */
+    public function run_edition_slot(string $slot, ?Registrar $registrar = null): void
+    {
+        $this->edition()->run($slot, $this->edition_context($registrar));
+    }
+
+    private function edition_context(?Registrar $registrar): \WPMCP\Edition\Edition_Context
+    {
+        return new \WPMCP\Edition\Edition_Context(
+            $registrar,
+            fn (string $group): bool => $this->group_enabled($group),
+            function (Registrar $registrar, array $integrations): void {
+                $this->register_integrations($registrar, array_values(array_filter($integrations, static fn (object $i): bool => $i instanceof \WPMCP\Integrations\Integration_Dispatcher)));
+            }
+        );
     }
 
     /**
@@ -375,9 +412,36 @@ final class Plugin
         // An undo that would change a synced pattern other people's posts
         // place is refused for a user who cannot edit those posts (#711).
         [\WPMCP\Integrations\Core_Patterns_Pack::class, 'restore_refusal', 'wpmcp_rollback_post_refusal'],
+        // An undo of a PublishPress Future schedule or cancel puts the post's
+        // meta back; the plugin's scheduled action follows it (issue #709).
+        [\WPMCP\Integrations\PublishPress_Pack::class, 'after_post_restored', 'wpmcp_rollback_post_restored'],
+        // An undo of a GeoDirectory listing write brings the listing's
+        // detail row mirror of its title, status and terms back in step
+        // (issue #707).
+        [\WPMCP\Integrations\Listings_Pack::class, 'after_post_restored', 'wpmcp_rollback_post_restored'],
+        // An undo of a Max Mega Menu settings, theme or menu item write
+        // rebuilds its generated CSS, as the write did (issue #908).
+        [\WPMCP\Integrations\Max_Mega_Menu_Pack::class, 'after_options_restored'],
+        [\WPMCP\Integrations\Max_Mega_Menu_Pack::class, 'after_post_restored', 'wpmcp_rollback_post_restored'],
+        // An undo of a Redux panel write runs the panel's compiler hooks for
+        // the restored values, as the write did (#897).
+        [\WPMCP\Integrations\Redux_Pack::class, 'after_options_restored'],
+        // An undo of a consent banner text write lets Complianz and CookieYes
+        // drop the banner caches their own save drops (#686).
+        [\WPMCP\Integrations\Consent_Pack::class, 'after_rows_restored', 'wpmcp_rollback_db_rows_restored'],
+        [\WPMCP\Integrations\Variation_Swatches_Pack::class, 'after_rows_restored', 'wpmcp_rollback_db_rows_restored'], // An undo of a swatch type change drops WooCommerce's attribute caches (#1096).
+        [\WPMCP\Integrations\Hustle_Pack::class, 'after_rows_restored', 'wpmcp_rollback_db_rows_restored'], // An undo of a Hustle write drops its module cache and schedule flags (#1091).
         [\WPMCP\Tools\I18n\I18n_Adapter::class, 'restore_translation_group', 'wpmcp_rollback_translation_group'],
         [\WPMCP\Tools\I18n\I18n_Adapter::class, 'hold_sync', 'wpmcp_rollback_hold_translation_sync'],
         [\WPMCP\Tools\I18n\I18n_Adapter::class, 'release_sync', 'wpmcp_rollback_release_translation_sync'],
+        // Modern Events Calendar reads its calendar from its own mec_events
+        // and mec_dates tables, derived from the event meta; an undo that
+        // restores an event post rebuilds them as the write did (#677).
+        [\WPMCP\Integrations\Modern_Events_Calendar_Writes::class, 'after_post_restored', 'wpmcp_rollback_post_restored'],
+        // The gallery and slider packs hook their refreshers on init: an undo
+        // flushes Envira, Smart Slider 3 and NextGEN caches, and a trash keeps
+        // Envira's trashed flag in step (#705).
+        [\WPMCP\Integrations\Gallery_Packs::class, 'attach_refreshers', 'init'],
     ];
 
     /**
@@ -397,6 +461,11 @@ final class Plugin
             if (class_exists($class)) {
                 add_action($refresher[2] ?? 'wpmcp_rollback_options_restored', [$class, $method], 10, 2);
             }
+        }
+        // Then the refreshers modules declare with #[On_Rollback]; a test
+        // that passes its own list gets exactly that list.
+        if (null === $refreshers) {
+            self::instance()->kernel()->attach_rollback_hooks(); // central-list-ok: D11 seam, the compiled #[On_Rollback] rows
         }
     }
 
@@ -466,6 +535,9 @@ final class Plugin
         if ($this->group_enabled('search')) {
             (new Index_Hooks())->register();
         }
+        // Image optimization runs, tool-upload optimization and modern
+        // format delivery (issue #432), gated on the media group.
+        $this->edition()->run('runtime.image_optimization', $this->edition_context(null));
         // File tool backups written before #609 kept their .php names under
         // uploads; rename them once to names no server executes (issue #622).
         add_action('init', [\WPMCP\Tools\Filesystem\Legacy_Backup_Migration::class, 'maybe_run'], 20);
@@ -509,19 +581,27 @@ final class Plugin
                 add_action('wp_abilities_api_categories_init', [$this, 'register_ability_category']);
             }
             $this->register_builder_runtime_hooks();
-            // Who may manage WP MCP (issue #479): every screen, admin-post and
+            // Who may manage WPMCP (issue #479): every screen, admin-post and
             // AJAX handler, admin REST route and options.php group checks
             // Management_Access::CAPABILITY. Handlers are registered through
             // Management_Access::add_handler(), which refuses before they run.
             Management_Access::register();
             add_action('admin_menu', [$this, 'register_admin_menu']);
             Management_Access::add_handler('wp_ajax_wpmcp_restore', [new Restore_Controller(), 'handle']);
+            // The Audit Log's Undo session button (issue #1150).
+            Management_Access::add_handler('wp_ajax_' . Restore_Controller::SESSION_ACTION, [new Restore_Controller(), 'handle_session']);
             // Redacted CSV export of the filtered request log (issue #303).
             Management_Access::add_handler('admin_post_' . Audit_Log_Page::EXPORT_ACTION, [new Audit_Log_Page(), 'export_requests']);
             // Integrations that derive state from options rebuild it after a
             // rollback puts those options back. Wired only for the classes
             // this build ships; see register_rollback_refreshers().
             self::register_rollback_refreshers();
+            // The generic redirect tools route to the active redirect plugin
+            // (issue #930); the providers live with the integrations, which
+            // the WooCommerce build prunes.
+            if (class_exists(\WPMCP\Integrations\Redirect_Providers::class)) {
+                add_filter('wpmcp_redirect_providers', [\WPMCP\Integrations\Redirect_Providers::class, 'register']);
+            }
             // A shipping zone deleted through WooCommerce drops the creation
             // marker a woo-write create gave it, so a zone that later reuses
             // the id is never mistaken for the created one (issue #338).
@@ -533,6 +613,7 @@ final class Plugin
             add_action(Run_Backup_Job::HOOK, [new Run_Backup_Job(), 'handle_scheduled']);
             // Recurring backups (issue #455): each run queues the job above.
             add_action(Backup_Schedule::HOOK, [Backup_Schedule::class, 'run']);
+            $this->edition()->run('boot_cli_job', $this->edition_context(null));
             // Front-end maintenance-mode enforcement. template_redirect runs after
             // WordPress has resolved the query but before a template is loaded, and
             // does not fire for wp-admin or REST requests, so authenticated capable
@@ -598,7 +679,7 @@ final class Plugin
             // flavor, so this is unconditional.
             \WPMCP\Gateway\Gateway_Guard::register();
             // The hardening settings set-hardening switches on (issue #847):
-            // WP MCP's own hooks, each a no-op until its setting is on.
+            // WPMCP's own hooks, each a no-op until its setting is on.
             // src/Tools/Security ships on every flavor.
             \WPMCP\Tools\Security\Hardening_Settings::register();
             // OAuth access levels (issue #454): a connection approved as
@@ -650,9 +731,9 @@ final class Plugin
             // ability denies on the next request) and surfaces its state in
             // the admin bar for manage_options users.
             Exposure::register();
-            // Secret-free Claude Desktop bundle download from the Connection
-            // screen (nonce + management capability enforced inside the handler).
-            Management_Access::add_handler('admin_post_wpmcp_download_bundle', [new Connection_Page(), 'download_bundle']);
+            // The Connection screen's handlers: the secret-free desktop bundle,
+            // its create and check AJAX actions, and its assets (guarded).
+            (new Connection_Page())->register_handlers();
             // Snapshot retention (issue #158): an install that arrives with
             // a deeper history than the flat cap keeps it until the owner
             // decides, and this is the notice that asks.
@@ -740,19 +821,20 @@ final class Plugin
     }
 
     /**
-     * The sidebar icon for the top-level menu (issue #879): the brand mark's
-     * circular undo arrow, drawn as one-colour filled shapes. WordPress's
-     * svg-painter recolours only base64 SVG data URIs (it rewrites fill
-     * attributes, not strokes), so the URI is base64. It is a precomputed
-     * literal of this exact SVG (AdminMenuIconTest decodes and checks it):
+     * The sidebar icon for the top-level menu (issue #879): the WPMCP
+     * logomark (undo arrow around "wp_") in one fill colour, since WordPress's
+     * svg-painter recolours only fill attributes of base64 SVG data URIs, so
+     * the kit's stroked arc is a filled half annulus, thick enough for 20x20.
+     * Precomputed literal (AdminMenuIconTest decodes and checks it) of:
      *
-     * <svg xmlns="http://www.w3.org/2000/svg" viewBox="48 44 160 160">
-     * <path fill="black" d="M155.3 60.3A73 73 0 1 1 100.7 60.3L108.9 80.7
-     * A51 51 0 1 0 147.1 80.7A11 11 0 0 1 155.3 60.3Z"/>
-     * <path fill="black" d="M74 70.5L112 47V94Z"/></svg>
+     * <svg xmlns="http://www.w3.org/2000/svg" viewBox="233 231 542 542">
+     * <path fill="black" d="M512.9 757.7A246 246 0 0 1 487.1 266.3L489 302.3
+     * A210 210 0 0 0 511 721.7Z"/><path fill="black" d="M480 246L570 298
+     * L480 350Z"/><path fill="black" d="M401.5 588H436.5 ... (wp glyph)"/>
+     * <path fill="black" d="M678 602H752V636H678Z"/></svg>
      */
     private const MENU_ICON = 'data:image/svg+xml;base64,'
-        . 'PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjQ4IDQ0IDE2MCAxNjAiPjxwYXRoIGZpbGw9ImJsYWNrIiBkPSJNMTU1LjMgNjAuM0E3MyA3MyAwIDEgMSAxMDAuNyA2MC4zTDEwOC45IDgwLjdBNTEgNTEgMCAxIDAgMTQ3LjEgODAuN0ExMSAxMSAwIDAgMSAxNTUuMyA2MC4zWiIvPjxwYXRoIGZpbGw9ImJsYWNrIiBkPSJNNzQgNzAuNUwxMTIgNDdWOTRaIi8+PC9zdmc+';
+        . 'PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjIzMyAyMzEgNTQyIDU0MiI+PHBhdGggZmlsbD0iYmxhY2siIGQ9Ik01MTIuOSA3NTcuN0EyNDYgMjQ2IDAgMCAxIDQ4Ny4xIDI2Ni4zTDQ4OSAzMDIuM0EyMTAgMjEwIDAgMCAwIDUxMSA3MjEuN1oiLz48cGF0aCBmaWxsPSJibGFjayIgZD0iTTQ4MCAyNDZMNTcwIDI5OEw0ODAgMzUwWiIvPjxwYXRoIGZpbGw9ImJsYWNrIiBkPSJNNDAxLjUgNTg4SDQzNi41TDQ1MC43IDUyOS4xQzQ1My44IDUxNi4yIDQ1Ni44IDQ5OC43IDQ1OS44IDQ4Mi42QzQ2Mi44IDQ5OC42IDQ2NS44IDUxNi4xIDQ2OSA1MjkuMUw0ODMuMiA1ODhINTE4LjNMNTU2LjQgNDM1LjFINTE5LjdMNTA4LjYgNDkxLjZDNTA1LjMgNTA5IDUwMS43IDUyOC4zIDQ5OC40IDU1MC44QzQ5NC43IDUyOC4xIDQ5MC42IDUwOC44IDQ4Ny40IDQ5MS42TDQ3NS45IDQzNS4xSDQ0NC4yTDQzMi41IDQ5MS42QzQyOSA1MDkgNDI0LjkgNTI4LjQgNDIxLjMgNTUwLjdDNDE3LjkgNTI4IDQxNCA1MDguNyA0MTAuOSA0OTEuNkwzOTkuNyA0MzUuMUgzNjMuNlpNNTcwLjYgNjQ1LjFINjA1LjFWNTYzLjVINjA2LjFDNjExIDU3NS44IDYyMS41IDU5MC42IDY0Mi41IDU5MC42QzY3Mi4yIDU5MC42IDY5NC44IDU2Mi43IDY5NC44IDUxMS44QzY5NC44IDQ1OS42IDY3MS4yIDQzMy4yIDY0Mi44IDQzMy4yQzYyMC45IDQzMy4yIDYxMC44IDQ0OC43IDYwNi4xIDQ2MC45SDYwNC41VjQzNS4xSDU3MC42Wk02MzIgNTU3LjZDNjE0LjQgNTU3LjYgNjA0LjMgNTM5LjMgNjA0LjMgNTExLjdDNjA0LjMgNDg0IDYxNC4zIDQ2NiA2MzIgNDY2QzY1MCA0NjYgNjU5LjUgNDg0LjkgNjU5LjUgNTExLjdDNjU5LjUgNTM4LjYgNjQ5LjkgNTU3LjYgNjMyIDU1Ny42WiIvPjxwYXRoIGZpbGw9ImJsYWNrIiBkPSJNNjc4IDYwMkg3NTJWNjM2SDY3OFoiLz48L3N2Zz4=';
 
     /**
      * Top-level menu slot (issue #1026). Without one, WordPress appends the
@@ -894,6 +976,8 @@ final class Plugin
                 [new \WPMCP\Admin\Opt_In_Settings_Page(), 'render']
             );
         }
+
+        $this->edition()->run('admin_menu_chat', $this->edition_context(null));
 
         // Agent memory (issue #131). The target is the wpmcp_memory CPT list
         // table, not a bespoke screen: approving a proposal is WordPress's own
@@ -1415,6 +1499,7 @@ final class Plugin
                     'post_id'     => [ 'type' => 'integer' ],
                     'description' => [ 'type' => 'string' ],
                     'alt'         => [ 'type' => 'string' ],
+                    'session_id'  => [ 'type' => 'string' ], // central-list-ok: #1255 the handler records it
                 ],
             ],
             [$sideload_image, 'handle'],
@@ -1454,7 +1539,6 @@ final class Plugin
         $set_stock_key       = new Set_Stock_Key();
         $search_stock_images = new Search_Stock_Images();
         $import_stock_image  = new Import_Stock_Image();
-
         $registrar->register(new Ability(
             'wpmcp/list-media',
             'free',
@@ -1514,6 +1598,7 @@ final class Plugin
             'media',
             'update'
         ));
+        $this->edition()->run('abilities.media.optimize', $this->edition_context($registrar));
         $registrar->register(new Ability(
             'wpmcp/upload-svg',
             'free',
@@ -1595,6 +1680,7 @@ final class Plugin
             'media',
             'create'
         ));
+        $this->edition()->run('abilities.media.stock', $this->edition_context($registrar));
 
         $get_settings    = new Get_Settings();
         $update_settings = new Update_Settings();
@@ -1623,6 +1709,7 @@ final class Plugin
                 'type'       => 'object',
                 'properties' => [
                     'settings' => [ 'type' => 'object' ],
+                    'session_id' => [ 'type' => 'string' ], // central-list-ok: #1255 the handler records it
                 ],
                 'required'   => [ 'settings' ],
             ],
@@ -1936,6 +2023,7 @@ final class Plugin
                     'slug'         => [ 'type' => 'string' ],
                     'activate'     => [ 'type' => 'boolean' ],
                     'network_wide' => [ 'type' => 'boolean' ],
+                    'session_id'   => [ 'type' => 'string' ], // central-list-ok: #1255 the handler records it
                 ],
                 'required'   => [ 'slug' ],
             ],
@@ -2021,6 +2109,7 @@ final class Plugin
                 'properties' => [
                     'slug'     => [ 'type' => 'string' ],
                     'activate' => [ 'type' => 'boolean' ],
+                    'session_id' => [ 'type' => 'string' ], // central-list-ok: #1255 the handler records it
                 ],
                 'required'   => [ 'slug' ],
             ],
@@ -2069,20 +2158,20 @@ final class Plugin
         $registrar->register(new Ability(
             'wpmcp/manage-updates',
             'free',
-            'Update WordPress core or set plugin/theme auto-updates. type=core applies the offered core update (or pending DB upgrade); needs confirm:true and a full backup (trigger-backup type=full) under 1h old; refuses if expected_version differs from the offer. A core update cannot be snapshot-rolled-back; restore that backup to revert. type=plugin|theme + item + enabled sets auto-update (undoable)',
+            'Update WordPress core or set plugin/theme auto-updates. type=core applies the offered core update (or pending DB upgrade); needs confirm:true and a full backup (trigger-backup type=full) under 1h old; refuses if expected_version differs from the offer. A core update cannot be snapshot-rolled-back; restore that backup to revert. type=plugin|theme + item + enabled sets auto-update (undoable). type=plugins|themes: action=plan lists pending updates; run (opt-in wpmcp_enable_safe_updates, confirm:true) snapshots each, updates, checks the site and auto-restores a broken one; status (run_id); restore (run_id, items)',
             [
                 'type'       => 'object',
                 'properties' => [
                     'type'             => [
                         'type' => 'string',
-                        'enum' => ['core', 'plugin', 'theme'],
+                        'enum' => ['core', 'plugin', 'theme', 'plugins', 'themes'],
                     ],
                     'item'             => [ 'type' => 'string' ],
                     'enabled'          => [ 'type' => 'boolean' ],
                     'expected_version' => [ 'type' => 'string' ],
                     'confirm'          => [ 'type' => 'boolean' ],
                     'session_id'       => [ 'type' => 'string' ],
-                ],
+                ] + Safe_Package_Update::input_properties(),
                 'required'   => [ 'type' ],
             ],
             [$manage_updates, 'handle'],
@@ -2155,6 +2244,7 @@ final class Plugin
             'read'
         ));
 
+        $this->edition()->run('abilities.packages.zip_install', $this->edition_context($registrar));
 
         $list_tables    = new List_Tables();
         $describe_table = new Describe_Table();
@@ -2232,6 +2322,8 @@ final class Plugin
                     'max_files'       => [ 'type' => 'integer' ],
                     'max_seconds'     => [ 'type' => 'integer' ],
                     'vulnerabilities' => [ 'type' => 'boolean' ],
+                    // Issue #1151: scan_meta.compromise.next_cursor of a truncated compromise scan.
+                    'cursor'          => [ 'type' => 'string' ],
                 ],
             ],
             [$scan_security, 'handle'],
@@ -2307,6 +2399,7 @@ final class Plugin
             'woocommerce'    => fn () => $this->register_woocommerce_abilities($registrar),
             'menu'           => fn () => $this->register_menu_abilities($registrar),
             'elementor'      => fn () => $this->register_elementor_abilities($registrar),
+            'builder'        => fn () => $this->edition()->run('abilities.builder', $this->edition_context($registrar)),
             'acf'            => fn () => $this->register_acf_abilities($registrar),
             'seo'            => fn () => $this->register_seo_abilities($registrar),
             'i18n'           => fn () => $this->register_i18n_abilities($registrar),
@@ -2324,6 +2417,10 @@ final class Plugin
             'export'         => fn () => $this->register_export_abilities($registrar),
             'backup'         => fn () => $this->register_backup_abilities($registrar),
             'sync'           => fn () => $this->register_sync_abilities($registrar),
+            'analysis'       => fn () => $this->edition()->run('abilities.analysis', $this->edition_context($registrar)),
+            'cli'            => fn () => $this->edition()->run('abilities.cli', $this->edition_context($registrar)),
+            'php_exec'       => fn () => $this->edition()->run('abilities.php_exec', $this->edition_context($registrar)),
+            'custom_code'    => fn () => $this->edition()->run('abilities.custom_code', $this->edition_context($registrar)),
             'connect'        => fn () => $this->register_connect_abilities($registrar),
             'governance'     => fn () => $this->register_governance_abilities($registrar),
             'multisite'      => fn () => $this->register_multisite_abilities($registrar),
@@ -2331,10 +2428,14 @@ final class Plugin
             'dispatch'       => fn () => $this->register_dispatch_abilities($registrar),
             'bridge'         => fn () => $this->register_bridge_abilities($registrar),
             'integration'    => fn () => $this->register_integration_abilities($registrar),
+            'widget_builder' => fn () => $this->edition()->run('abilities.widget_builder', $this->edition_context($registrar)),
+            'block_builder'  => fn () => $this->edition()->run('abilities.block_builder', $this->edition_context($registrar)),
             'theme_builder'  => fn () => $this->register_theme_builder_abilities($registrar),
+            'cloud'          => fn () => $this->edition()->run('abilities.cloud', $this->edition_context($registrar)),
             'gateway'        => fn () => $this->register_gateway_abilities($registrar),
             'search'         => fn () => $this->register_search_abilities($registrar),
             'skills'         => fn () => $this->register_skills_abilities($registrar),
+            'memory'         => fn () => $this->edition()->run('abilities.memory', $this->edition_context($registrar)),
         ];
         foreach ($groups as $group => $register) {
             if ($this->group_enabled($group)) {
@@ -2421,7 +2522,7 @@ final class Plugin
     {
         $confirm_schema = [
             'type'       => 'object',
-            'properties' => ['confirm' => ['type' => 'boolean']],
+            'properties' => ['confirm' => ['type' => 'boolean'], 'session_id' => ['type' => 'string']],
             'required'   => ['confirm'],
         ];
 
@@ -2635,6 +2736,7 @@ final class Plugin
                     'conditions' => $conditions_schema,
                     // Tie-break between equally specific matches; higher wins.
                     'priority'   => ['type' => 'integer'],
+                    'session_id' => ['type' => 'string'], // central-list-ok: #1255 the handler records it
                 ],
                 'required'   => ['part_type', 'title', 'conditions'],
             ],
@@ -2682,6 +2784,7 @@ final class Plugin
                     'content'     => ['type' => 'string'],
                     'conditions'  => $conditions_schema,
                     'priority'    => ['type' => 'integer'],
+                    'session_id'  => ['type' => 'string'], // central-list-ok: #1255 the handler records it
                 ],
                 'required'   => ['template_id'],
             ],
@@ -2699,6 +2802,7 @@ final class Plugin
                 'properties' => [
                     'template_id' => $template_id,
                     'status'      => ['type' => 'string', 'enum' => ['publish', 'draft']],
+                    'session_id'  => ['type' => 'string'], // central-list-ok: #1255 the handler records it
                 ],
                 'required'   => ['template_id', 'status'],
             ],
@@ -2713,7 +2817,7 @@ final class Plugin
             'Trash a site part. Snapshot-first: operation_id rolls it back',
             [
                 'type'       => 'object',
-                'properties' => ['template_id' => $template_id],
+                'properties' => ['template_id' => $template_id, 'session_id' => ['type' => 'string']],
                 'required'   => ['template_id'],
             ],
             [$delete, 'handle'],
@@ -2753,6 +2857,8 @@ final class Plugin
             new \WPMCP\Integrations\MetForm_Integration(),
             new \WPMCP\Integrations\Theme_Integration(),
         ]);
+        $this->edition()->run('abilities.forms_pack', $this->edition_context($registrar));
+        $this->edition()->run('abilities.block_suite', $this->edition_context($registrar));
     }
 
     /**
@@ -2909,7 +3015,7 @@ final class Plugin
         $registrar->register(new Ability(
             'wpmcp/get-maintenance-status',
             'free',
-            'Whether the site is gated: WP MCP maintenance mode (message, Retry-After), core .maintenance, coming soon and maintenance plugins',
+            'Whether the site is gated: WPMCP maintenance mode (message, Retry-After), core .maintenance, coming soon and maintenance plugins',
             [
                 'type'       => 'object',
                 'properties' => [],
@@ -3815,6 +3921,7 @@ final class Plugin
                     'confirm' => [ 'type' => 'boolean' ],
                     'mirror'  => [ 'type' => 'boolean' ],
                     'post_id' => [ 'type' => 'integer' ],
+                    'session_id' => [ 'type' => 'string' ], // central-list-ok: #1255 the handler records it
                 ],
             ],
             [$import_content, 'handle'],
@@ -4092,6 +4199,7 @@ final class Plugin
                     'operation' => [ 'type' => 'object' ],
                     'site_wide' => [ 'type' => 'string', 'enum' => [ 'off', 'audit', 'enforce' ] ],
                     'auto_enable_new_tools' => [ 'type' => 'boolean' ],
+                    'session_id'            => [ 'type' => 'string' ], // central-list-ok: #1255 the handler records it
                 ],
             ],
             [$update_governance_settings, 'handle'],
@@ -4304,8 +4412,11 @@ final class Plugin
      * third-party plugin/service" tool group in this codebase: Multisite
      * introspection, I18n (Polylang/WPML), SEO status/meta, and ALL of
      * WooCommerce including get-sales-report (a reporting tool directly
-     * analogous to analytics summaries) are free, as is everything else in
-     * this build. Analytics summary/top-pages/GSC-summary/GSC-queries are the
+     * analogous to analytics summaries) are all free-tier. 'pro' tier here is
+     * reserved for a different kind of feature: deep content scoring/analysis
+     * (analyze-seo, analyze-accessibility, check-contrast, extract-content,
+     * see the abilities.analysis edition slot) and deep Elementor element-tree
+     * editing. Analytics summary/top-pages/GSC-summary/GSC-queries are the
      * same shape as WooCommerce's sales report or Multisite's site listing:
      * basic read/reporting access to a connected system, not deep analysis.
      *
@@ -4474,12 +4585,16 @@ final class Plugin
         $registrar->register(new Ability(
             'wpmcp/get-debug-log',
             'free',
-            'Bounded tail (max 200 lines / 64KB) of the debug log, by default WP_CONTENT_DIR/debug.log or the WP_DEBUG_LOG path. A path argument is confined to WP_CONTENT_DIR',
+            'Bounded tail (max 200 lines / 64KB) of the debug log, by default WP_CONTENT_DIR/debug.log or the WP_DEBUG_LOG path. A path argument is confined to WP_CONTENT_DIR. source:access searches the access log, newest first (opt-in, IPs masked): filter {ip,path,status,method,agent,since,until,around_file,window minutes}, lines max 200, cursor; summary:true: top IPs, paths, wp-content PHP POSTs',
             [
                 'type'       => 'object',
                 'properties' => [
-                    'path'  => [ 'type' => 'string' ],
-                    'lines' => [ 'type' => 'integer' ],
+                    'path'    => [ 'type' => 'string' ],
+                    'lines'   => [ 'type' => 'integer' ],
+                    'source'  => [ 'type' => 'string', 'enum' => [ 'debug', 'access' ] ],
+                    'filter'  => [ 'type' => 'object' ],
+                    'summary' => [ 'type' => 'boolean' ],
+                    'cursor'  => [ 'type' => 'string' ],
                 ],
             ],
             [$get_debug_log, 'handle'],
@@ -4518,6 +4633,7 @@ final class Plugin
                     'dry_run' => [ 'type' => 'boolean' ],
                     'confirm' => [ 'type' => 'boolean' ],
                     'cursor'  => [ 'type' => 'string' ],
+                    'session_id' => [ 'type' => 'string' ], // central-list-ok: #1255 the handler records it
                 ],
             ],
             [$delete_transient, 'handle'],
@@ -4735,6 +4851,7 @@ final class Plugin
             'update'
         ));
 
+        $this->edition()->run('abilities.elementor_pro', $this->edition_context($registrar));
     }
 
     /**
@@ -4838,6 +4955,7 @@ final class Plugin
                     'status'            => [ 'type' => 'string' ],
                     'manage_stock'      => [ 'type' => 'boolean' ],
                     'stock_quantity'    => [ 'type' => 'integer' ],
+                    'session_id'        => [ 'type' => 'string' ], // central-list-ok: #1255 the handler records it
                 ],
                 'required'   => [ 'name' ],
             ],
@@ -5069,6 +5187,7 @@ final class Plugin
                     'manage_stock' => [ 'type' => 'boolean' ],
                     'stock_quantity' => [ 'type' => 'integer' ],
                     'stock_status' => [ 'type' => 'string' ],
+                    'session_id'   => [ 'type' => 'string' ], // central-list-ok: #1255 the handler records it
                 ],
                 'required'   => [ 'product_id' ],
             ],
@@ -5180,6 +5299,7 @@ final class Plugin
                     'excluded_product_categories' => [ 'type' => 'array', 'items' => [ 'type' => 'integer' ] ],
                     'email_restrictions' => [ 'type' => 'array', 'items' => [ 'type' => 'string' ] ],
                     'status' => [ 'type' => 'string' ],
+                    'session_id' => [ 'type' => 'string' ], // central-list-ok: #1255 the handler records it
                 ],
                 'required'   => [ 'code' ],
             ],
@@ -5297,6 +5417,7 @@ final class Plugin
                     'shipping' => [ 'type' => 'boolean' ],
                     'order' => [ 'type' => 'integer' ],
                     'class' => [ 'type' => 'string' ],
+                    'session_id' => [ 'type' => 'string' ], // central-list-ok: #1255 the handler records it
                 ],
                 'required'   => [ 'rate' ],
             ],
@@ -5379,6 +5500,7 @@ final class Plugin
                     'mode' => [ 'type' => 'string', 'enum' => [ 'upsert', 'create', 'update' ] ],
                     'plan_hash' => [ 'type' => 'string' ],
                     'confirm' => [ 'type' => 'boolean' ],
+                    'session_id' => [ 'type' => 'string' ], // central-list-ok: #1255 the handler records it
                 ],
                 'required'   => [ 'rows', 'plan_hash' ],
             ],
@@ -5403,6 +5525,9 @@ final class Plugin
         // The handlers are constructed inline so the directory build's strip,
         // which deletes these registrations whole, leaves the catalog classes
         // unreferenced and sweeps them out of that zip.
+        $this->edition()->run('abilities.woocommerce.catalog_ops', $this->edition_context($registrar));
+        $this->edition()->run('abilities.woocommerce.catalog_read', $this->edition_context($registrar));
+        $this->edition()->run('abilities.woocommerce.catalog_write', $this->edition_context($registrar));
     }
 
     /**
@@ -5803,6 +5928,7 @@ final class Plugin
             'update'
         ));
 
+        $this->edition()->run('abilities.seo_pro', $this->edition_context($registrar));
 
         if ('' === SEO_Adapter::active_plugin()) {
             return;
@@ -6040,14 +6166,15 @@ final class Plugin
         $registrar->register(new Ability(
             'wpmcp/list-redirects',
             'free',
-            'List this site\'s managed redirects (source path, resolved target, status code, enabled, hit count), plus pending suggestions raised when a published post was deleted or moved. Filter by enabled state or a search string. Read-only',
+            'List this site\'s redirects (the active redirect plugin\'s, else WPMCP\'s own: source path, resolved target, status code, enabled, hit count), plus pending suggestions raised when a published post was deleted or moved. Filter by enabled state or a search string. Read-only',
             [
                 'type'       => 'object',
                 'properties' => [
-                    'enabled' => [ 'type' => 'boolean' ],
-                    'search'  => [ 'type' => 'string' ],
-                    'limit'   => [ 'type' => 'integer' ],
-                    'offset'  => [ 'type' => 'integer' ],
+                    'enabled'  => [ 'type' => 'boolean' ],
+                    'search'   => [ 'type' => 'string' ],
+                    'limit'    => [ 'type' => 'integer' ],
+                    'offset'   => [ 'type' => 'integer' ],
+                    'provider' => [ 'type' => 'string', 'description' => Redirect_Router::PROVIDER_HINT ],
                 ],
             ],
             [new List_Redirects(), 'handle'],
@@ -6059,7 +6186,7 @@ final class Plugin
         $registrar->register(new Ability(
             'wpmcp/create-redirect',
             'free',
-            'Create a managed redirect from a source path to a target URL or target_post_id (which survives slug changes). Chains are flattened to one hop and loops refused; the stored target is reported. Snapshotted; rollback-operation removes it',
+            'Create a redirect (in the active redirect plugin, else WPMCP\'s own table) from a source path to a target URL or target_post_id (which survives slug changes). Chains are flattened to one hop and loops refused; the stored target is reported. Snapshotted; rollback-operation removes it',
             [
                 'type'       => 'object',
                 'properties' => [
@@ -6069,6 +6196,7 @@ final class Plugin
                     'status_code'    => [ 'type' => 'integer', 'enum' => Redirect_Store::ALLOWED_STATUS_CODES ],
                     'enabled'        => [ 'type' => 'boolean' ],
                     'notes'          => [ 'type' => 'string' ],
+                    'provider'       => [ 'type' => 'string', 'description' => Redirect_Router::PROVIDER_HINT ],
                     'session_id'     => [ 'type' => 'string' ],
                 ],
                 'required'   => [ 'source' ],
@@ -6082,7 +6210,7 @@ final class Plugin
         $registrar->register(new Ability(
             'wpmcp/update-redirect',
             'free',
-            'Change one managed redirect: its source, target/target_post_id, status code, enabled state or notes. Only the fields you pass change. Retargeting re-runs chain flattening and loop detection. Snapshotted and reversible',
+            'Change one redirect: its source, target/target_post_id, status code, enabled state or notes. Only the fields you pass change. Retargeting re-runs chain flattening and loop detection. Snapshotted and reversible',
             [
                 'type'       => 'object',
                 'properties' => [
@@ -6093,6 +6221,7 @@ final class Plugin
                     'status_code'    => [ 'type' => 'integer', 'enum' => Redirect_Store::ALLOWED_STATUS_CODES ],
                     'enabled'        => [ 'type' => 'boolean' ],
                     'notes'          => [ 'type' => 'string' ],
+                    'provider'       => [ 'type' => 'string', 'description' => Redirect_Router::PROVIDER_HINT ],
                     'session_id'     => [ 'type' => 'string' ],
                 ],
                 'required'   => [ 'redirect_id' ],
@@ -6106,11 +6235,13 @@ final class Plugin
         $registrar->register(new Ability(
             'wpmcp/delete-redirect',
             'free',
-            'Delete one managed redirect. The whole row is snapshotted first, so rollback-operation brings the same redirect back; use update-redirect with enabled:false instead to stop it firing while keeping its hit history',
+            'Delete one redirect. The whole row is snapshotted first, so rollback-operation brings the same redirect back; use update-redirect with enabled:false instead to stop it firing while keeping its hit history',
             [
                 'type'       => 'object',
                 'properties' => [
                     'redirect_id' => [ 'type' => 'integer' ],
+                    'provider'    => [ 'type' => 'string', 'description' => Redirect_Router::PROVIDER_HINT ],
+                    'confirm'     => [ 'type' => 'boolean' ],
                     'session_id'  => [ 'type' => 'string' ],
                 ],
                 'required'   => [ 'redirect_id' ],
@@ -6162,7 +6293,7 @@ final class Plugin
         $registrar->register(new Ability(
             'wpmcp/get-connection-info',
             'free',
-            'How to connect an MCP client here: the MCP endpoint URL and ready-to-paste snippets for Claude Code, Cursor and Claude Desktop, each using an Application Password placeholder. Never returns a real credential. Read-only',
+            'How to connect an MCP client here: the MCP endpoint URL, ready-to-paste snippets for Claude Code, Cursor, Claude Desktop and Antigravity with an Application Password placeholder, and the ChatGPT and Claude connector steps. Never returns a real credential. Read-only',
             [
                 'type'       => 'object',
                 'properties' => [],
@@ -6221,13 +6352,14 @@ final class Plugin
         $registrar->register(new Ability(
             'wpmcp/list-tools',
             'free',
-            'List every tool: name, summary, domain, operation, tier. Filters: domain, search (as list-tool-catalog). full:true adds descriptions and MCP annotations; schemas: get-tool-schema. Read-only. Compact mode: finds unlisted tools',
+            'List tools: name, summary, domain, operation, tier. Filters: domain, search. full:true adds descriptions, annotations; include_unavailable:true, what cannot run and why. Schemas: get-tool-schema. Read-only',
             [
                 'type'       => 'object',
                 'properties' => [
                     'domain' => [ 'type' => 'string' ],
                     'full'   => [ 'type' => 'boolean' ],
                     'search' => [ 'type' => 'string' ],
+                    'include_unavailable' => [ 'type' => 'boolean' ],
                 ],
             ],
             [$list_tools, 'handle'],
@@ -6238,7 +6370,7 @@ final class Plugin
         $registrar->register(new Ability(
             'wpmcp/get-tool-schema',
             'free',
-            'Read one wpmcp tool\'s full contract by name: exact input schema, complete description, MCP annotations and domain/operation/tier. Read-only; list-tools finds names',
+            'One tool\'s contract by name: input schema, description, annotations, domain/operation/tier, availability. Read-only; list-tools finds names',
             [
                 'type'       => 'object',
                 'properties' => [
@@ -6347,5 +6479,13 @@ final class Plugin
             true,
             false
         ));
+    }
+
+    private ?\WPMCP\Kernel\Kernel_Boot $kernel = null;
+
+    /** The kernel boot (D11): the compiled module registry and what modules contribute. */
+    public function kernel(): \WPMCP\Kernel\Kernel_Boot // central-list-ok: D11 kernel boot, one accessor
+    {
+        return $this->kernel ??= new \WPMCP\Kernel\Kernel_Boot(); // central-list-ok: D11 kernel boot
     }
 }
