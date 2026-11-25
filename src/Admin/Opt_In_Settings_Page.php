@@ -80,6 +80,9 @@ class Opt_In_Settings_Page
         if (! isset(Opt_In_Settings::groups()[ $filter ])) {
             return [ 'error' => __('Unknown opt-in group.', 'safe-mcp-for-woocommerce') ];
         }
+        if (! $network && Opt_In_Settings::network_only($filter)) {
+            return [ 'error' => __('On a network this is decided for every site at once: a network administrator switches it on the network screen (Network Settings, WPMCP opt-in operations).', 'safe-mcp-for-woocommerce') ];
+        }
         if (Opt_In_Settings::set_in_code($filter)) {
             return [
                 'error' => sprintf(
@@ -106,13 +109,14 @@ class Opt_In_Settings_Page
     /**
      * The screen model: filter => row.
      *
-     * @return array<string, array{filter: string, label: string, destructive: bool, warning: string, set_in_code: bool, on: bool, on_network: bool}>
+     * @return array<string, array{filter: string, label: string, destructive: bool, warning: string, set_in_code: bool, on: bool, on_network: bool, network_only: bool}>
      */
     public function rows(string $scope = 'site'): array
     {
         $labels = Opt_In_Settings::labels();
         $rows   = [];
         foreach (Opt_In_Settings::groups() as $filter => $group) {
+            $network_only    = 'network' !== $scope && Opt_In_Settings::network_only($filter);
             $rows[ $filter ] = [
                 'filter'      => $filter,
                 'label'       => $labels[ $filter ] ?? $filter,
@@ -121,8 +125,10 @@ class Opt_In_Settings_Page
                     ? __('Includes operations that delete data or that undo cannot fully reverse (mail sent, external calls).', 'safe-mcp-for-woocommerce')
                     : '',
                 'set_in_code' => Opt_In_Settings::set_in_code($filter),
-                'on'          => Opt_In_Settings::stored_on($filter, 'network' === $scope ? 'network' : 'site'),
+                'on'          => ! $network_only && Opt_In_Settings::stored_on($filter, 'network' === $scope ? 'network' : 'site'),
                 'on_network'  => is_multisite() && Opt_In_Settings::stored_on($filter, 'network'),
+                // Switched only on the network screen (Opt_In_Settings::NETWORK_ONLY_GROUPS).
+                'network_only' => $network_only,
             ];
         }
         return $rows;
@@ -212,6 +218,11 @@ class Opt_In_Settings_Page
                                     <button type="button" class="button button-small" disabled
                                         title="<?php echo esc_attr__('Set in code: remove the filter to manage it here.', 'safe-mcp-for-woocommerce'); ?>">
                                         <?php echo esc_html__('Set in code', 'safe-mcp-for-woocommerce'); ?>
+                                    </button>
+                                <?php elseif ($row['network_only']) : ?>
+                                    <button type="button" class="button button-small" disabled
+                                        title="<?php echo esc_attr__('Decided for the whole network on the network screen.', 'safe-mcp-for-woocommerce'); ?>">
+                                        <?php echo esc_html__('Network setting', 'safe-mcp-for-woocommerce'); ?>
                                     </button>
                                 <?php elseif ($row['on']) : ?>
                                     <button type="submit" name="enabled" value="0" class="button button-small">

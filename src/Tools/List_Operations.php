@@ -70,7 +70,10 @@ class List_Operations
                 'created_at'         => $r['created_at'],
                 'user_id'            => (int) $r['user_id'],
                 'domain'             => $domain,
-                'rollback_available' => null === $rolled_back_at && in_array($r['object_type'], $restorable, true),
+                // Offered only where the caller may undo it by operation
+                // ownership: on a network a site admin sees a super admin's
+                // rows but may not undo them.
+                'rollback_available' => null === $rolled_back_at && in_array($r['object_type'], $restorable, true) && Rollback_Service::may_undo_operation_of(is_numeric($r['user_id'] ?? null) ? (int) $r['user_id'] : 0),
                 'rolled_back_at'     => $rolled_back_at,
             ];
         }, $rows);

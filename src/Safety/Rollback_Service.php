@@ -60,6 +60,126 @@ class Rollback_Service
      */
     private static array $trashed = [];
 
+    /** Refusal code: the operation was made by someone the caller may not undo for. */
+    public const REFUSED_NOT_OWNER = 'rollback_not_owner';
+
+    /** Refusal code: undoing the operation takes a capability the caller lacks. */
+    public const REFUSED_CAPABILITY = 'rollback_capability_required';
+
+    /**
+     * Why the most recent restore_operation() refused to act for the
+     * current user, as the WP_Error the
+     * rollback tools return, or null. Static like $warnings, so the bool
+     * contract internal callers rely on stays as it is.
+     */
+    private static ?\WP_Error $refusal = null;
+
+    /** Return and clear the authorization refusal of the most recent restore_operation(). */
+    public static function take_refusal(): ?\WP_Error
+    {
+        $refusal       = self::$refusal;
+        self::$refusal = null;
+        return $refusal;
+    }
+
+    /**
+     * Record an authorization refusal: a warning, and the WP_Error the tools return.
+     *
+     * @param array<string, mixed> $data
+     */
+    private static function refuse(string $code, string $message, array $data = []): void
+    {
+        self::warn($message);
+        self::$refusal = new \WP_Error($code, $message, [ 'status' => 403 ] + $data);
+    }
+
+    /** A string read of a loosely typed snapshot or ledger value: '' for anything else. */
+    private static function str_of(mixed $value): string
+    {
+        return is_string($value) || is_int($value) || is_float($value) ? (string) $value : '';
+    }
+
+    /** An int read of a loosely typed snapshot or ledger value: 0 for anything else. */
+    private static function int_of(mixed $value): int
+    {
+        return is_int($value) ? $value : (is_numeric($value) ? (int) $value : 0);
+    }
+
+    /**
+     * An array read of a loosely typed snapshot value: [] for anything else.
+     *
+     * @return array<array-key, mixed>
+     */
+    private static function map_of(mixed $value): array
+    {
+        return is_array($value) ? $value : [];
+    }
+
+    /**
+     * Whether the current user may undo, by ownership alone, an operation
+     * that $author made. Everyone may undo their own. Below manage_options
+     * nobody may undo anyone else's: the rollback tools sit at edit_posts,
+     * so operation ownership is what keeps one user's undo to their own
+     * changes. On a network, an operation a super
+     * admin made, or one made with no user (cron, WP-CLI without --user),
+     * is undone by someone else only by a super admin, since a site
+     * admin holds manage_options too. Code running with no user is not
+     * acting for anyone (refused_post()) and is not refused.
+     */
+    public static function may_undo_operation_of(int $author): bool
+    {
+        $user = get_current_user_id();
+        if (0 === $user || $author === $user) {
+            return true;
+        }
+        if (! current_user_can('manage_options')) {
+            return false;
+        }
+        if (! is_multisite() || is_super_admin()) {
+            return true;
+        }
+        return $author > 0 && ! is_super_admin($author);
+    }
+
+    /** Why the current user may not undo an operation $author made, or null (may_undo_operation_of()). */
+    private static function owner_refusal(int $author): ?string
+    {
+        if (self::may_undo_operation_of($author)) {
+            return null;
+        }
+        if (is_multisite() && current_user_can('manage_options')) {
+            return 0 === $author
+                ? 'it was made outside any user account, so only a network administrator can undo it.'
+                : 'it was made by a network administrator, so only a network administrator can undo it.';
+        }
+        return 0 === $author
+            ? 'it was made outside any user account, so only a site administrator can undo it.'
+            : 'it was made by another user, so only they or a site administrator can undo it.';
+    }
+
+    /**
+     * Why the current user may not undo this ledger row, as [code, reason],
+     * or null when they may: ownership first, then every capability the
+     * snapshot's restore takes (restore_capabilities(), and edit_post or
+     * delete_post per post).
+     *
+     * @param array<array-key, mixed> $row
+     * @param array<array-key, mixed> $snapshot
+     * @return array{0: string, 1: string}|null
+     */
+    private static function operation_refusal(array $row, array $snapshot): ?array
+    {
+        $owner = self::owner_refusal(self::int_of($row['user_id'] ?? 0));
+        if (null !== $owner) {
+            return [ self::REFUSED_NOT_OWNER, $owner ];
+        }
+        if (! self::may_restore($snapshot)) {
+            return [ self::REFUSED_CAPABILITY, self::capability_message($snapshot, 'its snapshot') ];
+        }
+        $post = self::post_capability_refusal($snapshot);
+        return null === $post ? null : [ self::REFUSED_CAPABILITY, $post ];
+    }
+
     /** Return and clear the posts the most recent restore moved to the trash. */
     public static function take_trashed(): array
     {
@@ -92,9 +212,17 @@ class Rollback_Service
     {
         self::$warnings = [];
         self::$trashed  = [];
+        self::$refusal  = null;
         self::ensure_ledger_schema();
         $row = Snapshot_Store::get_by_operation($operation_id);
         if (! $row) {
+            return false;
+        }
+        // Authorized for the current user before anything else is asked:
+        // whose operation it is, then what undoing it takes now.
+        $refused = self::operation_refusal($row, (array) $row['snapshot']);
+        if (null !== $refused) {
+            self::refuse($refused[0], sprintf('operation %s refused: %s', $operation_id, $refused[1]), [ 'operation_id' => $operation_id ]);
             return false;
         }
         // An undone operation is never applied again (issue #593): its
@@ -109,15 +237,6 @@ class Rollback_Service
         // A personal data erasure redacted this snapshot (issue #478).
         if (Snapshot_Redactor::is_erased($row['snapshot'])) {
             self::warn(sprintf('operation %s refused: %s', $operation_id, Snapshot_Redactor::refusal($row['snapshot'])));
-            return false;
-        }
-        if (! self::may_restore($row['snapshot'])) {
-            self::warn(sprintf(
-                'operation %s refused: %s restoring it requires %s.',
-                $operation_id,
-                self::refusal_subject($row['snapshot'], 'its snapshot'),
-                self::restore_capability($row['snapshot'])
-            ));
             return false;
         }
         $refused = self::refused_post($row['snapshot']);
@@ -175,6 +294,13 @@ class Rollback_Service
             $partner_row = '' === $partner_id ? null : Snapshot_Store::get_by_operation($partner_id);
             if ($partner_row && null === Snapshot_Store::rolled_back_at($partner_row)) {
                 $partner = $partner_row;
+                // The pair is undone together, so the caller must be
+                // allowed to undo both halves.
+                $refused = self::operation_refusal($partner, (array) $partner['snapshot']);
+                if (null !== $refused) {
+                    self::refuse($refused[0], sprintf('operation %s refused: its paired theme switch operation %s cannot be undone by you: %s Nothing was changed.', $operation_id, self::str_of($partner['operation_id'] ?? ''), $refused[1]), [ 'operation_id' => $operation_id ]);
+                    return false;
+                }
             }
             $refused = Theme_Switch_Snapshot::refusal(array_filter([ $row['snapshot'], $partner ? $partner['snapshot'] : null ]));
             if (null !== $refused) {
@@ -332,11 +458,8 @@ class Rollback_Service
             return current_user_can($capability) ? null : sprintf('you cannot edit post %d.', $post_id);
         }
 
-        if (in_array($type, [ 'page_build', 'media_import', Post_Creation_Snapshot::OBJECT_TYPE ], true)) {
-            $ids = Post_Creation_Snapshot::OBJECT_TYPE === $type
-                ? Post_Creation_Snapshot::post_ids($snapshot)
-                : [ (int) ($snapshot['object_id'] ?? 0) ];
-            foreach ($ids as $post_id) {
+        if (in_array($type, self::POST_CREATION_TYPES, true)) {
+            foreach (self::created_post_ids($snapshot) as $post_id) {
                 $post = $post_id > 0 ? get_post($post_id) : null;
                 if ($post instanceof \WP_Post) {
                     $refused = self::refused_store((string) $post->post_type, $post_id)
@@ -349,6 +472,65 @@ class Rollback_Service
             }
         }
 
+        return null;
+    }
+
+    /** Snapshot types whose undo trashes or deletes the posts they created. */
+    private const POST_CREATION_TYPES = [ 'page_build', 'media_import', 'wc_product_create', Post_Creation_Snapshot::OBJECT_TYPE ];
+
+    /**
+     * The posts a creation snapshot's undo removes.
+     *
+     * @param array<array-key, mixed> $snapshot
+     * @return list<int>
+     */
+    private static function created_post_ids(array $snapshot): array
+    {
+        $ids = Post_Creation_Snapshot::OBJECT_TYPE === ($snapshot['object_type'] ?? '')
+            ? Post_Creation_Snapshot::post_ids($snapshot)
+            : [ $snapshot['object_id'] ?? 0 ];
+        return array_values(array_map(static fn (mixed $id): int => self::int_of($id), $ids));
+    }
+
+    /**
+     * The capability half of refused_post():
+     * why the current user may not write back the posts this snapshot
+     * covers, or null. edit_post for an edit (the type's edit_posts or
+     * edit_others_posts for a post that is gone), delete_post for each
+     * post a creation made. No current user is not refused, as there.
+     *
+     * @param array<array-key, mixed> $snapshot
+     */
+    private static function post_capability_refusal(array $snapshot): ?string
+    {
+        if (0 === get_current_user_id()) {
+            return null;
+        }
+        $type = self::str_of($snapshot['object_type'] ?? '');
+        if ('post' === $type) {
+            $post_id = self::int_of($snapshot['object_id'] ?? 0);
+            $post    = $post_id > 0 ? get_post($post_id) : null;
+            if ($post instanceof \WP_Post) {
+                return self::refused_post_capability('edit_post', $post);
+            }
+            $row    = self::map_of(self::map_of($snapshot['data'] ?? [])['post'] ?? []);
+            $object = get_post_type_object(self::str_of($row['post_type'] ?? ''));
+            if (! $object instanceof \WP_Post_Type) {
+                return current_user_can('manage_options') ? null : sprintf('post %d is of a type that is no longer registered.', $post_id);
+            }
+            $mine       = self::int_of($row['post_author'] ?? 0) === get_current_user_id();
+            $capability = self::str_of($mine ? $object->cap->edit_posts : $object->cap->edit_others_posts);
+            return current_user_can($capability) ? null : sprintf('you cannot edit post %d.', $post_id);
+        }
+        if (in_array($type, self::POST_CREATION_TYPES, true)) {
+            foreach (self::created_post_ids($snapshot) as $post_id) {
+                $post    = $post_id > 0 ? get_post($post_id) : null;
+                $refused = $post instanceof \WP_Post ? self::refused_post_capability('delete_post', $post) : null;
+                if (null !== $refused) {
+                    return $refused;
+                }
+            }
+        }
         return null;
     }
 
@@ -492,9 +674,32 @@ class Rollback_Service
      */
     private static function refusal_subject(array $snapshot, string $subject): string
     {
-        return in_array($snapshot['object_type'] ?? '', [ 'option', 'option_set' ], true)
-            ? sprintf('%s is a site setting, and', $subject)
-            : sprintf('%s holds personal data and', $subject);
+        $type = self::str_of($snapshot['object_type'] ?? '');
+        if (in_array($type, [ 'option', 'option_set' ], true)) {
+            return sprintf('%s is a site setting, and', $subject);
+        }
+        if ('user' === $type) {
+            return sprintf('%s holds a user\'s profile and roles, and', $subject);
+        }
+        return in_array($type, self::PERSONAL_DATA_TYPES, true) || 1 === preg_match('/^wc_(order|subscription|booking|user_membership)/', $type)
+            ? sprintf('%s holds personal data and', $subject)
+            : '';
+    }
+
+    /** Snapshot types outside WooCommerce whose capability refusal says they hold personal data. */
+    private const PERSONAL_DATA_TYPES = [ 'post', 'comment', 'crm_rows', 'amelia_rows', 'helpdesk_ticket', 'gamipress_user', 'buddypress_rows', 'bbpress_posts', 'db_cleanup', 'action_scheduler' ];
+
+    /**
+     * A capability refusal for $snapshot, opening with refusal_subject().
+     *
+     * @param array<array-key, mixed> $snapshot
+     */
+    private static function capability_message(array $snapshot, string $subject): string
+    {
+        $opening = self::refusal_subject($snapshot, $subject);
+        return '' === $opening
+            ? sprintf('undoing it requires %s.', self::restore_capability($snapshot))
+            : sprintf('%s restoring it requires %s.', $opening, self::restore_capability($snapshot));
     }
 
     /**
@@ -675,7 +880,7 @@ class Rollback_Service
             return [ [ 'delete_users' ] ];
         }
         if ('post' !== $type) {
-            return [];
+            return self::named_restore_capabilities(self::str_of($type), $snapshot);
         }
         $post_type = (string) ($snapshot['data']['post']['post_type'] ?? '');
         if (in_array($post_type, [ 'wp_template', 'wp_template_part', 'wp_navigation' ], true)) {
@@ -683,6 +888,184 @@ class Rollback_Service
         }
         $capability = self::pii_snapshot_capabilities()[ $post_type ] ?? null;
         return null === $capability ? [] : [ [ $capability ] ];
+    }
+
+    /**
+     * What undoing each remaining type takes:
+     * the capability making the change takes, for the current user, on that
+     * object. A type named nowhere takes manage_options, so a type added
+     * later without a rule here fails closed, never open. Like an option
+     * snapshot, a restore with no current user is made on no one's behalf
+     * (cron, a tool's own compensation) and is not asked.
+     *
+     * @param array<array-key, mixed> $snapshot
+     * @return array<int, array<int, mixed>>
+     */
+    private static function named_restore_capabilities(string $type, array $snapshot): array
+    {
+        if (0 === get_current_user_id()) {
+            return [];
+        }
+        $data = self::map_of($snapshot['data'] ?? []);
+        switch ($type) {
+            case 'user':
+                return self::user_restore_capabilities($snapshot);
+            // The undo of update-order-status, at that tool's capability.
+            case 'wc_order':
+                return [ [ 'edit_shop_orders' ] ];
+            // Already asked again by each type's own restore.
+            case 'db_rows':
+            case 'redirect':
+            case 'redirection_item':
+            case 'php_snippet':
+                return [ [ 'manage_options' ] ];
+            case 'term':
+                return [ [ 'manage_categories' ] ];
+            case 'wc_tax_rate':
+            case Wc_Tax_Rate_Creation_Snapshot::OBJECT_TYPE:
+                return [ [ 'manage_woocommerce' ] ];
+            case 'yoast_term_seo':
+                return self::term_capabilities(self::int_of($data['term_id'] ?? 0));
+            case 'aioseo_row':
+                $id   = self::int_of($data['id'] ?? 0);
+                $kind = self::str_of($data['kind'] ?? '');
+                if ('term' === $kind) {
+                    return self::term_capabilities($id);
+                }
+                return 'post' === $kind && $id > 0 && get_post($id) instanceof \WP_Post ? [ [ 'edit_post', $id ] ] : [ [ 'manage_options' ] ];
+            // Undoing create-comment trashes the comment, which takes
+            // edit_comment, as trashing it in wp-admin does.
+            case Comment_Creation_Snapshot::OBJECT_TYPE:
+                $comment = self::int_of($snapshot['object_id'] ?? 0);
+                return $comment > 0 && get_comment($comment) instanceof \WP_Comment ? [ [ 'edit_comment', $comment ] ] : [];
+            // Each post the creation made is asked delete_post by
+            // post_capability_refusal(), and every plugin table kind is
+            // asked its own capability by Plugin_Table_Rows_Snapshot.
+            case 'page_build':
+            case 'media_import':
+            case 'wc_product_create':
+            case Post_Creation_Snapshot::OBJECT_TYPE:
+            case 'plugin_table_rows':
+                return [];
+            // Elementor's own class capability, or manage_options on a
+            // site that has not run Elementor's capability migration, as
+            // the global classes writes take.
+            case 'elementor_global_classes':
+                return current_user_can('elementor_global_classes_update_class') ? [ [ 'elementor_global_classes_update_class' ] ] : [ [ 'manage_options' ] ];
+            case 'elementor_global_variables':
+                return [ [ 'manage_options' ] ];
+            // The scaffolder's own capability (a network admin's on a network).
+            case 'theme_scaffold':
+                return [ [ 'edit_themes' ] ];
+            // Putting back an earlier copy of a package is an update, and
+            // removing one an install made is that install's undo. Core
+            // maps all four to super admins on a network.
+            case 'package_install':
+                $kind = self::str_of($data['type'] ?? '');
+                if (! in_array($kind, [ 'plugin', 'theme' ], true)) {
+                    return [ [ 'manage_options' ] ];
+                }
+                $existed = in_array($data['existed'] ?? false, [ true, 1, '1' ], true);
+                return [ [ ($existed ? 'update_' : 'install_') . $kind . 's' ] ];
+            case 'acf_structure':
+            case 'acf_options':
+                $capability = function_exists('acf_get_setting') ? self::str_of(acf_get_setting('capability')) : '';
+                return [ [ '' === $capability ? 'manage_options' : $capability ] ];
+        }
+        return [ [ 'manage_options' ] ];
+    }
+
+    /**
+     * edit_term on a term that exists, else manage_categories.
+     *
+     * @return array<int, array<int, mixed>>
+     */
+    private static function term_capabilities(int $term_id): array
+    {
+        return $term_id > 0 && get_term($term_id) instanceof \WP_Term ? [ [ 'edit_term', $term_id ] ] : [ [ 'manage_categories' ] ];
+    }
+
+    /**
+     * What undoing a user snapshot takes: edit_user on that user, which on
+     * a network only a network admin holds for anyone but themselves, since
+     * usermeta is network-wide. The restore rewrites every usermeta key, so
+     * when it would change the user's role on this site it also takes
+     * promote_user, as changing a role does, and when it would change their
+     * role on another site of the network, manage_network_users.
+     *
+     * @param array<array-key, mixed> $snapshot
+     * @return array<int, array<int, mixed>>
+     */
+    private static function user_restore_capabilities(array $snapshot): array
+    {
+        $user_id = self::int_of($snapshot['object_id'] ?? 0);
+        if ($user_id <= 0 || false === get_userdata($user_id)) {
+            return [ [ 'edit_users' ] ];
+        }
+        $caps = [ [ 'edit_user', $user_id ] ];
+        [$here, $elsewhere] = self::changed_role_keys($user_id, self::map_of(self::map_of($snapshot['data'] ?? [])['meta'] ?? []));
+        if ($here) {
+            $caps[] = [ 'promote_user', $user_id ];
+        }
+        if ($elsewhere) {
+            $caps[] = [ 'manage_network_users' ];
+        }
+        return $caps;
+    }
+
+    /**
+     * Whether restoring $captured usermeta over a user's current usermeta
+     * would change their role keys (capabilities or user_level) on this
+     * site, and on any other site of the network.
+     *
+     * @param array<array-key, mixed> $captured usermeta as get_user_meta() returns it: key => raw values
+     * @return array{0: bool, 1: bool}
+     */
+    private static function changed_role_keys(int $user_id, array $captured): array
+    {
+        $db = $GLOBALS['wpdb'] ?? null;
+        if (! $db instanceof \wpdb) {
+            return [ false, false ];
+        }
+        $current = self::map_of(get_user_meta($user_id));
+        $pattern = '/^' . preg_quote($db->base_prefix, '/') . '(\d+_)?(capabilities|user_level)$/';
+        $local   = [ $db->get_blog_prefix() . 'capabilities', $db->get_blog_prefix() . 'user_level' ];
+        $here    = false;
+        $other   = false;
+        foreach (array_unique(array_merge(array_keys($captured), array_keys($current))) as $key) {
+            $key = (string) $key;
+            if (1 !== preg_match($pattern, $key)) {
+                continue;
+            }
+            if (self::role_values($captured[ $key ] ?? []) === self::role_values($current[ $key ] ?? [])) {
+                continue;
+            }
+            if (! is_multisite() || in_array($key, $local, true)) {
+                $here = true;
+            } else {
+                $other = true;
+            }
+        }
+        return [ $here, $other ];
+    }
+
+    /**
+     * One usermeta key's raw values, unserialized, each role map in key
+     * order, so the same role read back in another order compares equal.
+     *
+     * @return list<mixed>
+     */
+    private static function role_values(mixed $raw): array
+    {
+        $out = [];
+        foreach (self::map_of($raw) as $value) {
+            $value = is_string($value) ? maybe_unserialize($value) : $value;
+            if (is_array($value)) {
+                ksort($value);
+            }
+            $out[] = $value;
+        }
+        return $out;
     }
 
     /**
@@ -740,19 +1123,22 @@ class Rollback_Service
      * A named session belongs to the user who started it (issue #450).
      * Below manage_options a caller may roll back only their own sessions:
      * another user's, or one started with no user and so owned by no one,
-     * is refused with the reason before anything is restored. The shared
-     * 'default' session is everyone's stream of single writes, so it is not
-     * refused as a whole; each of its rows goes through the per-post checks
-     * below, as every row does.
+     * is refused with the reason before anything is restored. Every
+     * operation left to undo, in any session, the shared 'default' one
+     * included, is then authorized for the current user: one made by
+     * someone they may not undo for, or one whose
+     * undo takes a capability they lack, refuses the whole session.
      *
-     * @throws Mutation_Failed When a named session's undo points were pruned,
-     *                         or it belongs to another user.
-     * @throws Post_Locked     When another user is editing a post it changed.
+     * @throws Mutation_Failed    When a named session's undo points were pruned.
+     * @throws Post_Write_Refused When it belongs to another user, or holds an
+     *                            operation the caller may not undo.
+     * @throws Post_Locked        When another user is editing a post it changed.
      */
     public static function restore_session(string $session_id): int
     {
         self::$warnings = [];
         self::$trashed  = [];
+        self::$refusal  = null;
         self::ensure_ledger_schema();
         self::assert_session_owner($session_id);
         $pruned = Snapshot_Store::is_loose_session($session_id) ? 0 : Snapshot_Store::pruned_rows_for_session($session_id);
@@ -773,6 +1159,11 @@ class Rollback_Service
         // 2, so the session still lands on its pre-session state.
         $live         = array_values(array_filter($rows, static fn(array $r): bool => null === Snapshot_Store::rolled_back_at($r)));
         $undone_count = count($rows) - count($live);
+
+        // All or nothing, for the current user:
+        // one operation they may not undo, by ownership or by capability,
+        // refuses the whole session before anything is restored.
+        self::assert_session_authorized($session_id, $live);
 
         // All or nothing, like a pruned run: a session whose undo points
         // include one a personal data erasure redacted (issue #478) cannot
@@ -1042,12 +1433,7 @@ class Rollback_Service
                 if (! self::may_restore($checked)) {
                     // One refused snapshot must not abort the rest of the unwind,
                     // but it must be visible and must NOT be counted as restored.
-                    self::warn(sprintf(
-                        'snapshot %s skipped: %s restoring it requires %s.',
-                        $key,
-                        self::refusal_subject($checked, 'it'),
-                        self::restore_capability($checked)
-                    ));
+                    self::warn(sprintf('snapshot %s skipped: %s', $key, self::capability_message($checked, 'it')));
                     $count += $counted_if_refused;
                     continue 2;
                 }
@@ -1174,7 +1560,7 @@ class Rollback_Service
      * not refused, like refused_post(). A session with no undo points left
      * is left to restore_session()'s own pruned or unknown answer.
      *
-     * @throws Mutation_Failed When the session belongs to someone else.
+     * @throws Post_Write_Refused When the session belongs to someone else.
      */
     private static function assert_session_owner(string $session_id): void
     {
@@ -1182,12 +1568,86 @@ class Rollback_Service
         if (null === $owner) {
             return;
         }
-        throw new Mutation_Failed(sprintf(
-            0 === $owner
-                ? 'Session "%s" has no recorded owner (it was written outside any user account), so only a site administrator can roll it back. Nothing was restored.'
-                : 'Session "%s" was started by another user, so only they or a site administrator can roll it back. Nothing was restored.',
-            esc_html($session_id)
-        ));
+        $refusal = new \WP_Error(
+            self::REFUSED_NOT_OWNER,
+            sprintf(
+                0 === $owner
+                    ? 'Session "%s" has no recorded owner (it was written outside any user account), so only a site administrator can roll it back. Nothing was restored.'
+                    : 'Session "%s" was started by another user, so only they or a site administrator can roll it back. Nothing was restored.',
+                $session_id
+            ),
+            [ 'status' => 403, 'session_id' => $session_id ]
+        );
+        // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Post_Write_Refused escapes the message it is given.
+        throw new Post_Write_Refused($refusal);
+    }
+
+    /**
+     * Refuse the whole session when the current user may not undo every
+     * operation left in it, before anything is
+     * restored. Restoring only the allowed part would leave the session
+     * half undone, and the catch-all 'default' session holds every user's
+     * writes made without a session_id, so a filtered undo of it would
+     * reach far past the caller's own run. Refused rows of other users are
+     * counted, not named: list-operations does not show their ids below
+     * manage_options either. A row that does not decode is left to the
+     * unwind, which reports and skips it.
+     *
+     * @param array<array-key, mixed> $live The session's ledger rows not yet undone.
+     * @throws Post_Write_Refused When any of them may not be undone by the caller.
+     */
+    private static function assert_session_authorized(string $session_id, array $live): void
+    {
+        $not_owned = 0;
+        $refused   = [];
+        foreach ($live as $entry) {
+            $row = self::map_of($entry);
+            try {
+                $snapshot = Snapshot::unserialize(self::str_of($row['before_blob'] ?? ''));
+            } catch (\RuntimeException $e) {
+                unset($e);
+                continue;
+            }
+            $why = self::operation_refusal($row, $snapshot);
+            if (null === $why) {
+                continue;
+            }
+            if (self::REFUSED_NOT_OWNER === $why[0]) {
+                ++$not_owned;
+                continue;
+            }
+            $refused[] = [ 'operation_id' => self::str_of($row['operation_id'] ?? ''), 'tool_name' => self::str_of($row['tool_name'] ?? ''), 'reason' => $why[1] ];
+        }
+        if (0 === $not_owned && [] === $refused) {
+            return;
+        }
+
+        $parts = [];
+        if ($not_owned > 0) {
+            $parts[] = sprintf(
+                1 === $not_owned ? '%d of its operations was made by another user, and only a site administrator can undo another user\'s operations%s' : '%d of its operations were made by other users, and only a site administrator can undo another user\'s operations%s',
+                $not_owned,
+                is_multisite() ? ' (only a network administrator, for a network administrator\'s)' : ''
+            );
+        }
+        foreach (array_slice($refused, 0, 3) as $one) {
+            $parts[] = sprintf('operation %s (%s): %s', $one['operation_id'], $one['tool_name'], rtrim($one['reason'], '.'));
+        }
+        if (count($refused) > 3) {
+            $parts[] = sprintf('%d more that need capabilities you do not hold', count($refused) - 3);
+        }
+        $message = sprintf('Session "%s" cannot be rolled back by you: %s. Nothing was restored.', $session_id, implode('; ', $parts));
+        if (Snapshot_Store::is_loose_session($session_id)) {
+            $message .= ' This is the catch-all session that every write made without a session_id goes to; undo your own changes one at a time with rollback-operation.';
+        }
+
+        $refusal = new \WP_Error(
+            $not_owned > 0 ? self::REFUSED_NOT_OWNER : self::REFUSED_CAPABILITY,
+            $message,
+            [ 'status' => 403, 'session_id' => $session_id, 'not_owned' => $not_owned, 'refused' => array_slice($refused, 0, 50) ]
+        );
+        // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Post_Write_Refused escapes the message it is given.
+        throw new Post_Write_Refused($refusal);
     }
 
     /**
@@ -1559,7 +2019,15 @@ class Rollback_Service
         }
 
         $snapshotted_meta = (array) $snapshot['data']['meta'];
-        $current_meta     = get_user_meta($user_id);
+        $current_meta     = self::map_of(get_user_meta($user_id));
+
+        // Login sessions and application passwords keep their current
+        // values unless the site opts in, so ones revoked since the snapshot
+        // stay revoked, snapshots taken before this rule included.
+        $kept = self::kept_credential_keys($snapshotted_meta, $current_meta);
+        foreach ($kept as $key) {
+            unset($snapshotted_meta[ $key ], $current_meta[ $key ]);
+        }
 
         // Purge any usermeta key that didn't exist at snapshot time.
         foreach (array_keys(array_diff_key($current_meta, $snapshotted_meta)) as $key) {
@@ -1573,6 +2041,45 @@ class Rollback_Service
                 add_user_meta($user_id, $key, self::slash_meta_value(maybe_unserialize($v)));
             }
         }
+
+        if ([] !== $kept) {
+            self::warn(sprintf(
+                'user %d: %s kept their current values, so login sessions and application passwords are not brought back by an undo. An administrator can change this with the %s opt-in.',
+                $user_id,
+                implode(' and ', $kept),
+                self::USER_CREDENTIAL_OPT_IN
+            ));
+        }
+    }
+
+    /** Usermeta keys a user restore leaves as they are, unless the site opts in. */
+    private const USER_CREDENTIAL_KEYS = [ 'session_tokens', '_application_passwords' ];
+
+    /**
+     * The opt-in (an Opt_In_Settings group, network-wide on multisite) that
+     * lets a user restore bring login sessions and application passwords
+     * back as well.
+     */
+    public const USER_CREDENTIAL_OPT_IN = 'wpmcp_enable_user_credential_restore';
+
+    /**
+     * The credential keys this restore leaves at their current values: each
+     * one the snapshot or the user holds now, or none while the site opts in.
+     *
+     * @param array<array-key, mixed> $captured usermeta as captured
+     * @param array<array-key, mixed> $current  usermeta as it is now
+     * @return list<string>
+     */
+    private static function kept_credential_keys(array $captured, array $current): array
+    {
+        // The literal is USER_CREDENTIAL_OPT_IN, spelled out for the hook name sniffs.
+        if (in_array(apply_filters('wpmcp_enable_user_credential_restore', false), [ true, 1, '1' ], true)) {
+            return [];
+        }
+        return array_values(array_filter(
+            self::USER_CREDENTIAL_KEYS,
+            static fn (string $key): bool => array_key_exists($key, $captured) || array_key_exists($key, $current)
+        ));
     }
 
     /** The filters wp_update_comment() runs over a row before it is saved. */

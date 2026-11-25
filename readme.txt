@@ -4,7 +4,7 @@ Tags: ecommerce, mcp, ai, ai agent, automation
 Requires at least: 6.9
 Tested up to: 7.1
 Requires PHP: 8.1
-Stable tag: 1.2.2
+Stable tag: 1.2.3
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -142,10 +142,10 @@ Same safety core, same snapshot engine, scoped to what a WooCommerce store needs
 
 == Changelog ==
 
-= 1.2.2 =
+= 1.2.3 =
 * First release: WooCommerce products and orders, store content, blocks, menus, SEO metadata, and the full snapshot/rollback safety core.
 
 == Upgrade Notice ==
 
-= 1.2.2 =
+= 1.2.3 =
 First release.

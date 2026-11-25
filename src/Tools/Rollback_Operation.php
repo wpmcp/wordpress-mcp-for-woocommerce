@@ -25,6 +25,16 @@ class Rollback_Operation
 
         $restored = Rollback_Service::restore_operation($operation_id);
 
+        // The caller may not undo it: another
+        // user's operation, or one whose undo takes a capability they lack.
+        // A refusal, so it goes out as the refusal envelope, not as
+        // restored:false.
+        $refusal = Rollback_Service::take_refusal();
+        if (null !== $refusal) {
+            Rollback_Service::take_warnings();
+            return $refusal;
+        }
+
         // Non-fatal conflict findings (currently only from db_rows restores:
         // rows that changed, vanished, or were reclaimed since the operation).
         // The restore still succeeded; the caller is told the ground shifted.
